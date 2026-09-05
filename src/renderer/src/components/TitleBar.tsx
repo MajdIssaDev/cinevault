@@ -86,6 +86,7 @@ function WindowControls(): JSX.Element {
 
 export function TitleBar(): JSX.Element {
   const updateAvailable = useAppStore((s) => s.updateAvailable)
+  const playerOpen = Boolean(useAppStore((s) => s.session))
   const showControls = Boolean(window.cinevault?.window) && !isMobileShell()
 
   const onDragDoubleClick = (): void => {
@@ -95,7 +96,7 @@ export function TitleBar(): JSX.Element {
 
   return (
     <header className="titlebar" style={dragStyle} onDoubleClick={onDragDoubleClick}>
-      <div className="titlebar-left" style={noDragStyle}>
+      <div className="titlebar-left" style={playerOpen ? dragStyle : noDragStyle}>
         <div className="brand">CineVault</div>
         <NavLink
           to="/settings"
@@ -104,6 +105,11 @@ export function TitleBar(): JSX.Element {
           }
           title={updateAvailable ? 'Settings · Update available' : 'Settings'}
           style={noDragStyle}
+          tabIndex={playerOpen ? -1 : undefined}
+          aria-hidden={playerOpen || undefined}
+          onClick={(e) => {
+            if (playerOpen) e.preventDefault()
+          }}
         >
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
             <path

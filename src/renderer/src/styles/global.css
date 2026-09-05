@@ -315,32 +315,49 @@ html.player-open .titlebar {
   background: transparent;
   border-bottom-color: transparent;
   transition: opacity 0.3s ease-out;
+  pointer-events: auto;
+  -webkit-app-region: drag;
 }
-html.player-open .titlebar-left,
+/* Invisible brand/settings, but the strip still drags the window */
+html.player-open .titlebar-left {
+  opacity: 0;
+  pointer-events: auto;
+  -webkit-app-region: drag;
+}
 html.player-open .titlebar .brand,
 html.player-open .titlebar .titlebar-icon {
   opacity: 0;
   pointer-events: none;
 }
+html.player-open .titlebar-drag-space {
+  pointer-events: auto;
+  -webkit-app-region: drag;
+}
 html.player-open .titlebar-win-restore::after {
   background: transparent;
 }
-/* Hide titlebar chrome when idle, but keep window controls clickable */
+/* Hide titlebar chrome when idle, but keep drag strip + window controls */
 html.player-chrome-hidden .titlebar {
   background: transparent;
   border-bottom-color: transparent;
+  pointer-events: auto;
+  -webkit-app-region: drag;
 }
 html.player-chrome-hidden .titlebar-left,
-html.player-chrome-hidden .titlebar-drag-space,
 html.player-chrome-hidden .titlebar .brand,
 html.player-chrome-hidden .titlebar .titlebar-icon {
   opacity: 0;
-  pointer-events: none;
+}
+html.player-chrome-hidden .titlebar-left,
+html.player-chrome-hidden .titlebar-drag-space {
+  pointer-events: auto;
+  -webkit-app-region: drag;
 }
 html.player-chrome-hidden .titlebar-controls,
 html.player-chrome-hidden .titlebar-win-btn {
   opacity: 1;
   pointer-events: auto;
+  -webkit-app-region: no-drag;
 }
 
 .top-nav {
