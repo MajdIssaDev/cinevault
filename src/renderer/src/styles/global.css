@@ -367,11 +367,8 @@ html.player-chrome-hidden .titlebar-win-btn {
 
 /* Player sits under the titlebar strip so the bar always receives drag gestures */
 html.player-open .player-root {
-  top: var(--titlebar-height);
-  right: 0;
-  bottom: 0;
-  left: 0;
-  inset: unset;
+  inset: var(--titlebar-height) 0 0 0;
+  z-index: 500;
 }
 
 .top-nav {
@@ -3842,7 +3839,7 @@ html.player-open .player-root {
   position: fixed;
   inset: 0;
   background: #000;
-  z-index: 50;
+  z-index: 500;
   display: block;
   color: #fff;
   overflow: hidden;
