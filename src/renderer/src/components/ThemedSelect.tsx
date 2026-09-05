@@ -32,6 +32,13 @@ type Props = {
   menuMinWidth?: number
 }
 
+/** Fullscreen elements hide anything portaled to body — mount inside FS when needed. */
+function resolvePortalRoot(anchor: HTMLElement | null): HTMLElement {
+  const fs = document.fullscreenElement
+  if (fs instanceof HTMLElement && anchor && fs.contains(anchor)) return fs
+  return document.body
+}
+
 function computeMenuStyle(btn: HTMLElement, menuMinWidth?: number): CSSProperties {
   const rect = btn.getBoundingClientRect()
   const maxH = Math.min(320, window.innerHeight - 24)
@@ -69,9 +76,14 @@ export function ThemedSelect({
   const ignoreOutsideRef = useRef(false)
   const [open, setOpen] = useState(false)
   const [menuStyle, setMenuStyle] = useState<CSSProperties | null>(null)
+  const [portalRoot, setPortalRoot] = useState<HTMLElement>(() => document.body)
 
   const selected = options.find((o) => o.value === value) || options[0]
   const label = selected?.label ?? value
+
+  const syncPortalRoot = (): void => {
+    setPortalRoot(resolvePortalRoot(rootRef.current))
+  }
 
   const placeMenu = (): void => {
     const btn = btnRef.current
@@ -90,6 +102,7 @@ export function ThemedSelect({
     // Ignore the same gesture that opened the menu so the document listener
     // does not immediately dismiss it (common in Electron / pointer pipelines).
     ignoreOutsideRef.current = true
+    syncPortalRoot()
     setMenuStyle(computeMenuStyle(btn, menuMinWidth))
     setOpen(true)
     window.setTimeout(() => {
@@ -107,8 +120,18 @@ export function ThemedSelect({
 
   useLayoutEffect(() => {
     if (!open) return
+    syncPortalRoot()
     placeMenu()
   }, [open, options.length, menuMinWidth])
+
+  useEffect(() => {
+    const onFs = (): void => {
+      syncPortalRoot()
+      if (open) placeMenu()
+    }
+    document.addEventListener('fullscreenchange', onFs)
+    return () => document.removeEventListener('fullscreenchange', onFs)
+  }, [open, menuMinWidth])
 
   useEffect(() => {
     if (!open) return
@@ -213,7 +236,7 @@ export function ThemedSelect({
               )
             })}
           </div>,
-          document.body
+          portalRoot
         )}
     </div>
   )
