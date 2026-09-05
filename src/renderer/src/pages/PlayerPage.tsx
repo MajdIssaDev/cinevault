@@ -30,7 +30,8 @@ import {
   flushProgress,
   markAsCompleted,
   mediaIdFromParts,
-  saveProgress
+  saveProgress,
+  type PlaybackProgress
 } from '../services/playbackHistoryService'
 import { resolveNextEpisode, type NextEpisodeTarget } from '../lib/nextEpisode'
 import {
@@ -41,6 +42,7 @@ import {
 import { getBestStream } from '../lib/streamScorer'
 import { searchPublicIndexers } from '../services/publicSearchService'
 import { isBrowserPreferredVideo, parseTorrentVideo } from '../lib/torrentParser'
+import { buildAudioRemuxUrl, needsAudioRemux } from '../lib/audioRemux'
 
 const ICON = { size: 20, strokeWidth: 1.75 } as const
 
@@ -181,6 +183,12 @@ export function PlayerPage(): JSX.Element {
   const [playing, setPlaying] = useState(true)
   const [current, setCurrent] = useState(0)
   const [duration, setDuration] = useState(0)
+  const [proxyOffset, setProxyOffset] = useState(() =>
+    session.resumeSeconds &&
+    (session.source.needsAudioRemux || needsAudioRemux(session.source.label || ''))
+      ? session.resumeSeconds
+      : 0
+  )
   const [volume, setVolume] = useState(1)
   const [showStats, setShowStats] = useState(false)
   const [showSubs, setShowSubs] = useState(false)
@@ -231,8 +239,30 @@ export function PlayerPage(): JSX.Element {
   const [upNextBusy, setUpNextBusy] = useState(false)
   const upNextDismissedRef = useRef(false)
   const upNextShownRef = useRef(false)
+  /** FFmpeg remux `-ss` origin — wall clock = proxyOffset + video.currentTime */
+  const remuxOriginRef = useRef(proxyOffset)
+  const isProxiedStream =
+    (Boolean(session.source.needsAudioRemux) ||
+      needsAudioRemux(session.source.label || session.title)) &&
+    Boolean(window.cinevault) &&
+    session.source.kind !== 'hls'
+  const useAudioRemux = isProxiedStream
   const codecHint = playbackWarning(session.source.label || session.title)
   const hevcBlocked = isHevcRelease(session.source.label || session.title) && videoWidth === 0
+
+  const metadataDuration =
+    (session.runtimeSeconds && session.runtimeSeconds > 0 ? session.runtimeSeconds : 0) || 0
+
+  /** Prefer catalog runtime; never trust tiny/fragment remux durations for the scrubber. */
+  const totalDurationSeconds = Math.max(
+    metadataDuration,
+    Number.isFinite(duration) && duration > 0 && duration !== Number.POSITIVE_INFINITY
+      ? duration
+      : 0,
+    durationRef.current || 0
+  )
+
+  const currentPlaybackTime = current
 
   useEffect(() => {
     setSubLang(session.subtitleLang || settings?.defaultSubtitleLanguage || 'en')
@@ -277,18 +307,42 @@ export function PlayerPage(): JSX.Element {
     })
   }
 
+  useEffect(() => {
+    if (metadataDuration > 0) {
+      setDuration((prev) => Math.max(prev, metadataDuration))
+      durationRef.current = Math.max(durationRef.current, metadataDuration)
+    }
+  }, [session.cacheId, metadataDuration])
+
+  const wallClockTime = (videoTime: number): number => remuxOriginRef.current + videoTime
+
+  const resolvePlayableUrl = (rawUrl: string, startSeconds = 0): string => {
+    if (!useAudioRemux) return rawUrl
+    if (!window.cinevault) return rawUrl
+    if (session.source.kind === 'hls') return rawUrl
+    return buildAudioRemuxUrl(rawUrl, startSeconds)
+  }
+
   const attachMediaSource = (src: string, resumeAt: number): void => {
     const video = videoRef.current
     if (!video || sourceAttachedRef.current) return
     sourceAttachedRef.current = true
     wantPlaybackRef.current = true
-    video.src = src
+
+    const remuxing = useAudioRemux
+    const origin = remuxing ? Math.max(0, resumeAt) : 0
+    const playUrl = resolvePlayableUrl(src, origin)
+    remuxOriginRef.current = origin
+    setProxyOffset(origin)
+
+    video.src = playUrl
+    // Scrub preview uses the raw stream when possible (byte-range friendly).
     if (scrubVideoRef.current) scrubVideoRef.current.src = src
     setMediaAttached(true)
     setWaitTargetPct(null)
 
     const onMeta = (): void => {
-      if (resumeAt > 0) video.currentTime = resumeAt
+      if (!remuxing && resumeAt > 0) video.currentTime = resumeAt
     }
     const resumeIfWanted = (): void => {
       if (wantPlaybackRef.current && video.paused) tryStartPlayback()
@@ -297,6 +351,44 @@ export function PlayerPage(): JSX.Element {
     video.addEventListener('canplay', resumeIfWanted)
     video.addEventListener('canplaythrough', resumeIfWanted)
     video.addEventListener('loadeddata', () => tryStartPlayback(), { once: true })
+  }
+
+  /** Re-pipe FFmpeg from a new absolute timestamp (fragmented remux has no byte-range seek). */
+  const reattachRemuxAt = (absoluteSeconds: number): void => {
+    const video = videoRef.current
+    if (!video) return
+    const target = Math.max(0, absoluteSeconds)
+    video.pause()
+    remuxOriginRef.current = target
+    setProxyOffset(target)
+    setCurrent(target)
+    setBuffering(true)
+    waitingSinceRef.current = Date.now()
+    wantPlaybackRef.current = true
+
+    const playUrl = buildAudioRemuxUrl(session.source.url, target)
+    video.src = playUrl
+    video.load()
+    const kick = (): void => {
+      void video.play().then(() => {
+        setPlaying(true)
+        setBuffering(false)
+        waitingSinceRef.current = null
+      }).catch(() => {
+        setBuffering(true)
+      })
+    }
+    video.addEventListener('loadeddata', kick, { once: true })
+    video.addEventListener('canplay', kick, { once: true })
+
+    if (session.source.kind === 'torrent') {
+      void window.cinevault?.torrent.prioritize({
+        id: session.cacheId,
+        currentTime: target,
+        duration: Math.max(durationRef.current, metadataDuration, totalDurationSeconds) || 0
+      })
+    }
+    bumpChrome()
   }
 
   // Load media — for torrents wait until ~5% downloaded so the start of the file exists
@@ -316,6 +408,8 @@ export function PlayerPage(): JSX.Element {
     resumeGateRef.current = 0.05
     dlProgressRef.current = 0
 
+    remuxOriginRef.current = 0
+    setProxyOffset(0)
     const resumeAt = session.resumeSeconds || 0
 
     if (session.source.kind === 'hls' && Hls.isSupported()) {
@@ -656,27 +750,43 @@ export function PlayerPage(): JSX.Element {
       prioritizeTimerRef.current = setTimeout(() => {
         void window.cinevault?.torrent.prioritize({
           id: session.cacheId,
-          currentTime: video.currentTime,
-          duration: video.duration || durationRef.current || 0
+          currentTime: wallClockTime(video.currentTime),
+          duration: durationRef.current || video.duration || 0
         })
       }, 180)
     }
 
     const onTime = (): void => {
-      setCurrent(video.currentTime)
-      const cue = findActiveCue(cuesRef.current, video.currentTime, subOffsetMsRef.current)
+      const t = wallClockTime(video.currentTime)
+      setCurrent(t)
+      const cue = findActiveCue(cuesRef.current, t, subOffsetMsRef.current)
       setSubText(cue?.text || '')
       refreshBuffer()
     }
     const onSeeked = (): void => {
-      setCurrent(video.currentTime)
-      const cue = findActiveCue(cuesRef.current, video.currentTime, subOffsetMsRef.current)
+      const t = wallClockTime(video.currentTime)
+      setCurrent(t)
+      const cue = findActiveCue(cuesRef.current, t, subOffsetMsRef.current)
       setSubText(cue?.text || '')
       refreshBuffer()
       syncTorrentWindow()
     }
     const onMeta = (): void => {
-      setDuration(video.duration || 0)
+      const d = video.duration
+      if (useAudioRemux) {
+        // Fragmented remux streams often report remaining length or Infinity — prefer metadata.
+        if (metadataDuration > 0) {
+          setDuration(metadataDuration)
+          durationRef.current = metadataDuration
+        } else if (Number.isFinite(d) && d > 0 && d !== Number.POSITIVE_INFINITY) {
+          const absolute = d + remuxOriginRef.current
+          setDuration((prev) => Math.max(prev, absolute))
+          durationRef.current = Math.max(durationRef.current, absolute)
+        }
+      } else if (Number.isFinite(d) && d > 0 && d !== Number.POSITIVE_INFINITY) {
+        setDuration(d)
+        durationRef.current = d
+      }
       setVideoWidth(video.videoWidth)
       setVideoHeight(video.videoHeight)
       refreshBuffer()
@@ -834,29 +944,44 @@ export function PlayerPage(): JSX.Element {
     const mediaId = mediaIdFromParts(session.mediaType, session.externalId)
     const showTitle = session.showTitle || session.title.split(' · ')[0]
 
-    const buildEntry = () => ({
-      mediaId,
-      mediaType: session.mediaType,
-      externalId: session.externalId,
-      title: showTitle,
-      posterPath: session.posterUrl || undefined,
-      backdropPath: session.backdropUrl || undefined,
-      season: session.season,
-      episode: session.episode,
-      episodeTitle: session.episodeTitle,
-      currentTime: video.currentTime || 0,
-      duration: video.duration || durationRef.current || 0,
-      percentage: 0,
-      updatedAt: Date.now()
-    })
+    const buildEntry = (): PlaybackProgress => {
+      const t = useAudioRemux
+        ? remuxOriginRef.current + (video.currentTime || 0)
+        : video.currentTime || 0
+      const dur = Math.max(
+        session.runtimeSeconds || 0,
+        durationRef.current || 0,
+        Number.isFinite(video.duration) && video.duration !== Infinity ? video.duration : 0
+      )
+      return {
+        mediaId,
+        mediaType: session.mediaType,
+        externalId: session.externalId,
+        title: showTitle,
+        posterPath: session.posterUrl || undefined,
+        backdropPath: session.backdropUrl || undefined,
+        season: session.season,
+        episode: session.episode,
+        episodeTitle: session.episodeTitle,
+        currentTime: t,
+        duration: dur,
+        percentage: dur > 0 ? (t / dur) * 100 : 0,
+        updatedAt: Date.now()
+      }
+    }
 
     const persistHistory = (immediate: boolean): void => {
-      if (!video.duration || !Number.isFinite(video.duration)) return
+      const dur = Math.max(session.runtimeSeconds || 0, durationRef.current || 0)
+      const hasDur =
+        dur > 0 ||
+        (Number.isFinite(video.duration) && video.duration > 0 && video.duration !== Infinity)
+      if (!hasDur) return
       saveProgress(buildEntry(), { immediate })
     }
 
     const persistCache = (): void => {
       if (!window.cinevault) return
+      const entry = buildEntry()
       void window.cinevault.cache.upsert({
         id: session.cacheId,
         title: session.title,
@@ -864,9 +989,9 @@ export function PlayerPage(): JSX.Element {
         filePath: session.source.kind === 'local' ? session.source.url : '',
         createdAt: Date.now(),
         lastWatchedAt: Date.now(),
-        completed: false,
-        progressSeconds: video.currentTime,
-        durationSeconds: video.duration || 0,
+        completed: entry.percentage >= COMPLETE_AT,
+        progressSeconds: entry.currentTime,
+        durationSeconds: entry.duration,
         sourceUrl: session.source.kind !== 'local' ? session.source.url : undefined
       })
     }
@@ -907,9 +1032,10 @@ export function PlayerPage(): JSX.Element {
   useEffect(() => {
     if (session.mediaType === 'movie') return
     if (upNextDismissedRef.current || upNextShownRef.current) return
-    if (!duration || duration < 120) return
+    if (!totalDurationSeconds || totalDurationSeconds < 120) return
     const inOutro =
-      current >= duration - 85 || (duration > 0 && (current / duration) * 100 >= 94)
+      current >= totalDurationSeconds - 85 ||
+      (totalDurationSeconds > 0 && (current / totalDurationSeconds) * 100 >= 94)
     if (!inOutro) return
 
     upNextShownRef.current = true
@@ -930,7 +1056,7 @@ export function PlayerPage(): JSX.Element {
       cancelled = true
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [current, duration, session.cacheId, session.mediaType, session.externalId, session.season, session.episode])
+  }, [current, totalDurationSeconds, session.cacheId, session.mediaType, session.externalId, session.season, session.episode])
 
   useEffect(() => {
     if (!upNext || upNextBusy) return
@@ -1108,7 +1234,10 @@ export function PlayerPage(): JSX.Element {
         cacheId: source.id,
         source,
         resolution: source.quality !== 'unknown' ? source.quality : qualityPref,
-        resumeSeconds: videoRef.current?.currentTime || session.resumeSeconds || 0
+        resumeSeconds: useAudioRemux
+          ? wallClockTime(videoRef.current?.currentTime || 0)
+          : videoRef.current?.currentTime || session.resumeSeconds || 0,
+        runtimeSeconds: session.runtimeSeconds
       })
 
       void window.cinevault?.torrent.stop(prevCacheId)
@@ -1193,7 +1322,10 @@ export function PlayerPage(): JSX.Element {
         cacheId: source.id,
         source,
         resolution: source.quality !== 'unknown' ? source.quality : qualityPref,
-        resumeSeconds: videoRef.current?.currentTime || session.resumeSeconds || 0
+        resumeSeconds: useAudioRemux
+          ? wallClockTime(videoRef.current?.currentTime || 0)
+          : videoRef.current?.currentTime || session.resumeSeconds || 0,
+        runtimeSeconds: session.runtimeSeconds
       })
 
       void window.cinevault?.torrent.stop(prevCacheId)
@@ -1302,14 +1434,16 @@ export function PlayerPage(): JSX.Element {
   const skipBy = (deltaSec: number): void => {
     const video = videoRef.current
     if (!video) return
-    const dur = video.duration || durationRef.current || 0
-    const target = Math.max(
-      0,
-      Math.min((video.currentTime || 0) + deltaSec, dur || video.currentTime + deltaSec)
-    )
+    const dur = totalDurationSeconds || durationRef.current || 0
+    const now = useAudioRemux ? wallClockTime(video.currentTime) : video.currentTime || 0
+    const target = Math.max(0, Math.min(now + deltaSec, dur || now + deltaSec))
+    if (useAudioRemux) {
+      reattachRemuxAt(target)
+      flashSeek(deltaSec)
+      return
+    }
     video.currentTime = target
     setCurrent(target)
-    // seeked will refresh; also sync immediately for snappy UI
     const cue = findActiveCue(cuesRef.current, target, subOffsetMsRef.current)
     setSubText(cue?.text || '')
     flashSeek(deltaSec)
@@ -1447,8 +1581,16 @@ export function PlayerPage(): JSX.Element {
     const video = videoRef.current
     if (!video) return
     const fwd = calculateForwardBuffer(video, 15)
-    const dur = video.duration || duration || 0
+    const dur = totalDurationSeconds || durationRef.current || duration || 0
     const target = Math.max(0, Math.min(t, dur || t))
+
+    if (useAudioRemux) {
+      reattachRemuxAt(target)
+      const cue = findActiveCue(cuesRef.current, target, subOffsetMsRef.current)
+      setSubText(cue?.text || '')
+      return
+    }
+
     if (session.source.kind === 'torrent' && fwd.forwardSec < 1.5 && target > video.currentTime + 1.5) {
       setBuffering(true)
       waitingSinceRef.current = Date.now()
@@ -1560,12 +1702,12 @@ export function PlayerPage(): JSX.Element {
 
   const onTimelineHover = (e: MouseEvent<HTMLDivElement>): void => {
     const ratio = ratioFromEvent(e, e.currentTarget)
-    const t = ratio * (duration || 0)
+    const t = ratio * (totalDurationSeconds || 0)
     setScrub({ x: e.clientX - e.currentTarget.getBoundingClientRect().left, t, visible: true })
 
     const sv = scrubVideoRef.current
     const canvas = canvasRef.current
-    if (sv && canvas && duration) {
+    if (sv && canvas && totalDurationSeconds) {
       const draw = (): void => {
         const ctx = canvas.getContext('2d')
         if (!ctx) return
@@ -1583,12 +1725,12 @@ export function PlayerPage(): JSX.Element {
   const onTimelinePointer = (e: ReactPointerEvent<HTMLDivElement>): void => {
     e.preventDefault()
     e.currentTarget.setPointerCapture(e.pointerId)
-    seekTo(ratioFromEvent(e, e.currentTarget) * (duration || 0))
+    seekTo(ratioFromEvent(e, e.currentTarget) * (totalDurationSeconds || 0))
   }
 
   const onTimelinePointerMove = (e: ReactPointerEvent<HTMLDivElement>): void => {
     if (!e.currentTarget.hasPointerCapture(e.pointerId)) return
-    seekTo(ratioFromEvent(e, e.currentTarget) * (duration || 0))
+    seekTo(ratioFromEvent(e, e.currentTarget) * (totalDurationSeconds || 0))
   }
 
   const detectedRes = (() => {
@@ -1603,7 +1745,10 @@ export function PlayerPage(): JSX.Element {
     return '—'
   })()
 
-  const progressPct = duration > 0 ? Math.min(100, (current / duration) * 100) : 0
+  const progressPct =
+    totalDurationSeconds > 0
+      ? Math.min(100, (currentPlaybackTime / totalDurationSeconds) * 100)
+      : 0
   const torrentPct = dl?.progress != null ? Math.min(100, dl.progress * 100) : 0
   // Show the farther of HTML5 buffer vs torrent completion so the light track is visible
   const downloadedPct = Math.max(bufferPct, torrentPct)
@@ -1776,6 +1921,9 @@ export function PlayerPage(): JSX.Element {
               Resolution: {videoWidth}×{videoHeight} ({detectedRes})
             </div>
             <div>Source: {session.source.kind}</div>
+            <div>Audio remux: {useAudioRemux ? 'on (AAC stereo)' : 'off'}</div>
+            {useAudioRemux && <div>Proxy offset: {formatTime(proxyOffset)}</div>}
+            <div>Effective duration: {formatTime(totalDurationSeconds)}</div>
             <div>
               URL host:{' '}
               {(() => {
@@ -1991,8 +2139,8 @@ export function PlayerPage(): JSX.Element {
           onPointerMove={onTimelinePointerMove}
           role="slider"
           aria-valuemin={0}
-          aria-valuemax={duration || 0}
-          aria-valuenow={current}
+          aria-valuemax={totalDurationSeconds || 0}
+          aria-valuenow={currentPlaybackTime}
           tabIndex={0}
         >
           {scrub.visible && (
@@ -2061,9 +2209,9 @@ export function PlayerPage(): JSX.Element {
             <Square size={18} fill="currentColor" strokeWidth={0} />
           </button>
           <span className="player-time">
-            {formatTime(current)} / {formatTime(duration)}
+            {formatTime(currentPlaybackTime)} / {formatTime(totalDurationSeconds)}
             <span className="player-time-remain">
-              · −{formatTime(Math.max(0, duration - current))}
+              · −{formatTime(Math.max(0, totalDurationSeconds - currentPlaybackTime))}
             </span>
           </span>
           <input

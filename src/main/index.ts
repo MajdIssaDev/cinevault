@@ -13,6 +13,7 @@ import { registerDownloaderHandlers } from './downloader'
 import { registerTorznabHandlers } from './torznab'
 import { destroyAllTorrents, registerTorrentHandlers } from './torrent'
 import { setupAutoUpdater } from './updater'
+import { startStreamProxy, stopStreamProxy } from './streamProxy'
 
 // Unlock platform HEVC decoding + GPU paths before Chromium boots.
 app.commandLine.appendSwitch('enable-features', 'PlatformHEVCDecoderSupport')
@@ -121,6 +122,12 @@ function createPipWindow(bounds?: { x: number; y: number; width: number; height:
 app.whenReady().then(() => {
   electronApp.setAppUserModelId('com.cinevault.app')
   app.on('browser-window-created', (_, window) => optimizer.watchWindowShortcuts(window))
+
+  try {
+    startStreamProxy()
+  } catch (err) {
+    console.error('[main] stream proxy failed to start:', err)
+  }
 
   protocol.handle('cvmedia', (request) => {
     const url = new URL(request.url)
@@ -276,6 +283,11 @@ app.whenReady().then(() => {
 })
 
 app.on('window-all-closed', () => {
+  stopStreamProxy()
   void destroyAllTorrents()
   if (process.platform !== 'darwin') app.quit()
+})
+
+app.on('before-quit', () => {
+  stopStreamProxy()
 })

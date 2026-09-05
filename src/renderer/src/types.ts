@@ -21,6 +21,10 @@ export interface CastMember {
   character?: string | null
   photoUrl?: string | null
   role: 'director' | 'cast'
+  /** IMDb person id (nm…) when known */
+  imdbId?: string | null
+  /** TMDB person id when known */
+  tmdbPersonId?: number | null
 }
 
 export interface MediaExtras {
@@ -58,6 +62,8 @@ export interface StreamSource {
   kind: 'local' | 'http' | 'hls' | 'torrent'
   hdr?: boolean
   spatialAudio?: boolean
+  /** Cinema audio (DDP/AC3/DTS/…) — play via local FFmpeg remux proxy. */
+  needsAudioRemux?: boolean
 }
 
 export interface FavoriteEntry {
@@ -89,6 +95,8 @@ export interface PlaybackSession {
   subtitleLang?: string
   resolution: Quality
   resumeSeconds?: number
+  /** Catalog/TMDB runtime in seconds — used when remuxed streams omit duration. */
+  runtimeSeconds?: number
 }
 
 export const GENRE_MOVIE: Record<number, string> = {

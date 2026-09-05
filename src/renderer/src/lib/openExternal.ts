@@ -41,6 +41,16 @@ export async function openExternal(url: string): Promise<void> {
   window.open(url, '_blank', 'noopener,noreferrer')
 }
 
+/** Prefer a known nm… id; otherwise IMDb name search for their filmography. */
+export function imdbPersonUrl(opts: { name: string; imdbId?: string | null }): string {
+  const raw = (opts.imdbId || '').trim()
+  if (raw) {
+    const id = /^nm/i.test(raw) ? raw : `nm${raw}`
+    return `https://www.imdb.com/name/${encodeURIComponent(id)}/`
+  }
+  return `https://www.imdb.com/find/?q=${encodeURIComponent(opts.name.trim())}&s=nm`
+}
+
 export async function openMagnet(magnetUri: string): Promise<void> {
   await openExternal(magnetUri)
 }

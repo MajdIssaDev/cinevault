@@ -295,8 +295,8 @@ export async function enrichFromImdb(
       episode_run_time?: number[]
       backdrop_path: string | null
       credits?: {
-        crew: { job: string; name: string; profile_path: string | null }[]
-        cast: { name: string; character: string; profile_path: string | null }[]
+        crew: { id?: number; job: string; name: string; profile_path: string | null }[]
+        cast: { id?: number; name: string; character: string; profile_path: string | null }[]
       }
       images?: { backdrops: { file_path: string }[] }
       videos?: { results: { site: string; type: string; key: string; name?: string; official?: boolean }[] }
@@ -311,7 +311,8 @@ export async function enrichFromImdb(
         name: director.name,
         character: 'Director',
         photoUrl: director.profile_path ? `${IMG}/w185${director.profile_path}` : null,
-        role: 'director'
+        role: 'director',
+        tmdbPersonId: director.id ?? null
       })
     }
     for (const c of (m.credits?.cast || []).slice(0, 4)) {
@@ -319,7 +320,8 @@ export async function enrichFromImdb(
         name: c.name,
         character: c.character,
         photoUrl: c.profile_path ? `${IMG}/w185${c.profile_path}` : null,
-        role: 'cast'
+        role: 'cast',
+        tmdbPersonId: c.id ?? null
       })
     }
     const trailer = pickBestTrailer(m.videos?.results)
@@ -344,8 +346,8 @@ export async function enrichFromImdb(
     runtime?: number
     backdrop_path: string | null
     credits?: {
-      crew: { job: string; name: string; profile_path: string | null }[]
-      cast: { name: string; character: string; profile_path: string | null }[]
+      crew: { id?: number; job: string; name: string; profile_path: string | null }[]
+      cast: { id?: number; name: string; character: string; profile_path: string | null }[]
     }
     images?: { backdrops: { file_path: string }[] }
     videos?: { results: { site: string; type: string; key: string; name?: string; official?: boolean }[] }
@@ -363,7 +365,8 @@ export async function enrichFromImdb(
       name: director.name,
       character: 'Director',
       photoUrl: director.profile_path ? `${IMG}/w185${director.profile_path}` : null,
-      role: 'director'
+      role: 'director',
+      tmdbPersonId: director.id ?? null
     })
   }
   for (const c of (m.credits?.cast || []).slice(0, 4)) {
@@ -371,7 +374,8 @@ export async function enrichFromImdb(
       name: c.name,
       character: c.character,
       photoUrl: c.profile_path ? `${IMG}/w185${c.profile_path}` : null,
-      role: 'cast'
+      role: 'cast',
+      tmdbPersonId: c.id ?? null
     })
   }
   const trailer = pickBestTrailer(m.videos?.results)
@@ -508,6 +512,30 @@ export async function fetchTitleLogoUrl(
     if (!pick?.file_path) return null
     return `${IMG}/original${pick.file_path}`
   } catch {
+    return null
+  }
+}
+
+const personImdbCache = new Map<number, string | null>()
+
+/** Resolve a TMDB person id → IMDb `nm…` id (cached). */
+export async function getPersonImdbId(
+  apiKey: string,
+  personId: number
+): Promise<string | null> {
+  if (!apiKey || !personId) return null
+  if (personImdbCache.has(personId)) return personImdbCache.get(personId) ?? null
+  try {
+    const data = await tmdb<{ imdb_id?: string | null }>(
+      apiKey,
+      `/person/${personId}/external_ids`
+    )
+    const id = data.imdb_id?.trim() || null
+    personImdbCache.set(personId, id)
+    return id
+  } catch (err) {
+    console.error('Failed to fetch person external IDs:', err)
+    personImdbCache.set(personId, null)
     return null
   }
 }

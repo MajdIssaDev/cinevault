@@ -987,13 +987,13 @@ html.player-chrome-hidden .titlebar {
 }
 .catalog-search-clear {
   position: absolute;
-  right: 8px;
-  top: 50%;
-  transform: translateY(-50%);
+  right: 6px;
+  top: 0;
+  bottom: 0;
   z-index: 2;
   width: 28px;
   height: 28px;
-  margin: 0;
+  margin: auto 0;
   padding: 0;
   border: 0;
   border-radius: 8px;
@@ -1003,6 +1003,7 @@ html.player-chrome-hidden .titlebar {
   background: rgba(255, 255, 255, 0.08);
   color: rgba(255, 255, 255, 0.75);
   cursor: pointer;
+  /* No CSS transform — framer-motion owns transform for enter/exit */
 }
 .catalog-search-clear:hover {
   background: rgba(255, 255, 255, 0.14);
@@ -1983,10 +1984,29 @@ html.player-chrome-hidden .titlebar {
   border-radius: 16px;
   border: 1px solid rgba(255, 255, 255, 0.05);
   background: rgba(255, 255, 255, 0.06);
-  transition: background 0.15s ease;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease, transform 0.12s ease;
 }
 .cast-chip:hover {
   background: rgba(255, 255, 255, 0.1);
+  border-color: rgba(14, 165, 233, 0.35);
+}
+.cast-chip:active {
+  transform: scale(0.95);
+}
+.cast-chip.is-opening {
+  opacity: 0.72;
+  cursor: wait;
+}
+.cast-chip:disabled {
+  cursor: wait;
+}
+.cast-chip:focus-visible {
+  outline: 2px solid rgba(14, 165, 233, 0.65);
+  outline-offset: 2px;
 }
 .cast-avatar-wrap {
   width: 44px;
@@ -2077,27 +2097,113 @@ html.player-chrome-hidden .titlebar {
   padding: 12px;
   margin: 0;
 }
-.gallery-lightbox img {
+.gallery-lightbox-stage {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  place-items: center;
+  max-width: 90vw;
+  max-height: 85vh;
+}
+.gallery-lightbox-img,
+.gallery-lightbox img.gallery-lightbox-img {
   width: auto;
   height: auto;
-  max-width: 98vw;
-  max-height: 96vh;
+  max-width: 90vw;
+  max-height: 85vh;
   object-fit: contain;
-  border-radius: 4px;
+  border-radius: 12px;
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.55);
   filter: none !important;
+  user-select: none;
 }
 .gallery-close {
   position: absolute;
   top: 16px;
   right: 20px;
-  z-index: 1;
+  z-index: 50;
   height: 40px;
-  padding: 0 16px;
+  padding: 0 14px;
   border-radius: 999px;
   border: 1px solid rgba(255, 255, 255, 0.16);
   background: rgba(255, 255, 255, 0.12);
   color: #fff;
   cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 600;
+}
+.gallery-close:hover {
+  background: rgba(255, 255, 255, 0.18);
+}
+.gallery-nav {
+  position: absolute;
+  top: 50%;
+  z-index: 50;
+  width: 48px;
+  height: 48px;
+  margin: 0;
+  padding: 0;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  background: rgba(0, 0, 0, 0.6);
+  color: rgba(255, 255, 255, 0.85);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transform: translateY(-50%);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.5);
+  transition: background 0.15s ease, color 0.15s ease, transform 0.15s ease;
+}
+.gallery-nav:hover {
+  background: rgba(255, 255, 255, 0.2);
+  color: #fff;
+  transform: translateY(-50%) scale(1.05);
+}
+.gallery-nav:active {
+  transform: translateY(-50%) scale(0.95);
+}
+.gallery-nav-prev {
+  left: 24px;
+}
+.gallery-nav-next {
+  right: 24px;
+}
+.gallery-counter {
+  position: absolute;
+  bottom: 24px;
+  left: 50%;
+  z-index: 50;
+  transform: translateX(-50%);
+  padding: 6px 12px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.6);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  color: #d4d4d4;
+  font-size: 12px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.02em;
+  pointer-events: none;
+}
+@media (max-width: 720px) {
+  .gallery-nav-prev {
+    left: 10px;
+  }
+  .gallery-nav-next {
+    right: 10px;
+  }
+  .gallery-nav {
+    width: 40px;
+    height: 40px;
+  }
 }
 
 .detail-actions {

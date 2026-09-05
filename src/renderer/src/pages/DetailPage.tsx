@@ -7,7 +7,8 @@ import type { CatalogItem, EpisodeInfo, MediaExtras, Quality, SeasonInfo, Stream
 import { fetchMovieDetails } from '../api/ytsCatalog'
 import { episodesForSeason, fetchSeriesDetails } from '../api/tvmaze'
 import { fetchAnimeDetails } from '../api/anilist'
-import { enrichFromImdb, mergeExtras } from '../api/tmdb'
+import { enrichFromImdb, getPersonImdbId, mergeExtras } from '../api/tmdb'
+import { GalleryLightbox } from '../components/GalleryLightbox'
 import {
   formatFileSize,
   searchPublicIndexers,
@@ -37,6 +38,7 @@ import { pickSharpHeroUrl, upgradeImageUrl } from '../lib/heroImage'
 import { useWatchLater } from '../hooks/useWatchLater'
 import { catalogToWatchLaterItem } from '../services/watchLaterService'
 import { openTrailerSearch, resolveTrailerForItem } from '../lib/trailer'
+import { imdbPersonUrl, openExternal } from '../lib/openExternal'
 import { buildTrailerInfo, type TrailerInfo } from '../api/tmdb'
 import {
   formatSubtitleMenuLabel,
@@ -114,7 +116,7 @@ export function DetailPage(): JSX.Element {
 
   const [item, setItem] = useState<CatalogItem | null>(null)
   const [extras, setExtras] = useState<MediaExtras>({})
-  const [lightbox, setLightbox] = useState<string | null>(null)
+  const [lightboxIndex, setLightboxIndex] = useState<number | null>(null)
   const [trailer, setTrailer] = useState<TrailerInfo | null>(null)
   const [trailerBusy, setTrailerBusy] = useState(false)
   const fav = useAppStore((s) => {
@@ -148,6 +150,7 @@ export function DetailPage(): JSX.Element {
   const autoDowngrade = true
   const [savedProgress, setSavedProgress] = useState<PlaybackProgress | null>(null)
   const [forceFromStart, setForceFromStart] = useState(false)
+  const [castOpeningKey, setCastOpeningKey] = useState<string | null>(null)
 
   useEffect(() => {
     setSelectedRes(defaultTargetFromQuality(qualityPref))
@@ -155,20 +158,11 @@ export function DetailPage(): JSX.Element {
   }, [qualityPref, item?.id])
 
   useEffect(() => {
-    if (!lightbox) return
-    const onKey = (e: KeyboardEvent): void => {
-      if (e.key === 'Escape') setLightbox(null)
-    }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [lightbox])
-
-  useEffect(() => {
     let cancelled = false
     const run = async (): Promise<void> => {
       setError(null)
       setExtras({})
-      setLightbox(null)
+      setLightboxIndex(null)
       setTrailer(null)
       try {
         if (mediaType === 'anime') {
@@ -587,7 +581,14 @@ export function DetailPage(): JSX.Element {
         subtitleLabel,
         subtitleLang: subLang,
         resolution: (source.quality !== 'unknown' ? source.quality : qualityPref) as Quality,
-        resumeSeconds: fromStart ? 0 : resumeAt
+        resumeSeconds: fromStart ? 0 : resumeAt,
+        runtimeSeconds:
+          (episode?.runtime && episode.runtime > 0
+            ? episode.runtime * 60
+            : extras.runtimeMinutes && extras.runtimeMinutes > 0
+              ? extras.runtimeMinutes * 60
+              : undefined) ||
+          (savedProgress && savedProgress.duration > 60 ? savedProgress.duration : undefined)
       })
       setForceFromStart(false)
     } catch (e) {
@@ -660,7 +661,14 @@ export function DetailPage(): JSX.Element {
           ? 0
           : savedProgress && savedProgress.currentTime > 3
             ? savedProgress.currentTime
-            : undefined
+            : undefined,
+        runtimeSeconds:
+          (episode?.runtime && episode.runtime > 0
+            ? episode.runtime * 60
+            : extras.runtimeMinutes && extras.runtimeMinutes > 0
+              ? extras.runtimeMinutes * 60
+              : undefined) ||
+          (savedProgress && savedProgress.duration > 60 ? savedProgress.duration : undefined)
       })
       setForceFromStart(false)
     } catch (e) {
@@ -710,6 +718,23 @@ export function DetailPage(): JSX.Element {
   const cast = extras.cast || []
   const stills = extras.stills || []
   const backdrop = pickSharpHeroUrl(item.backdropUrl, stills)
+
+  const openCastOnImdb = async (member: (typeof cast)[number]): Promise<void> => {
+    const key = `${member.role}-${member.name}`
+    setCastOpeningKey(key)
+    try {
+      let imdbId = member.imdbId || null
+      const apiKey = settings?.tmdbApiKey
+      if (!imdbId && member.tmdbPersonId && apiKey) {
+        imdbId = await getPersonImdbId(apiKey, member.tmdbPersonId)
+      }
+      await openExternal(imdbPersonUrl({ name: member.name, imdbId }))
+    } catch {
+      await openExternal(imdbPersonUrl({ name: member.name }))
+    } finally {
+      setCastOpeningKey(null)
+    }
+  }
 
   const openTrailer = async (): Promise<void> => {
     if (!item) return
@@ -948,11 +973,11 @@ export function DetailPage(): JSX.Element {
                 <span
                   className="detail-audio-warn"
                   role="status"
-                  title="May require external player or audio transcoding"
+                  title="Desktop app remuxes cinema audio to AAC during playback"
                 >
                   Best match uses{' '}
-                  {bestStream.audioLabel || bestStream.audioCodec || 'cinema audio'} — audio may
-                  be silent in-app
+                  {bestStream.audioLabel || bestStream.audioCodec || 'cinema audio'} — remuxed to
+                  AAC in-app
                 </span>
               )}
             </div>
@@ -979,34 +1004,42 @@ export function DetailPage(): JSX.Element {
               <h2>Cast & Crew</h2>
             </div>
             <div className="cast-row">
-              {cast.map((c) => (
-                <div
-                  key={`${c.role}-${c.name}`}
-                  className="cast-chip"
-                  title={c.character || c.role}
-                >
-                  <div className="cast-avatar-wrap">
-                    {c.photoUrl ? (
-                      <img
-                        src={c.photoUrl}
-                        alt={c.name}
-                        className="cast-avatar"
-                        loading="lazy"
-                      />
-                    ) : (
-                      <span className="cast-avatar-fallback" aria-hidden>
-                        {c.name ? c.name.charAt(0).toUpperCase() : '?'}
+              {cast.map((c) => {
+                const chipKey = `${c.role}-${c.name}`
+                const busy = castOpeningKey === chipKey
+                return (
+                  <button
+                    key={chipKey}
+                    type="button"
+                    className={`cast-chip${busy ? ' is-opening' : ''}`}
+                    title={`View ${c.name} on IMDb`}
+                    aria-busy={busy}
+                    disabled={busy}
+                    onClick={() => void openCastOnImdb(c)}
+                  >
+                    <div className="cast-avatar-wrap">
+                      {c.photoUrl ? (
+                        <img
+                          src={c.photoUrl}
+                          alt=""
+                          className="cast-avatar"
+                          loading="lazy"
+                        />
+                      ) : (
+                        <span className="cast-avatar-fallback" aria-hidden>
+                          {c.name ? c.name.charAt(0).toUpperCase() : '?'}
+                        </span>
+                      )}
+                    </div>
+                    <div className="cast-copy">
+                      <strong className="cast-name">{c.name}</strong>
+                      <span className="cast-role">
+                        {c.role === 'director' ? 'Director' : c.character || 'Cast'}
                       </span>
-                    )}
-                  </div>
-                  <div className="cast-copy">
-                    <strong className="cast-name">{c.name}</strong>
-                    <span className="cast-role">
-                      {c.role === 'director' ? 'Director' : c.character || 'Cast'}
-                    </span>
-                  </div>
-                </div>
-              ))}
+                    </div>
+                  </button>
+                )
+              })}
             </div>
           </section>
         )}
@@ -1017,12 +1050,12 @@ export function DetailPage(): JSX.Element {
               <h2>Stills & Gallery</h2>
             </div>
             <HScrollRail className="gallery-rail" aria-label="Stills gallery" role="list">
-              {stills.map((url) => (
+              {stills.map((url, index) => (
                 <button
                   key={url}
                   type="button"
                   className="gallery-thumb"
-                  onClick={() => setLightbox(upgradeImageUrl(url))}
+                  onClick={() => setLightboxIndex(index)}
                 >
                   <img src={url} alt="" loading="lazy" decoding="async" />
                 </button>
@@ -1031,19 +1064,14 @@ export function DetailPage(): JSX.Element {
           </section>
         )}
 
-        {lightbox &&
+        {lightboxIndex != null &&
+          stills.length > 0 &&
           createPortal(
-            <div
-              className="gallery-lightbox"
-              role="dialog"
-              aria-modal="true"
-              onClick={() => setLightbox(null)}
-            >
-              <img src={lightbox} alt="" onClick={(e) => e.stopPropagation()} />
-              <button type="button" className="gallery-close" onClick={() => setLightbox(null)}>
-                Close
-              </button>
-            </div>,
+            <GalleryLightbox
+              images={stills.map((url) => upgradeImageUrl(url))}
+              initialIndex={lightboxIndex}
+              onClose={() => setLightboxIndex(null)}
+            />,
             document.body
           )}
 

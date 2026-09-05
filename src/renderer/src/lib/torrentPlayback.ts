@@ -1,6 +1,7 @@
 import type { Quality, StreamSource } from '../types'
 import type { PublicSearchResult } from '../services/publicSearchService'
 import { isBrowserPreferredVideo, parseTorrentVideo } from './torrentParser'
+import { needsAudioRemux } from './audioRemux'
 
 export function guessQualityFromName(name: string): Quality | 'unknown' {
   const n = name.toLowerCase()
@@ -130,6 +131,7 @@ export async function startTorrentPlayback(opts: {
     url: started.streamUrl,
     kind: 'torrent',
     hdr: /hdr|dv|dolby.?vision/i.test(opts.label),
-    spatialAudio: /atmos|truehd|dts.?x/i.test(opts.label)
+    spatialAudio: /atmos|truehd|dts.?x/i.test(opts.label),
+    needsAudioRemux: needsAudioRemux(opts.label || started.fileName || '')
   }
 }
