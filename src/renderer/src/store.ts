@@ -41,9 +41,12 @@ const fallbackSettings = async (): Promise<AppSettings> => {
     libraryFolders: [],
     cacheDirectory: '',
     cacheRetentionHours: 48,
+    maxCacheGB: 20,
     autoDeleteOnComplete: true,
     preferHdr: true,
     preferSpatialAudio: true,
+    nightMode: false,
+    volumeBoost: 1.25,
     updateChannel: 'latest'
   }
 }

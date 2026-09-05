@@ -4,6 +4,7 @@ import {
   ArrowLeft,
   Captions,
   Info,
+  Keyboard,
   Maximize2,
   Minimize2,
   Minus,
@@ -13,7 +14,9 @@ import {
   Plus,
   RotateCcw,
   RotateCw,
-  Square
+  Square,
+  Volume2,
+  VolumeX
 } from 'lucide-react'
 import { useAppStore } from '../store'
 import { findActiveCue, formatSubtitleDelayMs, formatTime, parseSrt, type Cue } from '../lib/subtitles'
@@ -39,6 +42,8 @@ import {
   sortTorrentResults,
   startTorrentPlayback
 } from '../lib/torrentPlayback'
+import { useAniSkip, isInSkipWindow } from '../hooks/useAniSkip'
+import { useAudioEnhancer } from '../hooks/useAudioEnhancer'
 import { getBestStream } from '../lib/streamScorer'
 import { searchPublicIndexers } from '../services/publicSearchService'
 import { isBrowserPreferredVideo, parseTorrentVideo } from '../lib/torrentParser'
@@ -229,6 +234,9 @@ export function PlayerPage(): JSX.Element {
       : 0
   )
   const [volume, setVolume] = useState(1)
+  const [muted, setMuted] = useState(false)
+  const [showShortcuts, setShowShortcuts] = useState(false)
+  const [nativePip, setNativePip] = useState(false)
   const [showStats, setShowStats] = useState(false)
   const [showSubs, setShowSubs] = useState(false)
   const [subSize, setSubSize] = useState(28)
@@ -303,6 +311,16 @@ export function PlayerPage(): JSX.Element {
   )
 
   const currentPlaybackTime = current
+
+  const nightMode = Boolean(settings?.nightMode)
+  const volumeBoost = settings?.volumeBoost ?? 1.25
+  useAudioEnhancer(videoRef, nightMode, volumeBoost)
+
+  const aniSkip = useAniSkip(
+    session.mediaType === 'anime' ? session.malId : null,
+    session.mediaType === 'anime' ? session.episode : null
+  )
+  const showSkipIntro = isInSkipWindow(currentPlaybackTime, aniSkip.op)
 
   useEffect(() => {
     setSubLang(session.subtitleLang || settings?.defaultSubtitleLanguage || 'en')
@@ -1082,7 +1100,7 @@ export function PlayerPage(): JSX.Element {
     if (upNextDismissedRef.current || upNextShownRef.current) return
     if (!totalDurationSeconds || totalDurationSeconds < 120) return
     const inOutro =
-      current >= totalDurationSeconds - 85 ||
+      current >= totalDurationSeconds - 30 ||
       (totalDurationSeconds > 0 && (current / totalDurationSeconds) * 100 >= 94)
     if (!inOutro) return
 
@@ -1211,6 +1229,7 @@ export function PlayerPage(): JSX.Element {
         posterUrl: target.posterUrl,
         backdropUrl: target.backdropUrl,
         imdbId: target.imdbId || session.imdbId,
+        malId: session.malId ?? null,
         source,
         subtitlePath: null,
         subtitleUrl: null,
@@ -1552,24 +1571,66 @@ export function PlayerPage(): JSX.Element {
       const tag = (e.target as HTMLElement | null)?.tagName
       if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return
       if (e.ctrlKey || e.metaKey || e.altKey) return
-      if (e.repeat) return
 
       const key = e.key
+      if (key === '?' || (key === '/' && e.shiftKey)) {
+        e.preventDefault()
+        setShowShortcuts((v) => !v)
+        bumpChrome()
+        return
+      }
+      if (key === 'Escape' && showShortcuts) {
+        e.preventDefault()
+        setShowShortcuts(false)
+        return
+      }
+      if (e.repeat && key !== 'ArrowLeft' && key !== 'ArrowRight' && key !== 'ArrowUp' && key !== 'ArrowDown' && key !== '[' && key !== ']' && key !== 'z' && key !== 'Z' && key !== 'x' && key !== 'X' && key !== 'j' && key !== 'J' && key !== 'l' && key !== 'L') {
+        return
+      }
+
       if (key === ' ' || key === 'k' || key === 'K') {
         e.preventDefault()
         togglePlay()
-      } else if (key === 'ArrowLeft') {
+      } else if (key === 'ArrowLeft' || key === 'j' || key === 'J') {
         e.preventDefault()
-        startHold('seek-left', () => skipBy(-5))
-      } else if (key === 'ArrowRight') {
+        startHold('seek-left', () => skipBy(-10))
+      } else if (key === 'ArrowRight' || key === 'l' || key === 'L') {
         e.preventDefault()
-        startHold('seek-right', () => skipBy(5))
+        startHold('seek-right', () => skipBy(10))
+      } else if (key === 'ArrowUp') {
+        e.preventDefault()
+        setVolume((v) => {
+          const next = Math.min(1, Math.round((v + 0.05) * 100) / 100)
+          if (videoRef.current) {
+            videoRef.current.volume = next
+            videoRef.current.muted = false
+          }
+          setMuted(false)
+          return next
+        })
+        bumpChrome()
+      } else if (key === 'ArrowDown') {
+        e.preventDefault()
+        setVolume((v) => {
+          const next = Math.max(0, Math.round((v - 0.05) * 100) / 100)
+          if (videoRef.current) videoRef.current.volume = next
+          return next
+        })
+        bumpChrome()
+      } else if (key === 'm' || key === 'M') {
+        e.preventDefault()
+        setMuted((prev) => {
+          const next = !prev
+          if (videoRef.current) videoRef.current.muted = next
+          return next
+        })
+        bumpChrome()
       } else if (key === 'z' || key === 'Z' || key === '[') {
         e.preventDefault()
-        startHold('sub-earlier', () => nudgeSubs(-100), 70, 320)
+        startHold('sub-earlier', () => nudgeSubs(-250), 70, 320)
       } else if (key === 'x' || key === 'X' || key === ']') {
         e.preventDefault()
-        startHold('sub-later', () => nudgeSubs(100), 70, 320)
+        startHold('sub-later', () => nudgeSubs(250), 70, 320)
       } else if (key === 'g' || key === 'G') {
         e.preventDefault()
         startHold('sub-earlier', () => nudgeSubs(-100), 70, 320)
@@ -1579,12 +1640,30 @@ export function PlayerPage(): JSX.Element {
       } else if (key === 'f' || key === 'F') {
         e.preventDefault()
         toggleFullscreen()
+      } else if (key === 'n' || key === 'N') {
+        e.preventDefault()
+        if (upNext) void playNextEpisode(upNext)
+        else if (session.mediaType !== 'movie') {
+          void resolveNextEpisode({
+            mediaType: session.mediaType,
+            externalId: session.externalId,
+            season: session.season,
+            episode: session.episode
+          }).then((next) => {
+            if (next) void playNextEpisode(next)
+          })
+        }
+      } else if (key === 'i' || key === 'I') {
+        if (showSkipIntro && aniSkip.op) {
+          e.preventDefault()
+          seekTo(aniSkip.op.endTime)
+        }
       }
     }
 
     const onKeyUp = (e: KeyboardEvent): void => {
-      if (e.key === 'ArrowLeft') clearHold('seek-left')
-      else if (e.key === 'ArrowRight') clearHold('seek-right')
+      if (e.key === 'ArrowLeft' || e.key === 'j' || e.key === 'J') clearHold('seek-left')
+      else if (e.key === 'ArrowRight' || e.key === 'l' || e.key === 'L') clearHold('seek-right')
       else if (e.key === 'z' || e.key === 'Z' || e.key === '[') clearHold('sub-earlier')
       else if (e.key === 'x' || e.key === 'X' || e.key === ']') clearHold('sub-later')
       else if (e.key === 'g' || e.key === 'G') clearHold('sub-earlier')
@@ -1610,7 +1689,7 @@ export function PlayerPage(): JSX.Element {
       document.removeEventListener('fullscreenchange', onFsChange)
       onBlur()
     }
-  }, [session.source.kind])
+  }, [session.source.kind, session.mediaType, session.externalId, session.season, session.episode, upNext, showShortcuts, showSkipIntro, aniSkip.op])
 
   const onStageClick = (): void => {
     if (clickTimerRef.current) clearTimeout(clickTimerRef.current)
@@ -1748,6 +1827,38 @@ export function PlayerPage(): JSX.Element {
     await window.cinevault?.pip.open()
     setSession(null)
   }
+
+  const toggleNativePip = async (): Promise<void> => {
+    const video = videoRef.current
+    if (!video) return
+    try {
+      if (document.pictureInPictureElement) {
+        await document.exitPictureInPicture()
+        setNativePip(false)
+        return
+      }
+      if (document.pictureInPictureEnabled) {
+        await video.requestPictureInPicture()
+        setNativePip(true)
+        bumpChrome()
+        return
+      }
+    } catch {
+      /* fall through to Electron PiP */
+    }
+    await enterPip()
+  }
+
+  useEffect(() => {
+    const onLeave = (): void => setNativePip(false)
+    const onEnter = (): void => setNativePip(true)
+    videoRef.current?.addEventListener('leavepictureinpicture', onLeave)
+    videoRef.current?.addEventListener('enterpictureinpicture', onEnter)
+    return () => {
+      videoRef.current?.removeEventListener('leavepictureinpicture', onLeave)
+      videoRef.current?.removeEventListener('enterpictureinpicture', onEnter)
+    }
+  }, [session.cacheId])
 
   const ratioFromEvent = (e: { clientX: number }, el: HTMLElement): number => {
     const rect = el.getBoundingClientRect()
@@ -2138,6 +2249,19 @@ export function PlayerPage(): JSX.Element {
           </div>
         )}
 
+        {showSkipIntro && aniSkip.op && (
+          <button
+            type="button"
+            className="skip-intro-btn"
+            onClick={(e) => {
+              e.stopPropagation()
+              seekTo(aniSkip.op!.endTime)
+            }}
+          >
+            Skip Intro
+          </button>
+        )}
+
         {upNext && (
           <div className="up-next-dock" onClick={(e) => e.stopPropagation()}>
             <div className="up-next-head">
@@ -2154,7 +2278,9 @@ export function PlayerPage(): JSX.Element {
               </svg>
               <div>
                 <div className="up-next-label">
-                  {upNextBusy ? 'Starting…' : `Up Next in ${upNextSeconds}s`}
+                  {upNextBusy
+                    ? 'Starting…'
+                    : `Up Next in ${upNextSeconds}s: Episode ${upNext.episode}`}
                 </div>
                 <div className="up-next-title">
                   S{upNext.season}:E{upNext.episode} · {upNext.episodeTitle}
@@ -2169,7 +2295,7 @@ export function PlayerPage(): JSX.Element {
                 onClick={() => void playNextEpisode(upNext)}
               >
                 <Play size={14} fill="currentColor" strokeWidth={0} />
-                Next Episode
+                Play Now
               </button>
               <button
                 type="button"
@@ -2177,7 +2303,7 @@ export function PlayerPage(): JSX.Element {
                 disabled={upNextBusy}
                 onClick={dismissUpNext}
               >
-                Watch Credits
+                Cancel
               </button>
             </div>
           </div>
@@ -2214,11 +2340,11 @@ export function PlayerPage(): JSX.Element {
           <button
             className="player-ctrl"
             type="button"
-            title="Rewind 5 seconds (←)"
-            aria-label="Rewind 5 seconds"
+            title="Rewind 10 seconds (J / ←)"
+            aria-label="Rewind 10 seconds"
             onPointerDown={(e) => {
               e.preventDefault()
-              startHold('btn-seek-left', () => skipBy(-5))
+              startHold('btn-seek-left', () => skipBy(-10))
             }}
             onPointerUp={() => clearHold('btn-seek-left')}
             onPointerLeave={() => clearHold('btn-seek-left')}
@@ -2242,11 +2368,11 @@ export function PlayerPage(): JSX.Element {
           <button
             className="player-ctrl"
             type="button"
-            title="Forward 5 seconds (→)"
-            aria-label="Forward 5 seconds"
+            title="Forward 10 seconds (L / →)"
+            aria-label="Forward 10 seconds"
             onPointerDown={(e) => {
               e.preventDefault()
-              startHold('btn-seek-right', () => skipBy(5))
+              startHold('btn-seek-right', () => skipBy(10))
             }}
             onPointerUp={() => clearHold('btn-seek-right')}
             onPointerLeave={() => clearHold('btn-seek-right')}
@@ -2269,24 +2395,57 @@ export function PlayerPage(): JSX.Element {
               · −{formatTime(Math.max(0, totalDurationSeconds - currentPlaybackTime))}
             </span>
           </span>
+          <button
+            className="player-ctrl"
+            type="button"
+            title={muted ? 'Unmute (M)' : 'Mute (M)'}
+            aria-label={muted ? 'Unmute' : 'Mute'}
+            onClick={() => {
+              setMuted((prev) => {
+                const next = !prev
+                if (videoRef.current) videoRef.current.muted = next
+                return next
+              })
+              bumpChrome()
+            }}
+          >
+            {muted || volume === 0 ? <VolumeX {...ICON} /> : <Volume2 {...ICON} />}
+          </button>
           <input
             className="volume"
             type="range"
             min={0}
             max={1}
             step={0.01}
-            value={volume}
-            style={{ ['--vol' as string]: `${volume * 100}%` } as CSSProperties}
+            value={muted ? 0 : volume}
+            style={{ ['--vol' as string]: `${(muted ? 0 : volume) * 100}%` } as CSSProperties}
             title="Volume"
             aria-label="Volume"
             onChange={(e) => {
               const v = Number(e.target.value)
               setVolume(v)
-              if (videoRef.current) videoRef.current.volume = v
+              setMuted(false)
+              if (videoRef.current) {
+                videoRef.current.volume = v
+                videoRef.current.muted = false
+              }
               bumpChrome()
             }}
           />
           <div className="spacer" />
+          <button
+            className={`player-ctrl${showShortcuts ? ' is-active' : ''}`}
+            type="button"
+            title="Keyboard shortcuts (?)"
+            aria-label="Keyboard shortcuts"
+            aria-pressed={showShortcuts}
+            onClick={() => {
+              setShowShortcuts((v) => !v)
+              bumpChrome()
+            }}
+          >
+            <Keyboard {...ICON} />
+          </button>
           <button
             className={`player-ctrl${showStats ? ' is-active' : ''}`}
             type="button"
@@ -2301,11 +2460,11 @@ export function PlayerPage(): JSX.Element {
             <Info {...ICON} />
           </button>
           <button
-            className="player-ctrl"
+            className={`player-ctrl${nativePip ? ' is-active' : ''}`}
             type="button"
             title="Picture in picture"
             aria-label="Picture in picture"
-            onClick={() => void enterPip()}
+            onClick={() => void toggleNativePip()}
           >
             <PictureInPicture2 {...ICON} />
           </button>
@@ -2333,6 +2492,66 @@ export function PlayerPage(): JSX.Element {
           </button>
         </div>
       </div>
+
+      {showShortcuts && (
+        <div
+          className="player-shortcuts-modal"
+          role="dialog"
+          aria-label="Keyboard shortcuts"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <div className="player-shortcuts-card">
+            <div className="player-shortcuts-head">
+              <strong>Keyboard shortcuts</strong>
+              <button type="button" className="player-ctrl" onClick={() => setShowShortcuts(false)}>
+                ✕
+              </button>
+            </div>
+            <ul className="player-shortcuts-list">
+              <li>
+                <kbd>Space</kbd> / <kbd>K</kbd>
+                <span>Play / Pause</span>
+              </li>
+              <li>
+                <kbd>F</kbd>
+                <span>Fullscreen</span>
+              </li>
+              <li>
+                <kbd>M</kbd>
+                <span>Mute</span>
+              </li>
+              <li>
+                <kbd>J</kbd> / <kbd>←</kbd>
+                <span>Seek −10s</span>
+              </li>
+              <li>
+                <kbd>L</kbd> / <kbd>→</kbd>
+                <span>Seek +10s</span>
+              </li>
+              <li>
+                <kbd>↑</kbd> / <kbd>↓</kbd>
+                <span>Volume ±5%</span>
+              </li>
+              <li>
+                <kbd>[</kbd> / <kbd>]</kbd>
+                <span>Subtitle ±250ms</span>
+              </li>
+              <li>
+                <kbd>N</kbd>
+                <span>Next episode</span>
+              </li>
+              <li>
+                <kbd>I</kbd>
+                <span>Skip intro</span>
+              </li>
+              <li>
+                <kbd>?</kbd>
+                <span>This help</span>
+              </li>
+            </ul>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

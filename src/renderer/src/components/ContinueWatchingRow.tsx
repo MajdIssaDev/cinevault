@@ -140,6 +140,7 @@ export function ContinueWatchingRow({
                     onRemove={() => {
                       clearProgressForMedia(entry.mediaId)
                       void window.cinevault?.cache.removeByMedia(entry.mediaId)
+                      void window.cinevault?.torrent.deleteByMedia?.(entry.mediaId)
                     }}
                     onOpen={() =>
                       navigate(`/detail/${entry.mediaType}/${entry.externalId}`)

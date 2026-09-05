@@ -14,6 +14,8 @@ export interface CatalogItem {
   rating: number
   genres: string[]
   imdbId?: string | null
+  /** MyAnimeList id when known (AniSkip) */
+  malId?: number | null
 }
 
 export interface CastMember {
@@ -87,6 +89,8 @@ export interface PlaybackSession {
   posterUrl?: string | null
   backdropUrl?: string | null
   imdbId?: string | null
+  /** MyAnimeList id for AniSkip (anime) */
+  malId?: number | null
   source: StreamSource
   subtitlePath?: string | null
   subtitleUrl?: string | null

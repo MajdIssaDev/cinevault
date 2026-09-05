@@ -12,6 +12,7 @@ import { registerSubtitleEngineHandlers } from './subtitlesEngine'
 import { registerDownloaderHandlers } from './downloader'
 import { registerTorznabHandlers } from './torznab'
 import { destroyAllTorrents, registerTorrentHandlers } from './torrent'
+import { registerTorrentRegistryHandlers } from './torrentRegistry'
 import { setupAutoUpdater } from './updater'
 import { startStreamProxy, stopStreamProxy } from './streamProxy'
 
@@ -152,6 +153,7 @@ app.whenReady().then(() => {
   registerDownloaderHandlers()
   registerTorznabHandlers()
   registerTorrentHandlers()
+  registerTorrentRegistryHandlers()
 
   createMainWindow()
   setupAutoUpdater(() => mainWindow)

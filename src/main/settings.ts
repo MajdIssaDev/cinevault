@@ -16,9 +16,15 @@ export interface AppSettings {
   libraryFolders: string[]
   cacheDirectory: string
   cacheRetentionHours: number
+  /** Soft cap for torrent cache size (GB). LRU eviction when exceeded. */
+  maxCacheGB: number
   autoDeleteOnComplete: boolean
   preferHdr: boolean
   preferSpatialAudio: boolean
+  /** Web Audio compressor + dialogue lift */
+  nightMode: boolean
+  /** Gain multiplier while night mode is on (1.0–2.0) */
+  volumeBoost: number
   updateChannel: 'latest'
 }
 
@@ -34,9 +40,12 @@ const DEFAULTS: AppSettings = {
   libraryFolders: [],
   cacheDirectory: '',
   cacheRetentionHours: 48,
+  maxCacheGB: 20,
   autoDeleteOnComplete: true,
   preferHdr: true,
   preferSpatialAudio: true,
+  nightMode: false,
+  volumeBoost: 1.25,
   updateChannel: 'latest'
 }
 
@@ -62,10 +71,16 @@ export function loadSettings(): AppSettings {
   }
 }
 
-export function saveSettings( partial: Partial<AppSettings>): AppSettings {
+export function saveSettings(partial: Partial<AppSettings>): AppSettings {
   const next = { ...loadSettings(), ...partial }
   if (!next.cacheDirectory) next.cacheDirectory = getDefaultCacheDir()
   if (!existsSync(next.cacheDirectory)) mkdirSync(next.cacheDirectory, { recursive: true })
+  if (typeof next.maxCacheGB === 'number') {
+    next.maxCacheGB = Math.min(500, Math.max(1, next.maxCacheGB))
+  }
+  if (typeof next.volumeBoost === 'number') {
+    next.volumeBoost = Math.min(2, Math.max(1, next.volumeBoost))
+  }
   writeFileSync(settingsPath(), JSON.stringify(next, null, 2), 'utf-8')
   return next
 }

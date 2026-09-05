@@ -11,6 +11,7 @@ import {
 import { join } from 'path'
 import { loadSettings } from './settings'
 import { destroyAllTorrents, destroyTorrentData, stopMatchingTorrents } from './torrent'
+import { deleteTorrentByMediaId, enforceCacheCap } from './torrentRegistry'
 
 export interface CacheEntry {
   id: string
@@ -167,6 +168,7 @@ export function registerCacheHandlers(): void {
     const entries = readIndex().filter((e) => e.id !== entry.id)
     entries.push(entry)
     writeIndex(entries)
+    void enforceCacheCap()
     return entry
   })
 
@@ -190,8 +192,13 @@ export function registerCacheHandlers(): void {
 
   ipcMain.handle(
     'cache:remove-by-media',
-    async (_e, mediaId: string, opts?: { keepId?: string }) =>
-      removeByMediaId(mediaId, opts)
+    async (_e, mediaId: string, opts?: { keepId?: string }) => {
+      const n = await removeByMediaId(mediaId, opts)
+      if (mediaId && !opts?.keepId) {
+        await deleteTorrentByMediaId(mediaId)
+      }
+      return n
+    }
   )
 
   ipcMain.handle('cache:clear-all', async () => {

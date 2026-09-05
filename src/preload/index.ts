@@ -177,6 +177,17 @@ const api = {
       magnetUri?: string
       destroyStore?: boolean
     }): Promise<boolean> => ipcRenderer.invoke('torrent:destroy-data', opts),
+    prepareStream: (opts: {
+      mediaId: string
+      infoHash: string
+      folderPath?: string
+      cacheId?: string
+      sizeBytes?: number
+    }): Promise<{ success: boolean }> => ipcRenderer.invoke('torrent:prepare-stream', opts),
+    deleteByMedia: (mediaId: string): Promise<{ success: boolean }> =>
+      ipcRenderer.invoke('torrent:delete-by-media', mediaId),
+    enforceCacheCap: (maxCacheGB?: number): Promise<{ success: boolean; removed: number }> =>
+      ipcRenderer.invoke('torrent:enforce-cache-cap', maxCacheGB),
     prioritize: (opts: {
       id: string
       currentTime: number

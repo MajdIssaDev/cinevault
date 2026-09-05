@@ -131,6 +131,16 @@ export async function startTorrentPlayback(opts: {
     await window.cinevault.cache.removeByMedia(opts.mediaId, { keepId: opts.cacheId })
   }
 
+  const hashMatch = opts.magnetUri.match(/xt=urn:btih:([a-fA-F0-9]{40}|[a-zA-Z2-7]{32})/i)
+  const infoHash = hashMatch?.[1]?.toLowerCase() || ''
+  if (opts.mediaId && infoHash && window.cinevault.torrent.prepareStream) {
+    await window.cinevault.torrent.prepareStream({
+      mediaId: opts.mediaId,
+      infoHash,
+      cacheId: opts.cacheId
+    })
+  }
+
   const quality = guessQualityFromName(opts.label)
   return {
     id: opts.cacheId,

@@ -449,7 +449,27 @@ export function SettingsPage(): JSX.Element {
                     label="Prefer spatial / Atmos audio tracks"
                     description="When labels mention Atmos, TrueHD, or DTS:X"
                   />
+                  <Toggle
+                    checked={Boolean(draft.nightMode)}
+                    onChange={(v) => set('nightMode', v)}
+                    label="Night Mode (Dialogue Boost)"
+                    description="Softens loud peaks and lifts quiet dialogue via Web Audio"
+                  />
                 </div>
+                {draft.nightMode && (
+                  <Field label={`Max volume boost (${Math.round((draft.volumeBoost || 1) * 100)}%)`}>
+                    <input
+                      className="settings-input"
+                      type="range"
+                      min={100}
+                      max={200}
+                      step={5}
+                      value={Math.round((draft.volumeBoost || 1) * 100)}
+                      onChange={(e) => set('volumeBoost', Number(e.target.value) / 100)}
+                      aria-label="Max volume boost"
+                    />
+                  </Field>
+                )}
               </section>
             )}
 
@@ -483,6 +503,21 @@ export function SettingsPage(): JSX.Element {
                       min={1}
                       value={draft.cacheRetentionHours}
                       onChange={(e) => set('cacheRetentionHours', Number(e.target.value) || 48)}
+                    />
+                  </Field>
+
+                  <Field label="Max torrent cache (GB)">
+                    <input
+                      className="settings-input settings-input-narrow"
+                      type="number"
+                      min={1}
+                      max={500}
+                      value={draft.maxCacheGB ?? 20}
+                      onChange={(e) => {
+                        const n = Number(e.target.value) || 20
+                        set('maxCacheGB', n)
+                        void window.cinevault?.torrent.enforceCacheCap?.(n)
+                      }}
                     />
                   </Field>
 

@@ -16,6 +16,7 @@ async function anilist<T>(query: string, variables: Record<string, unknown> = {}
 
 function mapAnime(m: {
   id: number
+  idMal?: number | null
   title: { romaji: string; english: string | null }
   description: string | null
   coverImage: { large: string | null }
@@ -39,12 +40,14 @@ function mapAnime(m: {
     backdropUrl: m.bannerImage,
     releaseDate,
     rating: m.averageScore ? m.averageScore / 10 : 0,
-    genres: m.genres || []
+    genres: m.genres || [],
+    malId: m.idMal ?? null
   }
 }
 
 const MEDIA_FIELDS = `
   id
+  idMal
   title { romaji english }
   description
   coverImage { large }
