@@ -311,18 +311,19 @@ button { cursor: pointer; border: none; background: none; user-select: none; -we
 }
 
 /* Transparent titlebar while the player owns the viewport */
-html.player-open .titlebar {
-  background: transparent;
+html.player-open .titlebar,
+html.player-open .titlebar.titlebar-player {
+  background: #000;
   border-bottom-color: transparent;
-  transition: opacity 0.3s ease-out;
+  transition: background 0.2s ease-out, opacity 0.3s ease-out;
   pointer-events: auto;
-  -webkit-app-region: drag;
+  -webkit-app-region: no-drag; /* manual IPC drag while playing */
+  cursor: default;
 }
-/* Invisible brand/settings, but the strip still drags the window */
+/* Keep the full strip hittable for drag; hide brand/settings visually */
 html.player-open .titlebar-left {
   opacity: 0;
   pointer-events: auto;
-  -webkit-app-region: drag;
 }
 html.player-open .titlebar .brand,
 html.player-open .titlebar .titlebar-icon {
@@ -331,33 +332,46 @@ html.player-open .titlebar .titlebar-icon {
 }
 html.player-open .titlebar-drag-space {
   pointer-events: auto;
-  -webkit-app-region: drag;
+  -webkit-app-region: no-drag;
+  cursor: grab;
+}
+html.player-open .titlebar-drag-space:active {
+  cursor: grabbing;
 }
 html.player-open .titlebar-win-restore::after {
-  background: transparent;
+  background: #000;
 }
 /* Hide titlebar chrome when idle, but keep drag strip + window controls */
 html.player-chrome-hidden .titlebar {
-  background: transparent;
+  background: #000;
   border-bottom-color: transparent;
   pointer-events: auto;
-  -webkit-app-region: drag;
 }
 html.player-chrome-hidden .titlebar-left,
 html.player-chrome-hidden .titlebar .brand,
 html.player-chrome-hidden .titlebar .titlebar-icon {
   opacity: 0;
 }
-html.player-chrome-hidden .titlebar-left,
+html.player-chrome-hidden .titlebar-left {
+  pointer-events: auto;
+}
 html.player-chrome-hidden .titlebar-drag-space {
   pointer-events: auto;
-  -webkit-app-region: drag;
 }
 html.player-chrome-hidden .titlebar-controls,
 html.player-chrome-hidden .titlebar-win-btn {
   opacity: 1;
   pointer-events: auto;
   -webkit-app-region: no-drag;
+}
+
+/* Player sits under the titlebar strip so the bar always receives drag gestures */
+html.player-open .player-root {
+  top: var(--titlebar-height);
+  right: 0;
+  bottom: 0;
+  left: 0;
+  inset: unset;
 }
 
 .top-nav {
@@ -3833,10 +3847,7 @@ html.player-chrome-hidden .titlebar-win-btn {
   display: flex;
   align-items: flex-start;
   gap: 12px;
-  /* Leave the OS window-control strip clear so Electron drag regions
-     under the titlebar cannot steal minimize / maximize / close clicks. */
-  padding: calc(var(--titlebar-height) + 8px) calc(var(--player-overlay-pad) + 140px) 64px
-    var(--player-overlay-pad);
+  padding: 12px var(--player-overlay-pad) 64px;
   background: linear-gradient(
     to bottom,
     rgba(0, 0, 0, 0.85) 0%,
@@ -3918,7 +3929,7 @@ html.player-chrome-hidden .titlebar-win-btn {
 }
 .sub-offset-toast {
   position: absolute;
-  top: calc(var(--titlebar-height) + 52px);
+  top: 52px;
   left: 50%;
   transform: translateX(-50%);
   z-index: 6;
@@ -3936,7 +3947,7 @@ html.player-chrome-hidden .titlebar-win-btn {
 }
 .stall-recovery-toast {
   position: absolute;
-  top: calc(var(--titlebar-height) + 52px);
+  top: 52px;
   left: 50%;
   transform: translateX(-50%);
   z-index: 8;

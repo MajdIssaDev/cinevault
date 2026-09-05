@@ -109,6 +109,9 @@ const api = {
     close: (): Promise<void> => ipcRenderer.invoke('window:close'),
     toggleMaximize: (): Promise<boolean> => ipcRenderer.invoke('window:toggle-maximize'),
     isMaximized: (): Promise<boolean> => ipcRenderer.invoke('window:is-maximized'),
+    dragStart: (): Promise<boolean> => ipcRenderer.invoke('window:drag-start'),
+    dragMove: (): Promise<boolean> => ipcRenderer.invoke('window:drag-move'),
+    dragEnd: (): Promise<boolean> => ipcRenderer.invoke('window:drag-end'),
     onMaximizedChanged: (cb: (maximized: boolean) => void): (() => void) => {
       const handler = (_event: unknown, maximized: boolean): void => cb(Boolean(maximized))
       ipcRenderer.on('window:maximized-changed', handler)

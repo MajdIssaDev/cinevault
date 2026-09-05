@@ -1,4 +1,4 @@
-import { useEffect, useState, type CSSProperties } from 'react'
+import { useEffect, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from 'react'
 import { NavLink } from 'react-router-dom'
 import { useAppStore } from '../store'
 import { isMobileShell } from '../lib/platform'
@@ -84,19 +84,72 @@ function WindowControls(): JSX.Element {
   )
 }
 
+/** Pointer-driven window move (works when CSS app-region fails over the player). */
+function useWindowDrag(enabled: boolean): {
+  onPointerDown?: (e: ReactPointerEvent<HTMLElement>) => void
+  onPointerMove?: (e: ReactPointerEvent<HTMLElement>) => void
+  onPointerUp?: (e: ReactPointerEvent<HTMLElement>) => void
+  onPointerCancel?: (e: ReactPointerEvent<HTMLElement>) => void
+} {
+  const dragging = useRef(false)
+
+  if (!enabled) return {}
+
+  const end = (e: ReactPointerEvent<HTMLElement>): void => {
+    if (!dragging.current) return
+    dragging.current = false
+    try {
+      e.currentTarget.releasePointerCapture(e.pointerId)
+    } catch {
+      /* ignore */
+    }
+    void window.cinevault?.window.dragEnd?.()
+  }
+
+  return {
+    onPointerDown: (e) => {
+      if (e.button !== 0) return
+      if (!window.cinevault?.window.dragStart) return
+      // Ignore clicks that originated on window controls
+      const t = e.target as HTMLElement | null
+      if (t?.closest?.('.titlebar-controls, .titlebar-win-btn, .titlebar-icon')) return
+      e.preventDefault()
+      e.stopPropagation()
+      dragging.current = true
+      e.currentTarget.setPointerCapture(e.pointerId)
+      void window.cinevault.window.dragStart()
+    },
+    onPointerMove: (e) => {
+      if (!dragging.current) return
+      e.preventDefault()
+      void window.cinevault?.window.dragMove?.()
+    },
+    onPointerUp: end,
+    onPointerCancel: end
+  }
+}
+
 export function TitleBar(): JSX.Element {
   const updateAvailable = useAppStore((s) => s.updateAvailable)
   const playerOpen = Boolean(useAppStore((s) => s.session))
   const showControls = Boolean(window.cinevault?.window) && !isMobileShell()
+  const windowDrag = useWindowDrag(playerOpen)
 
-  const onDragDoubleClick = (): void => {
+  const onDragDoubleClick = (e: ReactMouseEvent): void => {
     if (!showControls) return
+    const t = e.target as HTMLElement | null
+    if (t?.closest?.('.titlebar-controls, .titlebar-win-btn, .titlebar-icon')) return
     void window.cinevault?.window.toggleMaximize()
   }
 
   return (
-    <header className="titlebar" style={dragStyle} onDoubleClick={onDragDoubleClick}>
-      <div className="titlebar-left" style={playerOpen ? dragStyle : noDragStyle}>
+    <header
+      className={`titlebar${playerOpen ? ' titlebar-player' : ''}`}
+      style={playerOpen ? noDragStyle : dragStyle}
+      onDoubleClick={onDragDoubleClick}
+      {...windowDrag}
+    >
+      <div className="titlebar-left" style={noDragStyle}>
         <div className="brand">CineVault</div>
         <NavLink
           to="/settings"
@@ -108,6 +161,9 @@ export function TitleBar(): JSX.Element {
           tabIndex={playerOpen ? -1 : undefined}
           aria-hidden={playerOpen || undefined}
           onClick={(e) => {
+            if (playerOpen) e.preventDefault()
+          }}
+          onPointerDown={(e) => {
             if (playerOpen) e.preventDefault()
           }}
         >

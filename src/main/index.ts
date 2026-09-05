@@ -171,6 +171,38 @@ app.whenReady().then(() => {
   // Kept for compatibility; custom title bar no longer uses native overlay.
   ipcMain.handle('window:set-titlebar-overlay', () => false)
 
+  // Manual window drag — CSS -webkit-app-region is unreliable over full-bleed player layers.
+  let dragOffset: { x: number; y: number } | null = null
+  ipcMain.handle('window:drag-start', () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return false
+    if (mainWindow.isMaximized()) {
+      // Windows-like: restore then start drag from cursor
+      const cursor = screen.getCursorScreenPoint()
+      mainWindow.unmaximize()
+      const restored = mainWindow.getBounds()
+      const x = Math.round(cursor.x - restored.width / 2)
+      const y = Math.max(0, cursor.y - Math.round(restored.height * 0.08))
+      mainWindow.setPosition(x, y)
+      dragOffset = { x: cursor.x - x, y: cursor.y - y }
+      return true
+    }
+    const cursor = screen.getCursorScreenPoint()
+    const [wx, wy] = mainWindow.getPosition()
+    dragOffset = { x: cursor.x - wx, y: cursor.y - wy }
+    return true
+  })
+  ipcMain.handle('window:drag-move', () => {
+    if (!mainWindow || mainWindow.isDestroyed() || !dragOffset) return false
+    if (mainWindow.isMaximized()) return false
+    const cursor = screen.getCursorScreenPoint()
+    mainWindow.setPosition(cursor.x - dragOffset.x, cursor.y - dragOffset.y)
+    return true
+  })
+  ipcMain.handle('window:drag-end', () => {
+    dragOffset = null
+    return true
+  })
+
   ipcMain.handle('pip:open', (_e, bounds?: { x: number; y: number; width: number; height: number }) => {
     if (pipWindow && !pipWindow.isDestroyed()) {
       pipWindow.focus()
