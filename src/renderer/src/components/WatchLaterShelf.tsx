@@ -1,5 +1,5 @@
 import { useNavigate } from 'react-router-dom'
-import { ChevronLeft, ChevronRight, Clock, X } from 'lucide-react'
+import { BookmarkPlus, ChevronLeft, ChevronRight, Clock, X } from 'lucide-react'
 import { AnimatePresence, motion } from 'framer-motion'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useWatchLater } from '../hooks/useWatchLater'
@@ -10,6 +10,7 @@ import {
 } from '../services/watchLaterService'
 
 const SCROLL_STEP = 160
+const PLACEHOLDER_SLOTS = 4
 
 function WatchLaterCard({
   item,
@@ -58,11 +59,25 @@ function WatchLaterCard({
   )
 }
 
+function WatchLaterPlaceholder({ onActivate }: { onActivate: () => void }): JSX.Element {
+  return (
+    <button
+      type="button"
+      className="watch-later-placeholder"
+      onClick={onActivate}
+      aria-label="Browse catalog to add Watch Later"
+    >
+      <BookmarkPlus size={20} strokeWidth={1.5} className="watch-later-placeholder-icon" aria-hidden />
+      <span className="watch-later-placeholder-label">Add to Watch Later</span>
+    </button>
+  )
+}
+
 export function WatchLaterShelf({
   mediaType
 }: {
   mediaType: WatchLaterMediaType
-}): JSX.Element {
+}): JSX.Element | null {
   const navigate = useNavigate()
   const { watchLaterItems, remove } = useWatchLater(mediaType)
   const trackRef = useRef<HTMLDivElement>(null)
@@ -98,6 +113,14 @@ export function WatchLaterShelf({
     trackRef.current?.scrollBy({ left: dir * SCROLL_STEP, behavior: 'smooth' })
   }
 
+  const focusCatalog = (): void => {
+    document.querySelector<HTMLElement>('.catalog-toolbar .catalog-search')?.focus()
+    document.querySelector('.catalog-toolbar')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  }
+
+  const sparse = watchLaterItems.length > 0 && watchLaterItems.length < PLACEHOLDER_SLOTS
+  const placeholderCount = sparse ? Math.max(0, PLACEHOLDER_SLOTS - watchLaterItems.length) : 0
+
   return (
     <AnimatePresence initial={false}>
       {watchLaterItems.length > 0 && (
@@ -106,7 +129,7 @@ export function WatchLaterShelf({
           className="watch-later-shelf catalog-shelf watch-later-shelf-anim"
           aria-label="Watch Later"
           initial={{ opacity: 0, height: 0, marginBottom: 0 }}
-          animate={{ opacity: 1, height: 'auto', marginBottom: 20 }}
+          animate={{ opacity: 1, height: 'auto', marginBottom: 0 }}
           exit={{
             opacity: 0,
             height: 0,
@@ -189,6 +212,18 @@ export function WatchLaterShelf({
                     </motion.div>
                   )
                 })}
+                {Array.from({ length: placeholderCount }).map((_, i) => (
+                  <motion.div
+                    key={`placeholder-${i}`}
+                    layout
+                    initial={{ opacity: 0, scale: 0.95 }}
+                    animate={{ opacity: 1, scale: 1 }}
+                    exit={{ opacity: 0, scale: 0.95 }}
+                    className="watch-later-card-motion watch-later-placeholder-motion"
+                  >
+                    <WatchLaterPlaceholder onActivate={focusCatalog} />
+                  </motion.div>
+                ))}
               </AnimatePresence>
             </div>
           </div>

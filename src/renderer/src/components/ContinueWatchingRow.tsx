@@ -94,7 +94,7 @@ export function ContinueWatchingRow({
           className="continue-watching catalog-shelf continue-watching-anim"
           aria-label="Continue watching"
           initial={{ opacity: 0, height: 0, marginBottom: 0 }}
-          animate={{ opacity: 1, height: 'auto', marginBottom: 20 }}
+          animate={{ opacity: 1, height: 'auto', marginBottom: 0 }}
           exit={{
             opacity: 0,
             height: 0,

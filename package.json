@@ -1,6 +1,6 @@
 {
   "name": "cinevault",
-  "version": "1.1.8",
+  "version": "1.1.9",
   "description": "Modern media catalog and player for movies, series, and anime — local library & HTTP streams",
   "main": "./out/main/index.js",
   "author": "CineVault",

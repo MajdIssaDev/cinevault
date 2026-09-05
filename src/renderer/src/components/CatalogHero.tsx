@@ -168,6 +168,8 @@ export function CatalogHero({ item }: { item: CatalogItem }): JSX.Element {
         <div className="catalog-hero-scrim catalog-hero-scrim-x" />
         <div className="catalog-hero-scrim catalog-hero-scrim-y" />
       </div>
+      {/* Bottom gradient fade into page background */}
+      <div className="catalog-hero-fade-bottom" aria-hidden />
       <div className="catalog-hero-content">
         <p className="catalog-hero-kicker">Featured</p>
         {titleLogo ? (
