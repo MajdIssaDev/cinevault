@@ -16,6 +16,10 @@ const api = {
     markComplete: (id: string): Promise<CacheEntry | null> =>
       ipcRenderer.invoke('cache:mark-complete', id),
     remove: (id: string): Promise<boolean> => ipcRenderer.invoke('cache:remove', id),
+    removeByMedia: (
+      mediaId: string,
+      opts?: { keepId?: string }
+    ): Promise<number> => ipcRenderer.invoke('cache:remove-by-media', mediaId, opts),
     clearAll: (): Promise<boolean> => ipcRenderer.invoke('cache:clear-all'),
     openFolder: (): Promise<string> => ipcRenderer.invoke('cache:open-folder'),
     stats: (): Promise<{ bytes: number; count: number; directory: string }> =>
@@ -163,7 +167,13 @@ const api = {
       streamUrl?: string
       fileName?: string
     } | null> => ipcRenderer.invoke('torrent:status', id),
-    stop: (id: string): Promise<boolean> => ipcRenderer.invoke('torrent:stop', id),
+    stop: (id: string, opts?: { destroyStore?: boolean }): Promise<boolean> =>
+      ipcRenderer.invoke('torrent:stop', id, opts),
+    destroyData: (opts: {
+      id?: string
+      magnetUri?: string
+      destroyStore?: boolean
+    }): Promise<boolean> => ipcRenderer.invoke('torrent:destroy-data', opts),
     prioritize: (opts: {
       id: string
       currentTime: number

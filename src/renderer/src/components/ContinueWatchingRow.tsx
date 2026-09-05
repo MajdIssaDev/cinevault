@@ -4,7 +4,7 @@ import { AnimatePresence, motion } from 'framer-motion'
 import { Play, X } from 'lucide-react'
 import type { MediaType } from '../types'
 import {
-  clearProgress,
+  clearProgressForMedia,
   formatRemaining,
   getContinueWatchingList,
   subscribePlaybackHistory,
@@ -137,9 +137,10 @@ export function ContinueWatchingRow({
                 >
                   <ContinueCard
                     entry={entry}
-                    onRemove={() =>
-                      clearProgress(entry.mediaId, entry.season, entry.episode)
-                    }
+                    onRemove={() => {
+                      clearProgressForMedia(entry.mediaId)
+                      void window.cinevault?.cache.removeByMedia(entry.mediaId)
+                    }}
                     onOpen={() =>
                       navigate(`/detail/${entry.mediaType}/${entry.externalId}`)
                     }

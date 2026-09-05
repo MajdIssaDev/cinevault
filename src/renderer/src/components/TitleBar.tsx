@@ -27,13 +27,17 @@ function WindowControls(): JSX.Element {
   }
 
   return (
-    <div className="titlebar-controls" style={noDragStyle}>
+    <div className="titlebar-controls" style={noDragStyle} onPointerDown={(e) => e.stopPropagation()}>
       <button
         type="button"
         className="titlebar-win-btn"
         title="Minimize"
         aria-label="Minimize"
-        onClick={minimize}
+        onPointerDown={(e) => e.stopPropagation()}
+        onClick={(e) => {
+          e.stopPropagation()
+          minimize()
+        }}
       >
         <span className="titlebar-win-min" aria-hidden />
       </button>
@@ -42,7 +46,11 @@ function WindowControls(): JSX.Element {
         className="titlebar-win-btn"
         title={maximized ? 'Restore' : 'Maximize'}
         aria-label={maximized ? 'Restore' : 'Maximize'}
-        onClick={toggleMaximize}
+        onPointerDown={(e) => e.stopPropagation()}
+        onClick={(e) => {
+          e.stopPropagation()
+          toggleMaximize()
+        }}
       >
         {maximized ? (
           <span className="titlebar-win-restore" aria-hidden />
@@ -55,7 +63,11 @@ function WindowControls(): JSX.Element {
         className="titlebar-win-btn titlebar-win-close"
         title="Close"
         aria-label="Close"
-        onClick={close}
+        onPointerDown={(e) => e.stopPropagation()}
+        onClick={(e) => {
+          e.stopPropagation()
+          close()
+        }}
       >
         <svg
           className="titlebar-win-x"

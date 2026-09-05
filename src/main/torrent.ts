@@ -1,5 +1,5 @@
 import { ipcMain } from 'electron'
-import { existsSync, mkdirSync } from 'fs'
+import { existsSync, mkdirSync, rmSync } from 'fs'
 import { join } from 'path'
 import type { Server } from 'http'
 import WebTorrent from 'webtorrent'
@@ -319,9 +319,29 @@ async function startTorrent(opts: {
   return ensureStream({ id: opts.id, torrent })
 }
 
-async function stopTorrent(id: string): Promise<boolean> {
+async function destroyTorrentInstance(
+  torrent: WebTorrent.Torrent,
+  destroyStore: boolean
+): Promise<void> {
+  await new Promise<void>((resolve) => {
+    try {
+      torrent.destroy({ destroyStore }, () => resolve())
+    } catch {
+      resolve()
+    }
+    setTimeout(resolve, destroyStore ? 2500 : 1500)
+  })
+}
+
+async function stopTorrent(
+  id: string,
+  opts?: { destroyStore?: boolean }
+): Promise<boolean> {
+  const destroyStore = Boolean(opts?.destroyStore)
   const entry = active.get(id)
-  if (!entry) return false
+  if (!entry) {
+    return false
+  }
   active.delete(id)
 
   await new Promise<void>((resolve) => {
@@ -333,16 +353,70 @@ async function stopTorrent(id: string): Promise<boolean> {
     setTimeout(resolve, 500)
   })
 
-  await new Promise<void>((resolve) => {
-    try {
-      entry.torrent.destroy({ destroyStore: false }, () => resolve())
-    } catch {
-      resolve()
-    }
-    setTimeout(resolve, 1500)
-  })
-
+  await destroyTorrentInstance(entry.torrent, destroyStore)
   return true
+}
+
+/** Stop + optionally wipe downloaded files for any active id matching a predicate. */
+export async function stopMatchingTorrents(
+  match: (id: string) => boolean,
+  opts?: { destroyStore?: boolean }
+): Promise<string[]> {
+  const ids = [...active.keys()].filter(match)
+  for (const id of ids) await stopTorrent(id, opts)
+  return ids
+}
+
+/**
+ * Fully remove torrent data for a cache id and/or magnet (active or residual on disk).
+ */
+export async function destroyTorrentData(opts: {
+  id?: string
+  magnetUri?: string
+  destroyStore?: boolean
+}): Promise<boolean> {
+  const destroyStore = opts.destroyStore !== false
+  let removed = false
+
+  if (opts.id && active.has(opts.id)) {
+    removed = (await stopTorrent(opts.id, { destroyStore })) || removed
+  }
+
+  const hash = opts.magnetUri ? infoHashFromMagnet(opts.magnetUri) : null
+  if (hash) {
+    const hit = findActiveByInfoHash(hash)
+    if (hit) {
+      removed = (await stopTorrent(hit.id, { destroyStore })) || removed
+    }
+
+    const wt = client
+    const known = wt && typeof wt.get === 'function' ? wt.get(hash) : null
+    if (known) {
+      // May already have been destroyed above; ignore duplicate destroy errors.
+      const stillListed = [...active.values()].some((e) => e.torrent === known)
+      if (!stillListed) {
+        await destroyTorrentInstance(known, destroyStore)
+        removed = true
+      }
+    }
+
+    if (destroyStore) {
+      const dir = join(torrentsDir(), hash)
+      const dirUpper = join(torrentsDir(), hash.toUpperCase())
+      for (const p of [dir, dirUpper]) {
+        try {
+          if (existsSync(p)) {
+            rmSync(p, { recursive: true, force: true, maxRetries: 6, retryDelay: 120 })
+            removed = true
+          }
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+  }
+
+  return removed
 }
 
 type TorrentFilePieces = WebTorrent.TorrentFile & {
@@ -503,7 +577,17 @@ export function registerTorrentHandlers(): void {
     return toStatus(entry)
   })
 
-  ipcMain.handle('torrent:stop', async (_e, id: string) => stopTorrent(id))
+  ipcMain.handle(
+    'torrent:stop',
+    async (_e, id: string, opts?: { destroyStore?: boolean }) =>
+      stopTorrent(id, opts)
+  )
+
+  ipcMain.handle(
+    'torrent:destroy-data',
+    async (_e, opts: { id?: string; magnetUri?: string; destroyStore?: boolean }) =>
+      destroyTorrentData(opts || {})
+  )
 
   ipcMain.handle(
     'torrent:prioritize',

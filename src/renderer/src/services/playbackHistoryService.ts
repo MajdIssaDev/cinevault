@@ -215,6 +215,26 @@ export function clearProgress(
   writeAll(map)
 }
 
+/** Remove every progress row for a title (all seasons/episodes). */
+export function clearProgressForMedia(mediaId: string): void {
+  if (!mediaId) return
+  const map = readAll()
+  let changed = false
+  for (const key of Object.keys(map)) {
+    const entry = map[key]
+    if (entry?.mediaId !== mediaId && !key.startsWith(`${mediaId}:`) && key !== mediaId) {
+      continue
+    }
+    delete map[key]
+    const timer = throttleTimers.get(key)
+    if (timer) clearTimeout(timer)
+    throttleTimers.delete(key)
+    pendingEntries.delete(key)
+    changed = true
+  }
+  if (changed) writeAll(map)
+}
+
 export function subscribePlaybackHistory(cb: () => void): () => void {
   const handler = (): void => cb()
   window.addEventListener(CHANGE_EVENT, handler)

@@ -10,10 +10,12 @@ import {
 } from 'fs'
 import { join } from 'path'
 import { loadSettings } from './settings'
-import { destroyAllTorrents } from './torrent'
+import { destroyAllTorrents, destroyTorrentData, stopMatchingTorrents } from './torrent'
 
 export interface CacheEntry {
   id: string
+  /** Catalog key e.g. movie-123 / series-456 — one stored torrent per mediaId */
+  mediaId?: string
   title: string
   mediaType: 'movie' | 'series' | 'anime'
   filePath: string
@@ -24,6 +26,9 @@ export interface CacheEntry {
   durationSeconds: number
   sourceUrl?: string
 }
+
+const COMPLETE_DELETE_MS = 5 * 60 * 1000
+const pendingDeletes = new Map<string, ReturnType<typeof setTimeout>>()
 
 function metaPath(cacheDir: string): string {
   return join(cacheDir, 'cache-index.json')
@@ -51,6 +56,83 @@ function writeIndex(entries: CacheEntry[]): void {
   writeFileSync(metaPath(dir), JSON.stringify(entries, null, 2), 'utf-8')
 }
 
+function cancelScheduledDelete(id: string): void {
+  const t = pendingDeletes.get(id)
+  if (t) clearTimeout(t)
+  pendingDeletes.delete(id)
+}
+
+function entryMatchesMedia(entry: CacheEntry, mediaId: string): boolean {
+  if (!mediaId) return false
+  if (entry.mediaId === mediaId) return true
+  return entry.id === mediaId || entry.id.startsWith(`${mediaId}-`)
+}
+
+async function wipeEntryFiles(entry: CacheEntry): Promise<void> {
+  await destroyTorrentData({
+    id: entry.id,
+    magnetUri: entry.sourceUrl?.startsWith('magnet:') ? entry.sourceUrl : undefined,
+    destroyStore: true
+  })
+  if (entry.filePath) {
+    try {
+      if (existsSync(entry.filePath)) {
+        rmSync(entry.filePath, { force: true, maxRetries: 6, retryDelay: 120 })
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+async function removeEntryById(id: string): Promise<boolean> {
+  cancelScheduledDelete(id)
+  const entries = readIndex()
+  const entry = entries.find((e) => e.id === id)
+  if (entry) await wipeEntryFiles(entry)
+  else {
+    await destroyTorrentData({ id, destroyStore: true })
+  }
+  writeIndex(entries.filter((e) => e.id !== id))
+  return true
+}
+
+async function removeByMediaId(
+  mediaId: string,
+  opts?: { keepId?: string }
+): Promise<number> {
+  if (!mediaId) return 0
+  const keepId = opts?.keepId
+  const entries = readIndex()
+  const doomed = entries.filter(
+    (e) => entryMatchesMedia(e, mediaId) && (!keepId || e.id !== keepId)
+  )
+
+  await stopMatchingTorrents(
+    (id) =>
+      (id === mediaId || id.startsWith(`${mediaId}-`)) && (!keepId || id !== keepId),
+    { destroyStore: true }
+  )
+
+  for (const entry of doomed) {
+    cancelScheduledDelete(entry.id)
+    await wipeEntryFiles(entry)
+  }
+
+  const kept = entries.filter((e) => !doomed.some((d) => d.id === e.id))
+  writeIndex(kept)
+  return doomed.length
+}
+
+function scheduleDelete(id: string, delayMs = COMPLETE_DELETE_MS): void {
+  if (pendingDeletes.has(id)) return
+  const timer = setTimeout(() => {
+    pendingDeletes.delete(id)
+    void removeEntryById(id)
+  }, delayMs)
+  pendingDeletes.set(id, timer)
+}
+
 export function pruneExpiredCache(): CacheEntry[] {
   const settings = loadSettings()
   const retentionMs = (settings.cacheRetentionHours || 48) * 60 * 60 * 1000
@@ -62,11 +144,8 @@ export function pruneExpiredCache(): CacheEntry[] {
     const expired = !entry.completed && now - entry.lastWatchedAt > retentionMs
     const doneAndDelete = entry.completed && settings.autoDeleteOnComplete
     if (expired || doneAndDelete) {
-      try {
-        if (existsSync(entry.filePath)) rmSync(entry.filePath, { force: true })
-      } catch {
-        /* ignore */
-      }
+      cancelScheduledDelete(entry.id)
+      void wipeEntryFiles(entry)
     } else {
       kept.push(entry)
     }
@@ -83,41 +162,40 @@ export function registerCacheHandlers(): void {
   })
 
   ipcMain.handle('cache:upsert', (_e, entry: CacheEntry) => {
+    // Don't cancel a pending post-complete wipe when progress keeps updating.
+    if (!entry.completed) cancelScheduledDelete(entry.id)
     const entries = readIndex().filter((e) => e.id !== entry.id)
     entries.push(entry)
     writeIndex(entries)
     return entry
   })
 
-  ipcMain.handle('cache:mark-complete', (_e, id: string) => {
-    const settings = loadSettings()
+  ipcMain.handle('cache:mark-complete', async (_e, id: string) => {
     let entries = readIndex()
     const entry = entries.find((e) => e.id === id)
-    if (!entry) return null
+    if (!entry) {
+      // Still schedule wipe for active torrent without index row
+      scheduleDelete(id)
+      return null
+    }
     entry.completed = true
     entry.lastWatchedAt = Date.now()
-    if (settings.autoDeleteOnComplete) {
-      try {
-        if (existsSync(entry.filePath)) rmSync(entry.filePath, { force: true })
-      } catch {
-        /* ignore */
-      }
-      entries = entries.filter((e) => e.id !== id)
-    }
     writeIndex(entries)
+    // Always wipe finished titles from disk after 5 minutes
+    scheduleDelete(id, COMPLETE_DELETE_MS)
     return entry
   })
 
-  ipcMain.handle('cache:remove', (_e, id: string) => {
-    const entries = readIndex()
-    const entry = entries.find((e) => e.id === id)
-    if (entry && existsSync(entry.filePath)) rmSync(entry.filePath, { force: true })
-    const next = entries.filter((e) => e.id !== id)
-    writeIndex(next)
-    return true
-  })
+  ipcMain.handle('cache:remove', async (_e, id: string) => removeEntryById(id))
+
+  ipcMain.handle(
+    'cache:remove-by-media',
+    async (_e, mediaId: string, opts?: { keepId?: string }) =>
+      removeByMediaId(mediaId, opts)
+  )
 
   ipcMain.handle('cache:clear-all', async () => {
+    for (const id of [...pendingDeletes.keys()]) cancelScheduledDelete(id)
 
     // Release file locks held by WebTorrent before deleting
     await destroyAllTorrents()
@@ -134,7 +212,6 @@ export function registerCacheHandlers(): void {
       }
     }
     writeIndex([])
-
 
     if (failures.length) {
       throw new Error(`Some cache files could not be deleted (in use): ${failures[0]}`)
@@ -168,7 +245,13 @@ export function registerCacheHandlers(): void {
       const full = join(dir, name)
       if (seen.has(full)) continue
       try {
-        bytes += statSync(full).size
+        const st = statSync(full)
+        if (st.isDirectory()) {
+          // Approximate: sum nested sizes would be expensive; count top-level dir size via walk
+          bytes += walkBytes(full)
+        } else {
+          bytes += st.size
+        }
       } catch {
         /* ignore */
       }
@@ -177,4 +260,23 @@ export function registerCacheHandlers(): void {
   })
 
   ipcMain.handle('cache:get-dir', () => ensureCacheDir())
+}
+
+function walkBytes(root: string): number {
+  let total = 0
+  try {
+    for (const name of readdirSync(root)) {
+      const full = join(root, name)
+      try {
+        const st = statSync(full)
+        if (st.isDirectory()) total += walkBytes(full)
+        else total += st.size
+      } catch {
+        /* ignore */
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+  return total
 }

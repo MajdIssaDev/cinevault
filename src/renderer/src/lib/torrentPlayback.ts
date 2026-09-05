@@ -105,6 +105,8 @@ export async function startTorrentPlayback(opts: {
   magnetUri: string
   label: string
   preferredQuality?: Quality
+  /** When set, keep only this title's new torrent and wipe prior downloads for it. */
+  mediaId?: string
 }): Promise<StreamSource> {
   if (!window.cinevault?.torrent) {
     throw new Error('Torrent playback requires the desktop app')
@@ -123,6 +125,12 @@ export async function startTorrentPlayback(opts: {
       )
     })
   ])
+
+  // One torrent per title: remove prior downloads only after the new stream is ready.
+  if (opts.mediaId && window.cinevault.cache?.removeByMedia) {
+    await window.cinevault.cache.removeByMedia(opts.mediaId, { keepId: opts.cacheId })
+  }
+
   const quality = guessQualityFromName(opts.label)
   return {
     id: opts.cacheId,

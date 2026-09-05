@@ -160,8 +160,8 @@ button { cursor: pointer; border: none; background: none; user-select: none; -we
   border-radius: 0;
   -webkit-app-region: drag;
   user-select: none;
-  overflow: hidden;
-  z-index: 200;
+  overflow: visible;
+  z-index: 10050;
 }
 [data-theme='light'] .titlebar {
   background: color-mix(in srgb, var(--titlebar) 92%, #fff);
@@ -228,6 +228,9 @@ button { cursor: pointer; border: none; background: none; user-select: none; -we
   height: 100%;
   margin-left: auto;
   -webkit-app-region: no-drag;
+  position: relative;
+  z-index: 2;
+  pointer-events: auto;
 }
 .titlebar-win-btn {
   width: 44px;
@@ -322,9 +325,22 @@ html.player-open .titlebar .titlebar-icon {
 html.player-open .titlebar-win-restore::after {
   background: transparent;
 }
+/* Hide titlebar chrome when idle, but keep window controls clickable */
 html.player-chrome-hidden .titlebar {
+  background: transparent;
+  border-bottom-color: transparent;
+}
+html.player-chrome-hidden .titlebar-left,
+html.player-chrome-hidden .titlebar-drag-space,
+html.player-chrome-hidden .titlebar .brand,
+html.player-chrome-hidden .titlebar .titlebar-icon {
   opacity: 0;
   pointer-events: none;
+}
+html.player-chrome-hidden .titlebar-controls,
+html.player-chrome-hidden .titlebar-win-btn {
+  opacity: 1;
+  pointer-events: auto;
 }
 
 .top-nav {
@@ -3800,7 +3816,10 @@ html.player-chrome-hidden .titlebar {
   display: flex;
   align-items: flex-start;
   gap: 12px;
-  padding: calc(var(--titlebar-height) + 8px) var(--player-overlay-pad) 64px;
+  /* Leave the OS window-control strip clear so Electron drag regions
+     under the titlebar cannot steal minimize / maximize / close clicks. */
+  padding: calc(var(--titlebar-height) + 8px) calc(var(--player-overlay-pad) + 140px) 64px
+    var(--player-overlay-pad);
   background: linear-gradient(
     to bottom,
     rgba(0, 0, 0, 0.85) 0%,
@@ -3808,12 +3827,21 @@ html.player-chrome-hidden .titlebar {
     transparent 100%
   );
   border: 0;
+  pointer-events: none;
+  -webkit-app-region: no-drag;
+}
+.player-top .player-no-drag,
+.player-top button,
+.player-top .player-title-block,
+.player-top .player-drag-spacer {
   pointer-events: auto;
-  -webkit-app-region: drag;
 }
 .player-top .player-no-drag,
 .player-top button {
   -webkit-app-region: no-drag;
+}
+.player-top .player-drag-spacer {
+  -webkit-app-region: drag;
 }
 .player-title-block {
   min-width: 0;

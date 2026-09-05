@@ -264,6 +264,7 @@ export function PlayerPage(): JSX.Element {
   const [hevcSwitchBusy, setHevcSwitchBusy] = useState(false)
   const [vlcBusy, setVlcBusy] = useState(false)
   const stallNudgedRef = useRef(false)
+  const completedMarkedRef = useRef(false)
   const prioritizeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const [seekFlash, setSeekFlash] = useState<{ dir: -1 | 1; seconds: number } | null>(null)
   const [subToast, setSubToast] = useState<string | null>(null)
@@ -305,6 +306,7 @@ export function PlayerPage(): JSX.Element {
 
   useEffect(() => {
     setSubLang(session.subtitleLang || settings?.defaultSubtitleLanguage || 'en')
+    completedMarkedRef.current = false
     // eslint-disable-next-line react-hooks/exhaustive-deps -- reset language only for a new playback session
   }, [session.cacheId])
 
@@ -1021,18 +1023,25 @@ export function PlayerPage(): JSX.Element {
     const persistCache = (): void => {
       if (!window.cinevault) return
       const entry = buildEntry()
+      const mediaId = mediaIdFromParts(session.mediaType, session.externalId)
+      const done = entry.percentage >= COMPLETE_AT
       void window.cinevault.cache.upsert({
         id: session.cacheId,
+        mediaId,
         title: session.title,
         mediaType: session.mediaType,
         filePath: session.source.kind === 'local' ? session.source.url : '',
         createdAt: Date.now(),
         lastWatchedAt: Date.now(),
-        completed: entry.percentage >= COMPLETE_AT,
+        completed: done,
         progressSeconds: entry.currentTime,
         durationSeconds: entry.duration,
         sourceUrl: session.source.kind !== 'local' ? session.source.url : undefined
       })
+      if (done && !completedMarkedRef.current) {
+        completedMarkedRef.current = true
+        void window.cinevault.cache.markComplete(session.cacheId)
+      }
     }
 
     const onPause = (): void => {
@@ -1163,7 +1172,8 @@ export function PlayerPage(): JSX.Element {
             cacheId: `${session.mediaType}-${session.externalId}-${target.season}-${target.episode}-${Date.now()}`,
             magnetUri: chosen.magnetUri!,
             label: chosen.name,
-            preferredQuality: qualityPref
+            preferredQuality: qualityPref,
+            mediaId
           })
           break
         } catch (e) {
@@ -1257,7 +1267,8 @@ export function PlayerPage(): JSX.Element {
         cacheId: `${session.mediaType}-${session.externalId}-${session.season || 0}-${session.episode || 0}-${Date.now()}`,
         magnetUri: chosen.magnetUri,
         label: chosen.name,
-        preferredQuality: qualityPref
+        preferredQuality: qualityPref,
+        mediaId: mediaIdFromParts(session.mediaType, session.externalId)
       })
 
       sourceAttachedRef.current = false
@@ -1343,7 +1354,8 @@ export function PlayerPage(): JSX.Element {
         cacheId: `${session.mediaType}-${session.externalId}-${session.season || 0}-${session.episode || 0}-${Date.now()}`,
         magnetUri: chosen.magnetUri,
         label: chosen.name,
-        preferredQuality: qualityPref
+        preferredQuality: qualityPref,
+        mediaId: mediaIdFromParts(session.mediaType, session.externalId)
       })
 
       sourceAttachedRef.current = false
@@ -1677,7 +1689,10 @@ export function PlayerPage(): JSX.Element {
       }
       if (window.cinevault) {
         const nearEnd = video.duration > 0 && video.currentTime / video.duration > 0.92
-        if (nearEnd) await window.cinevault.cache.markComplete(session.cacheId)
+        if (nearEnd) {
+          completedMarkedRef.current = true
+          await window.cinevault.cache.markComplete(session.cacheId)
+        }
       }
     }
     if (session.source.kind === 'torrent') {

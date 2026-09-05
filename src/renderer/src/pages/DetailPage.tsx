@@ -496,7 +496,8 @@ export function DetailPage(): JSX.Element {
         cacheId,
         magnetUri: result.magnetUri,
         label: result.name,
-        preferredQuality: qualityPref
+        preferredQuality: qualityPref,
+        mediaId: item.id
       })
 
       // Prefer prefetched tracks; never block playback on a slow subtitle API.
@@ -548,6 +549,7 @@ export function DetailPage(): JSX.Element {
       if (window.cinevault) {
         void window.cinevault.cache.upsert({
           id: cacheId,
+          mediaId: item.id,
           title: item.title,
           mediaType: item.mediaType,
           filePath: '',
@@ -612,6 +614,10 @@ export function DetailPage(): JSX.Element {
       const playUrl = activeLocal.url
       const playKind = activeLocal.kind
 
+      if (window.cinevault?.cache?.removeByMedia) {
+        await window.cinevault.cache.removeByMedia(item.id, { keepId: cacheId })
+      }
+
       if (activeLocal.kind === 'http' && window.cinevault) {
         const ext = playUrl.split('?')[0].split('.').pop() || 'mp4'
         void window.cinevault.download.start({
@@ -624,6 +630,7 @@ export function DetailPage(): JSX.Element {
       if (window.cinevault) {
         await window.cinevault.cache.upsert({
           id: cacheId,
+          mediaId: item.id,
           title: item.title,
           mediaType: item.mediaType,
           filePath: playKind === 'local' ? activeLocal.url : '',
