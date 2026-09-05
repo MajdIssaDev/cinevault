@@ -1,9 +1,28 @@
-import { NavLink } from 'react-router-dom'
+import { NavLink, useLocation } from 'react-router-dom'
 import { useAppStore } from '../store'
 import { useEffect, type ReactNode } from 'react'
 
+const TOP_LINKS = [
+  { to: '/movies', label: 'Movies' },
+  { to: '/series', label: 'Series' },
+  { to: '/anime', label: 'Anime' },
+  { to: '/feeds', label: 'Feeds' },
+  { to: '/library', label: 'Local & streams' },
+  { to: '/favorites', label: 'Favorites' }
+] as const
+
 export function Shell({ children }: { children: ReactNode }): JSX.Element {
-  const { lastSession, setSession } = useAppStore()
+  const setGenreFilter = useAppStore((s) => s.setGenreFilter)
+  const location = useLocation()
+
+  const catalogType =
+    location.pathname.startsWith('/movies')
+      ? 'movie'
+      : location.pathname.startsWith('/series')
+        ? 'series'
+        : location.pathname.startsWith('/anime')
+          ? 'anime'
+          : null
 
   useEffect(() => {
     const sync = (): void => {
@@ -22,72 +41,39 @@ export function Shell({ children }: { children: ReactNode }): JSX.Element {
     return () => window.removeEventListener('storage', sync)
   }, [])
 
+  useEffect(() => {
+    setGenreFilter('all')
+  }, [catalogType, setGenreFilter])
+
+  useEffect(() => {
+    const pane = document.querySelector('.main-pane')
+    if (pane) pane.scrollTop = 0
+  }, [location.pathname])
+
   return (
     <div className="app-shell">
-      <header className="titlebar">
-        <div className="brand">CineVault</div>
-        <div className="spacer" />
-        <button type="button" title="Minimize" onClick={() => void window.cinevault?.window.minimize()}>
-          ─
-        </button>
-        <button
-          type="button"
-          title="Maximize"
-          onClick={() => void window.cinevault?.window.toggleMaximize()}
-        >
-          □
-        </button>
-        <button type="button" title="Close" onClick={() => void window.cinevault?.window.close()}>
-          ×
-        </button>
-      </header>
-      <div className="app-body">
-        <aside className="sidebar">
-          <div className="nav-label">Browse</div>
-          <NavLink className={({ isActive }) => `nav-item${isActive ? ' active' : ''}`} to="/movies">
-            <span className="label">Movies</span>
-          </NavLink>
-          <NavLink className={({ isActive }) => `nav-item${isActive ? ' active' : ''}`} to="/series">
-            <span className="label">Series</span>
-          </NavLink>
-          <NavLink className={({ isActive }) => `nav-item${isActive ? ' active' : ''}`} to="/anime">
-            <span className="label">Anime</span>
-          </NavLink>
+      <div className="app-atmosphere" aria-hidden="true">
+        <span className="glow-bubble b1" />
+        <span className="glow-bubble b2" />
+        <span className="glow-bubble b3" />
+        <span className="glow-bubble b4" />
+      </div>
+
+      <nav className="top-nav" aria-label="Primary">
+        {TOP_LINKS.map((link) => (
           <NavLink
-            className={({ isActive }) => `nav-item${isActive ? ' active' : ''}`}
-            to="/favorites"
+            key={link.to}
+            to={link.to}
+            className={({ isActive }) => `top-nav-item${isActive ? ' active' : ''}`}
           >
-            <span className="label">Favorites</span>
+            {link.label}
           </NavLink>
-          <div className="nav-label">Library</div>
-          <NavLink className={({ isActive }) => `nav-item${isActive ? ' active' : ''}`} to="/library">
-            <span className="label">Local & streams</span>
-          </NavLink>
-          <NavLink className={({ isActive }) => `nav-item${isActive ? ' active' : ''}`} to="/feeds">
-            <span className="label">Feeds</span>
-          </NavLink>
-          <div style={{ flex: 1 }} />
-          <NavLink className={({ isActive }) => `nav-item${isActive ? ' active' : ''}`} to="/settings">
-            <span className="label">Settings</span>
-          </NavLink>
-        </aside>
+        ))}
+      </nav>
+
+      <div className="app-body app-body-full">
         <main className="main-pane">{children}</main>
       </div>
-      {lastSession && (
-        <div className="resume-chip">
-          <span className="muted">Continue · {lastSession.title}</span>
-          <button className="btn primary" type="button" onClick={() => setSession(lastSession)}>
-            Resume
-          </button>
-          <button
-            className="btn ghost"
-            type="button"
-            onClick={() => useAppStore.setState({ lastSession: null })}
-          >
-            Dismiss
-          </button>
-        </div>
-      )}
     </div>
   )
 }

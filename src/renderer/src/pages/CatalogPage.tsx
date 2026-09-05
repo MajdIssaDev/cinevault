@@ -1,16 +1,32 @@
-import { useEffect, useMemo, useState } from 'react'
+import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Search } from 'lucide-react'
 import type { CatalogItem, MediaType } from '../types'
 import { useAppStore } from '../store'
 import { PosterCard } from '../components/PosterCard'
+import { CatalogHero } from '../components/CatalogHero'
+import { ContinueWatchingRow } from '../components/ContinueWatchingRow'
+import { WatchLaterShelf } from '../components/WatchLaterShelf'
+import { GenreChips } from '../components/GenreChips'
+import { ThemedSelect } from '../components/ThemedSelect'
 import {
-  discoverByGenre,
-  fetchPopularMovies,
-  fetchPopularSeries,
-  searchMovies,
+  SearchCorrectionNotice,
+  type SearchCorrection
+} from '../components/SearchCorrectionNotice'
+import { getSpellingSuggestion } from '../services/searchSuggestionService'
+import {
+  YTS_GENRES,
+  fetchMoviesByGenre,
+  fetchNewAndPopularMovies,
+  searchMovies
+} from '../api/ytsCatalog'
+import {
+  TVMAZE_GENRES,
+  fetchNewAndPopularSeries,
+  fetchSeriesByGenre,
   searchSeries
-} from '../api/tmdb'
+} from '../api/tvmaze'
 import { fetchAnimeByGenre, fetchPopularAnime, searchAnime } from '../api/anilist'
-import { GENRE_MOVIE, GENRE_TV } from '../types'
+import { catalogCacheKey, getCatalogCache, setCatalogCache } from '../lib/catalogCache'
 
 const ANIME_GENRES = [
   'Action',
@@ -28,8 +44,66 @@ const ANIME_GENRES = [
   'Supernatural'
 ]
 
+function genresFor(mediaType: MediaType): string[] {
+  if (mediaType === 'movie') return YTS_GENRES
+  if (mediaType === 'series') return TVMAZE_GENRES
+  return ANIME_GENRES
+}
+
+async function loadCatalogPage(
+  mediaType: MediaType,
+  searchQuery: string,
+  genreFilter: string,
+  page: number
+): Promise<CatalogItem[]> {
+  const q = searchQuery.trim()
+  if (mediaType === 'anime') {
+    if (q) return searchAnime(q, page)
+    if (genreFilter !== 'all') return fetchAnimeByGenre(genreFilter, page)
+    return fetchPopularAnime(page)
+  }
+  if (mediaType === 'movie') {
+    if (q) return searchMovies(q, page)
+    if (genreFilter !== 'all') return fetchMoviesByGenre(genreFilter, page)
+    return fetchNewAndPopularMovies(page)
+  }
+  if (q) return searchSeries(q, page)
+  if (genreFilter !== 'all') return fetchSeriesByGenre(genreFilter, page)
+  return fetchNewAndPopularSeries(page)
+}
+
+function mergeUnique(existing: CatalogItem[], next: CatalogItem[]): CatalogItem[] {
+  const seen = new Set(existing.map((i) => i.id))
+  const out = [...existing]
+  for (const item of next) {
+    if (seen.has(item.id)) continue
+    seen.add(item.id)
+    out.push(item)
+  }
+  return out
+}
+
+function prefetchPosters(items: CatalogItem[]): void {
+  for (const item of items.slice(0, 24)) {
+    if (!item.posterUrl) continue
+    const img = new Image()
+    img.decoding = 'async'
+    img.src = item.posterUrl
+  }
+}
+
+function sentinelNeedsMore(
+  root: Element | null,
+  target: Element | null,
+  rootMarginPx = 1400
+): boolean {
+  if (!root || !target) return false
+  const rootRect = root.getBoundingClientRect()
+  const targetRect = target.getBoundingClientRect()
+  return targetRect.top <= rootRect.bottom + rootMarginPx
+}
+
 export function CatalogPage({ mediaType }: { mediaType: MediaType }): JSX.Element {
-  const settings = useAppStore((s) => s.settings)
   const searchQuery = useAppStore((s) => s.searchQuery)
   const setSearchQuery = useAppStore((s) => s.setSearchQuery)
   const genreFilter = useAppStore((s) => s.genreFilter)
@@ -37,57 +111,292 @@ export function CatalogPage({ mediaType }: { mediaType: MediaType }): JSX.Elemen
   const sortBy = useAppStore((s) => s.sortBy)
   const setSortBy = useAppStore((s) => s.setSortBy)
 
-  const [items, setItems] = useState<CatalogItem[]>([])
-  const [error, setError] = useState<string | null>(null)
-  const [loading, setLoading] = useState(false)
+  const cacheKey = catalogCacheKey(mediaType, searchQuery, genreFilter)
+  const cached = getCatalogCache(cacheKey)
 
-  const genres = useMemo(() => {
-    if (mediaType === 'movie') return Object.values(GENRE_MOVIE)
-    if (mediaType === 'series') return Object.values(GENRE_TV)
-    return ANIME_GENRES
-  }, [mediaType])
+  const [items, setItems] = useState<CatalogItem[]>(cached?.items ?? [])
+  const [page, setPage] = useState(cached?.lastPage ?? 1)
+  const [hasMore, setHasMore] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+  const [loading, setLoading] = useState(!cached)
+  const [loadingMore, setLoadingMore] = useState(false)
+  const [correction, setCorrection] = useState<SearchCorrection>(null)
+
+  const sentinelRef = useRef<HTMLDivElement>(null)
+  const paneRef = useRef<Element | null>(null)
+  const loadingMoreRef = useRef(false)
+  const hasMoreRef = useRef(true)
+  const pageRef = useRef(cached?.lastPage ?? 1)
+  const itemsRef = useRef<CatalogItem[]>(cached?.items ?? [])
+  const loadingRef = useRef(!cached)
+  const skipAutocorrectRef = useRef(false)
+  const pendingOriginalRef = useRef<string | null>(null)
+  const autoCorrectingRef = useRef(false)
+
+  useEffect(() => {
+    hasMoreRef.current = hasMore
+  }, [hasMore])
+  useEffect(() => {
+    pageRef.current = page
+  }, [page])
+  useEffect(() => {
+    itemsRef.current = items
+  }, [items])
+  useEffect(() => {
+    loadingRef.current = loading
+  }, [loading])
+
+  useEffect(() => {
+    paneRef.current = document.querySelector('.main-pane')
+  }, [])
+
+  useEffect(() => {
+    const pane = paneRef.current || document.querySelector('.main-pane')
+    if (pane) pane.scrollTop = 0
+  }, [mediaType, genreFilter])
+
+  const loadMore = useCallback(async (): Promise<void> => {
+    if (loadingMoreRef.current || !hasMoreRef.current || loadingRef.current) return
+    loadingMoreRef.current = true
+    setLoadingMore(true)
+    const key = catalogCacheKey(mediaType, searchQuery, genreFilter)
+
+    try {
+      // One page per trigger — keeps scroll smooth; chain once after paint if still short
+      let nextPage = pageRef.current + 1
+      let appended = false
+
+      for (let attempt = 0; attempt < 8; attempt++) {
+        let list: CatalogItem[] = []
+        try {
+          list = await loadCatalogPage(mediaType, searchQuery, genreFilter, nextPage)
+        } catch {
+          break
+        }
+
+        if (!list.length) {
+          if (attempt >= 2) {
+            hasMoreRef.current = false
+            setHasMore(false)
+          } else {
+            nextPage += 1
+            continue
+          }
+          break
+        }
+
+        prefetchPosters(list)
+        const prev = itemsRef.current
+        const merged = mergeUnique(prev, list)
+        if (merged.length > prev.length) {
+          itemsRef.current = merged
+          pageRef.current = nextPage
+          setCatalogCache(key, merged, nextPage)
+          startTransition(() => {
+            setItems(merged)
+            setPage(nextPage)
+          })
+          appended = true
+          hasMoreRef.current = true
+          setHasMore(true)
+          void loadCatalogPage(mediaType, searchQuery, genreFilter, nextPage + 1).then((warm) => {
+            if (warm.length) prefetchPosters(warm)
+          })
+          break
+        }
+        nextPage += 1
+      }
+
+      if (appended) {
+        requestAnimationFrame(() => {
+          if (
+            hasMoreRef.current &&
+            !loadingMoreRef.current &&
+            sentinelNeedsMore(paneRef.current, sentinelRef.current)
+          ) {
+            void loadMore()
+          }
+        })
+      }
+    } finally {
+      loadingMoreRef.current = false
+      setLoadingMore(false)
+    }
+  }, [mediaType, searchQuery, genreFilter])
 
   useEffect(() => {
     let cancelled = false
-    const run = async (): Promise<void> => {
-      setLoading(true)
-      setError(null)
-      try {
-        const key = settings?.tmdbApiKey || ''
-        let list: CatalogItem[] = []
-        if (mediaType === 'anime') {
-          if (searchQuery.trim()) list = await searchAnime(searchQuery.trim())
-          else if (genreFilter !== 'all') list = await fetchAnimeByGenre(genreFilter)
-          else list = await fetchPopularAnime()
-        } else {
-          if (!key) throw new Error('Add your TMDB API key in Settings to browse catalogs.')
-          if (searchQuery.trim()) {
-            list =
-              mediaType === 'movie'
-                ? await searchMovies(key, searchQuery.trim())
-                : await searchSeries(key, searchQuery.trim())
-          } else if (genreFilter !== 'all') {
-            list = await discoverByGenre(key, mediaType === 'movie' ? 'movie' : 'tv', genreFilter)
-          } else {
-            list =
-              mediaType === 'movie' ? await fetchPopularMovies(key) : await fetchPopularSeries(key)
-          }
+    const key = catalogCacheKey(mediaType, searchQuery, genreFilter)
+    const rawQuery = searchQuery.trim()
+    const hit = getCatalogCache(key)
+
+    const applySuggestionLogic = async (list: CatalogItem[]): Promise<void> => {
+      if (!rawQuery) {
+        pendingOriginalRef.current = null
+        setCorrection(null)
+        return
+      }
+
+      if (list.length > 0) {
+        const original = pendingOriginalRef.current
+        if (original && original.toLowerCase() !== rawQuery.toLowerCase()) {
+          setCorrection({
+            isAutoCorrected: true,
+            displayedQuery: rawQuery,
+            originalQuery: original
+          })
+          return
         }
-        if (!cancelled) setItems(list)
+        pendingOriginalRef.current = null
+        // Soft "Did you mean" while showing current hits
+        const suggestion = await getSpellingSuggestion(rawQuery)
+        if (cancelled) return
+        if (suggestion && suggestion.toLowerCase() !== rawQuery.toLowerCase()) {
+          setCorrection({ isAutoCorrected: false, suggestion })
+        } else {
+          setCorrection(null)
+        }
+        return
+      }
+
+      // Zero results — try auto-correct unless user forced the raw query
+      // or we already redirected once for this attempt.
+      if (skipAutocorrectRef.current) {
+        skipAutocorrectRef.current = false
+        pendingOriginalRef.current = null
+        setCorrection(null)
+        return
+      }
+
+      if (pendingOriginalRef.current) {
+        // Corrected term also empty — keep a way back to the original spelling
+        setCorrection({
+          isAutoCorrected: true,
+          displayedQuery: rawQuery,
+          originalQuery: pendingOriginalRef.current
+        })
+        return
+      }
+
+      const suggestion = await getSpellingSuggestion(rawQuery)
+      if (cancelled) return
+      if (suggestion && suggestion.toLowerCase() !== rawQuery.toLowerCase()) {
+        pendingOriginalRef.current = rawQuery
+        autoCorrectingRef.current = true
+        setSearchQuery(suggestion)
+        return
+      }
+      pendingOriginalRef.current = null
+      setCorrection(null)
+    }
+
+    if (hit?.items.length) {
+      setItems(hit.items)
+      setPage(hit.lastPage)
+      pageRef.current = hit.lastPage
+      itemsRef.current = hit.items
+      setHasMore(true)
+      hasMoreRef.current = true
+      setError(null)
+      setLoading(false)
+      loadingRef.current = false
+      void applySuggestionLogic(hit.items)
+      queueMicrotask(() => {
+        if (!cancelled) void loadMore()
+      })
+      return () => {
+        cancelled = true
+      }
+    }
+
+    setItems([])
+    setPage(1)
+    pageRef.current = 1
+    itemsRef.current = []
+    setHasMore(true)
+    hasMoreRef.current = true
+    setError(null)
+    setLoading(true)
+    loadingRef.current = true
+    if (!autoCorrectingRef.current && !pendingOriginalRef.current) {
+      setCorrection(null)
+    }
+    autoCorrectingRef.current = false
+
+    const run = async (): Promise<void> => {
+      try {
+        const list = await loadCatalogPage(mediaType, searchQuery, genreFilter, 1)
+        if (cancelled) return
+        setCatalogCache(key, list, 1)
+        setItems(list)
+        itemsRef.current = list
+        setPage(1)
+        pageRef.current = 1
+        setHasMore(list.length > 0)
+        hasMoreRef.current = list.length > 0
+        prefetchPosters(list)
+        await applySuggestionLogic(list)
       } catch (e) {
         if (!cancelled) setError(e instanceof Error ? e.message : 'Failed to load catalog')
       } finally {
-        if (!cancelled) setLoading(false)
+        if (!cancelled) {
+          setLoading(false)
+          loadingRef.current = false
+          void loadMore()
+        }
       }
     }
-    const t = setTimeout(() => void run(), 250)
+
+    const delay = rawQuery ? 280 : 0
+    const t = setTimeout(() => void run(), delay)
     return () => {
       cancelled = true
       clearTimeout(t)
     }
-  }, [mediaType, searchQuery, genreFilter, settings?.tmdbApiKey])
+  }, [mediaType, searchQuery, genreFilter, loadMore, setSearchQuery])
+
+  const onSearchInputChange = (value: string): void => {
+    pendingOriginalRef.current = null
+    skipAutocorrectRef.current = false
+    autoCorrectingRef.current = false
+    setCorrection(null)
+    setSearchQuery(value)
+  }
+
+  const onApplySuggestion = (suggestion: string): void => {
+    pendingOriginalRef.current = null
+    skipAutocorrectRef.current = false
+    setCorrection(null)
+    setSearchQuery(suggestion)
+  }
+
+  const onSearchOriginal = (original: string): void => {
+    skipAutocorrectRef.current = true
+    pendingOriginalRef.current = null
+    autoCorrectingRef.current = false
+    setCorrection(null)
+    setSearchQuery(original)
+  }
+
+  useEffect(() => {
+    const root = document.querySelector('.main-pane')
+    const target = sentinelRef.current
+    if (!root || !target) return
+    paneRef.current = root
+
+    const io = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((e) => e.isIntersecting)) void loadMore()
+      },
+      { root, rootMargin: '1200px 0px', threshold: 0 }
+    )
+    io.observe(target)
+    return () => io.disconnect()
+  }, [loadMore])
 
   const sorted = useMemo(() => {
+    // Keep API order for popularity so newly fetched pages stay at the bottom
+    if (sortBy === 'popularity') return items
     const copy = [...items]
     switch (sortBy) {
       case 'rating':
@@ -101,50 +410,112 @@ export function CatalogPage({ mediaType }: { mediaType: MediaType }): JSX.Elemen
     }
   }, [items, sortBy])
 
-  const title =
-    mediaType === 'movie' ? 'Movies' : mediaType === 'series' ? 'Series' : 'Anime'
+  const featured = useMemo(() => {
+    if (searchQuery.trim()) return null
+    // Prefer titles that actually have a landscape backdrop
+    return sorted.find((i) => i.backdropUrl) || null
+  }, [sorted, searchQuery])
+
+  const genres = genresFor(mediaType)
+  const title = mediaType === 'movie' ? 'Movies' : mediaType === 'series' ? 'Series' : 'Anime'
 
   return (
-    <div>
-      <h1 className="page-title">{title}</h1>
-      <p className="page-sub">
-        Official artwork & metadata · hover a poster for release date · star to favorite
-      </p>
-      <div className="toolbar">
-        <input
-          className="search"
-          placeholder={`Search ${title.toLowerCase()}…`}
-          value={searchQuery}
-          onChange={(e) => setSearchQuery(e.target.value)}
-        />
-        <select className="select" value={genreFilter} onChange={(e) => setGenreFilter(e.target.value)}>
-          <option value="all">All genres</option>
+    <div className="catalog-page">
+      {featured && <CatalogHero item={featured} />}
+
+      <div className="catalog-body">
+        {!searchQuery.trim() && <ContinueWatchingRow mediaType={mediaType} />}
+        {!searchQuery.trim() && (
+          <WatchLaterShelf
+            mediaType={mediaType === 'series' ? 'tv' : mediaType}
+          />
+        )}
+
+        <div className="catalog-toolbar">
+          <div className="catalog-heading">
+            <h1 className="catalog-section-title">{title}</h1>
+          </div>
+          <div className="catalog-tools">
+            <label className="catalog-search-wrap">
+              <span className="catalog-search-icon" aria-hidden>
+                <Search size={16} strokeWidth={2} />
+              </span>
+              <input
+                className="catalog-search"
+                placeholder={`Search ${title.toLowerCase()}…`}
+                value={searchQuery}
+                onChange={(e) => onSearchInputChange(e.target.value)}
+                aria-label={`Search ${title.toLowerCase()}`}
+              />
+            </label>
+            <ThemedSelect
+              variant="catalog"
+              className="catalog-sort-select"
+              aria-label="Sort catalog"
+              value={sortBy}
+              onChange={(v) => setSortBy(v as typeof sortBy)}
+              menuMinWidth={152}
+              options={[
+                { value: 'popularity', label: 'Popularity' },
+                { value: 'rating', label: 'Rating' },
+                { value: 'date', label: 'Release date' },
+                { value: 'title', label: 'Title' }
+              ]}
+            />
+          </div>
+        </div>
+
+        <GenreChips aria-label="Genres">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={genreFilter === 'all'}
+            className={`genre-chip${genreFilter === 'all' ? ' active' : ''}`}
+            onClick={() => setGenreFilter('all')}
+          >
+            All
+          </button>
           {genres.map((g) => (
-            <option key={g} value={g}>
+            <button
+              key={g}
+              type="button"
+              role="tab"
+              aria-selected={genreFilter === g}
+              className={`genre-chip${genreFilter === g ? ' active' : ''}`}
+              onClick={() => setGenreFilter(g)}
+            >
               {g}
-            </option>
+            </button>
           ))}
-        </select>
-        <select
-          className="select"
-          value={sortBy}
-          onChange={(e) => setSortBy(e.target.value as typeof sortBy)}
-        >
-          <option value="popularity">Sort: Popularity</option>
-          <option value="rating">Sort: Rating</option>
-          <option value="date">Sort: Release date</option>
-          <option value="title">Sort: Title</option>
-        </select>
-      </div>
-      {loading && <div className="muted">Loading catalog…</div>}
-      {error && <div className="card-block" style={{ color: 'var(--danger)' }}>{error}</div>}
-      {!loading && !error && sorted.length === 0 && (
-        <div className="empty">No titles found. Try another search or genre.</div>
-      )}
-      <div className="poster-grid">
-        {sorted.map((item) => (
-          <PosterCard key={item.id} item={item} />
-        ))}
+        </GenreChips>
+
+        <SearchCorrectionNotice
+          correction={correction}
+          onApplySuggestion={onApplySuggestion}
+          onSearchOriginal={onSearchOriginal}
+        />
+
+        {loading && <div className="muted">Loading catalog…</div>}
+        {error && (
+          <div className="card-block" style={{ color: 'var(--danger)' }}>
+            {error}
+          </div>
+        )}
+        {!loading && !error && sorted.length === 0 && (
+          <div className="empty">No titles found. Try another search or genre.</div>
+        )}
+
+        <div className="poster-grid">
+          {sorted.map((item) => (
+            <PosterCard key={item.id} item={item} />
+          ))}
+        </div>
+        <div ref={sentinelRef} data-catalog-sentinel style={{ height: 1 }} aria-hidden />
+        {loadingMore && (
+          <div className="muted" style={{ padding: '16px 0' }}>
+            Loading more…
+          </div>
+        )}
       </div>
     </div>
   )

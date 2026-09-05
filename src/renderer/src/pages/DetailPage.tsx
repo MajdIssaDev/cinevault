@@ -1,11 +1,106 @@
 import { useEffect, useMemo, useState } from 'react'
-import { useNavigate, useParams } from 'react-router-dom'
+import { createPortal } from 'react-dom'
+import { Link, useNavigate, useParams } from 'react-router-dom'
+import { ArrowLeft, ChevronDown, Clapperboard, Clock, Heart, Play, RotateCcw, Star } from 'lucide-react'
 import { useAppStore } from '../store'
-import type { CatalogItem, EpisodeInfo, Quality, SeasonInfo, StreamSource } from '../types'
-import { fetchMovieDetails, fetchSeasonEpisodes, fetchSeriesDetails } from '../api/tmdb'
+import type { CatalogItem, EpisodeInfo, MediaExtras, Quality, SeasonInfo, StreamSource } from '../types'
+import { fetchMovieDetails } from '../api/ytsCatalog'
+import { episodesForSeason, fetchSeriesDetails } from '../api/tvmaze'
 import { fetchAnimeDetails } from '../api/anilist'
+import { enrichFromImdb, mergeExtras } from '../api/tmdb'
+import {
+  formatFileSize,
+  searchPublicIndexers,
+  type PublicSearchResult
+} from '../services/publicSearchService'
+import {
+  buildCatalogSearchQuery,
+  guessQualityFromName,
+  qualityLabel,
+  sortTorrentResults,
+  startTorrentPlayback
+} from '../lib/torrentPlayback'
+import {
+  defaultTargetFromQuality,
+  getBestStream,
+  type TargetRes
+} from '../lib/streamScorer'
+import {
+  formatRemaining,
+  getLatestProgressForTitle,
+  getProgress,
+  subscribePlaybackHistory,
+  type PlaybackProgress
+} from '../services/playbackHistoryService'
+import { formatTime } from '../lib/subtitles'
+import { pickSharpHeroUrl, upgradeImageUrl } from '../lib/heroImage'
+import { useWatchLater } from '../hooks/useWatchLater'
+import { catalogToWatchLaterItem } from '../services/watchLaterService'
+import { openTrailerSearch, resolveTrailerForItem } from '../lib/trailer'
+import { buildTrailerInfo, type TrailerInfo } from '../api/tmdb'
+import {
+  formatSubtitleMenuLabel,
+  getAvailableSubtitles,
+  rankSubtitlesByRelease,
+  resolveSubtitleTrack,
+  type UnifiedSubtitle
+} from '../services/subtitleService'
+import { HScrollRail } from '../components/HScrollRail'
+import { ThemedSelect } from '../components/ThemedSelect'
+import { TrailerModal } from '../components/TrailerModal'
 
-const QUALITIES: Quality[] = ['720p', '1080p', '1440p', '2160p']
+type UiError = {
+  message: string
+  action?: { to: string; label: string }
+}
+
+function cleanIpcMessage(raw: string): string {
+  return raw
+    .replace(/^Error invoking remote method '[^']+':\s*/i, '')
+    .replace(/^Error:\s*/i, '')
+    .trim()
+}
+
+function toUiError(e: unknown, fallback: string): UiError {
+  const raw = e instanceof Error ? e.message : String(e)
+  const cleaned = cleanIpcMessage(raw)
+  if (/OPENSUBTITLES_CREDENTIALS_MISSING|credentials missing/i.test(cleaned)) {
+    return {
+      message: 'OpenSubtitles isn’t set up yet. Add your API key and account to search for subtitles.',
+      action: { to: '/settings', label: 'Open Settings' }
+    }
+  }
+  if (/OpenSubtitles login failed/i.test(cleaned)) {
+    return {
+      message: 'Couldn’t sign in to OpenSubtitles. Check your API key, username, and password.',
+      action: { to: '/settings', label: 'Open Settings' }
+    }
+  }
+  return { message: cleaned || fallback }
+}
+
+function releaseYear(date: string | null | undefined): string {
+  if (!date) return '—'
+  return date.split('-')[0] || date
+}
+
+function formatRuntime(mins: number): string {
+  const h = Math.floor(mins / 60)
+  const m = mins % 60
+  if (h <= 0) return `${m}m`
+  return m ? `${h}h ${m}m` : `${h}h`
+}
+
+function epCode(n: number): string {
+  return `E${String(n).padStart(2, '0')}`
+}
+
+function qualityTone(q: Quality | 'unknown'): string {
+  if (q === '2160p' || q === '1440p') return 'uhd'
+  if (q === '1080p') return 'hi'
+  if (q === '720p') return 'mid'
+  return 'lo'
+}
 
 export function DetailPage(): JSX.Element {
   const { mediaType = 'movie', id = '0' } = useParams()
@@ -13,32 +108,68 @@ export function DetailPage(): JSX.Element {
   const navigate = useNavigate()
   const settings = useAppStore((s) => s.settings)
   const qualityPref = useAppStore((s) => s.qualityPref)
-  const setQualityPref = useAppStore((s) => s.setQualityPref)
   const setSession = useAppStore((s) => s.setSession)
-  const isFavorite = useAppStore((s) => s.isFavorite)
   const toggleFavorite = useAppStore((s) => s.toggleFavorite)
+  const { isSaved: isWatchLaterSaved, toggle: toggleWatchLaterItem } = useWatchLater()
 
   const [item, setItem] = useState<CatalogItem | null>(null)
+  const [extras, setExtras] = useState<MediaExtras>({})
+  const [lightbox, setLightbox] = useState<string | null>(null)
+  const [trailer, setTrailer] = useState<TrailerInfo | null>(null)
+  const [trailerBusy, setTrailerBusy] = useState(false)
+  const fav = useAppStore((s) => {
+    const media = item?.mediaType || (mediaType as 'movie' | 'series' | 'anime')
+    const ext = item?.externalId ?? externalId
+    return s.favorites.some((f) => f.mediaType === media && f.externalId === ext)
+  })
   const [seasons, setSeasons] = useState<SeasonInfo[]>([])
   const [episodes, setEpisodes] = useState<EpisodeInfo[]>([])
   const [season, setSeason] = useState(1)
   const [episode, setEpisode] = useState<EpisodeInfo | null>(null)
   const [imdbId, setImdbId] = useState<string | null>(null)
-  const [sources, setSources] = useState<StreamSource[]>([])
-  const [selectedSource, setSelectedSource] = useState<string>('')
+  const [localSources, setLocalSources] = useState<StreamSource[]>([])
+  const [selectedLocal, setSelectedLocal] = useState('')
   const [streamUrl, setStreamUrl] = useState('')
+  const [showAdvanced, setShowAdvanced] = useState(false)
   const [subLang, setSubLang] = useState(settings?.defaultSubtitleLanguage || 'en')
-  const [subs, setSubs] = useState<{ id: string; language: string; release: string; fileId: number }[]>(
-    []
-  )
-  const [selectedSub, setSelectedSub] = useState<number | null>(null)
-  const [error, setError] = useState<string | null>(null)
+  const [subs, setSubs] = useState<UnifiedSubtitle[]>([])
+  const [error, setError] = useState<UiError | null>(null)
   const [busy, setBusy] = useState(false)
+
+  const [torrentResults, setTorrentResults] = useState<PublicSearchResult[]>([])
+  const [torrentLoading, setTorrentLoading] = useState(false)
+  const [torrentError, setTorrentError] = useState<string | null>(null)
+  const [startingId, setStartingId] = useState<string | null>(null)
+  const [qualityFilter, setQualityFilter] = useState<'all' | Quality | 'unknown'>('all')
+  const [selectedRes, setSelectedRes] = useState<TargetRes>(() =>
+    defaultTargetFromQuality(qualityPref)
+  )
+  const [resAdjustedNote, setResAdjustedNote] = useState<string | null>(null)
+  const autoDowngrade = true
+  const [savedProgress, setSavedProgress] = useState<PlaybackProgress | null>(null)
+  const [forceFromStart, setForceFromStart] = useState(false)
+
+  useEffect(() => {
+    setSelectedRes(defaultTargetFromQuality(qualityPref))
+    setResAdjustedNote(null)
+  }, [qualityPref, item?.id])
+
+  useEffect(() => {
+    if (!lightbox) return
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === 'Escape') setLightbox(null)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [lightbox])
 
   useEffect(() => {
     let cancelled = false
     const run = async (): Promise<void> => {
       setError(null)
+      setExtras({})
+      setLightbox(null)
+      setTrailer(null)
       try {
         if (mediaType === 'anime') {
           const data = await fetchAnimeDetails(externalId)
@@ -48,23 +179,60 @@ export function DetailPage(): JSX.Element {
           setEpisodes(data.episodes)
           setEpisode(data.episodes[0] || null)
         } else if (mediaType === 'series') {
-          const key = settings?.tmdbApiKey || ''
-          const data = await fetchSeriesDetails(key, externalId)
+          const data = await fetchSeriesDetails(externalId)
           if (cancelled) return
-          setItem(data.item)
+          let nextItem = data.item
+          let nextExtras: MediaExtras = {}
+          const key = settings?.tmdbApiKey
+          if (key && data.imdbId) {
+            try {
+              const enrich = await enrichFromImdb(key, data.imdbId, 'tv')
+              if (enrich) {
+                if (enrich.backdropUrl) nextItem = { ...nextItem, backdropUrl: enrich.backdropUrl }
+                if (enrich.overview) nextItem = { ...nextItem, overview: enrich.overview }
+                nextExtras = enrich.extras
+              }
+            } catch {
+              /* YTS/TVMaze base is enough */
+            }
+          }
+          if (cancelled) return
+          setItem(nextItem)
+          setExtras(nextExtras)
           setSeasons(data.seasons)
           setImdbId(data.imdbId)
+          setEpisodes(data.episodes)
           const s = data.seasons[0]?.seasonNumber || 1
           setSeason(s)
+          const seasonEps = episodesForSeason(data.episodes, s)
+          setEpisode(seasonEps[0] || null)
         } else {
-          const key = settings?.tmdbApiKey || ''
-          const data = await fetchMovieDetails(key, externalId)
+          const data = await fetchMovieDetails(externalId)
           if (cancelled) return
-          setItem(data)
-          setImdbId(data.imdbId)
+          let nextItem = data.item
+          let nextExtras = data.extras
+          const key = settings?.tmdbApiKey
+          if (key && nextItem.imdbId) {
+            try {
+              const enrich = await enrichFromImdb(key, nextItem.imdbId, 'movie')
+              if (enrich) {
+                if (enrich.backdropUrl) nextItem = { ...nextItem, backdropUrl: enrich.backdropUrl }
+                if (enrich.overview && enrich.overview.length > (nextItem.overview?.length || 0)) {
+                  nextItem = { ...nextItem, overview: enrich.overview }
+                }
+                nextExtras = mergeExtras(nextExtras, enrich.extras)
+              }
+            } catch {
+              /* keep YTS extras */
+            }
+          }
+          if (cancelled) return
+          setItem(nextItem)
+          setExtras(nextExtras)
+          setImdbId(nextItem.imdbId)
         }
       } catch (e) {
-        if (!cancelled) setError(e instanceof Error ? e.message : 'Failed to load')
+        if (!cancelled) setError(toUiError(e, 'Failed to load'))
       }
     }
     void run()
@@ -74,17 +242,75 @@ export function DetailPage(): JSX.Element {
   }, [mediaType, externalId, settings?.tmdbApiKey])
 
   useEffect(() => {
-    if (mediaType !== 'series' || !settings?.tmdbApiKey) return
-    let cancelled = false
-    void fetchSeasonEpisodes(settings.tmdbApiKey, externalId, season).then((eps) => {
-      if (cancelled) return
-      setEpisodes(eps)
-      setEpisode(eps[0] || null)
+    if (mediaType !== 'series' || !episodes.length) return
+    const seasonEps = episodesForSeason(episodes, season)
+    setEpisode((current) => {
+      if (current && seasonEps.some((e) => e.id === current.id)) return current
+      return seasonEps[0] || null
     })
+  }, [mediaType, season, episodes])
+
+  useEffect(() => {
+    if (!item) {
+      setSavedProgress(null)
+      return
+    }
+    const refresh = (): void => {
+      if (mediaType === 'movie') {
+        setSavedProgress(getProgress(item.id))
+        return
+      }
+      if (episode == null) {
+        setSavedProgress(getLatestProgressForTitle(item.id))
+        return
+      }
+      setSavedProgress(getProgress(item.id, season, episode.episodeNumber))
+    }
+    refresh()
+    return subscribePlaybackHistory(refresh)
+  }, [item, mediaType, season, episode?.episodeNumber])
+
+  // Jump to the episode that has saved progress when details load
+  useEffect(() => {
+    if (!item || mediaType === 'movie' || !episodes.length) return
+    const latest = getLatestProgressForTitle(item.id)
+    if (!latest?.season || !latest.episode) return
+    setSeason(latest.season)
+    const match = episodes.find(
+      (e) => e.seasonNumber === latest.season && e.episodeNumber === latest.episode
+    )
+    if (match) setEpisode(match)
+    // only on item identity change
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [item?.id, episodes.length])
+
+  useEffect(() => {
+    setSubLang(settings?.defaultSubtitleLanguage || 'en')
+  }, [settings?.defaultSubtitleLanguage])
+
+  // Prefetch subtitles using Settings default language (player can change later)
+  useEffect(() => {
+    const id = imdbId || item?.imdbId
+    if (!id || !item) return
+    let cancelled = false
+    void getAvailableSubtitles({
+      imdbId: id,
+      type: mediaType === 'movie' ? 'movie' : 'series',
+      lang: subLang,
+      season: mediaType !== 'movie' ? season : undefined,
+      episode: mediaType !== 'movie' ? episode?.episodeNumber : undefined,
+      title: item.title
+    })
+      .then((results) => {
+        if (!cancelled) setSubs(results)
+      })
+      .catch(() => {
+        /* player can still search */
+      })
     return () => {
       cancelled = true
     }
-  }, [mediaType, externalId, season, settings?.tmdbApiKey])
+  }, [imdbId, item?.imdbId, item?.title, mediaType, subLang, season, episode?.episodeNumber])
 
   useEffect(() => {
     if (!item) return
@@ -107,48 +333,117 @@ export function DetailPage(): JSX.Element {
           spatialAudio: /atmos|truehd|dts.?x/i.test(m.name)
         })
       }
-      // restore custom streams from localStorage
       try {
         const raw = localStorage.getItem(`streams:${item.id}`)
         if (raw) mapped.push(...(JSON.parse(raw) as StreamSource[]))
       } catch {
         /* ignore */
       }
-      setSources(mapped)
-      setSelectedSource(mapped[0]?.id || '')
+      setLocalSources(mapped)
+      setSelectedLocal(mapped[0]?.id || '')
     })
     return () => {
       cancelled = true
     }
   }, [item])
 
-  const activeSource = useMemo(
-    () => sources.find((s) => s.id === selectedSource) || null,
-    [sources, selectedSource]
+  const searchQuery = useMemo(() => {
+    if (!item) return ''
+    return buildCatalogSearchQuery({
+      title: item.title,
+      mediaType: item.mediaType,
+      releaseDate: item.releaseDate,
+      season: mediaType !== 'movie' ? season : undefined,
+      episode: mediaType !== 'movie' ? episode?.episodeNumber : undefined
+    })
+  }, [item, mediaType, season, episode?.episodeNumber])
+
+  useEffect(() => {
+    if (!searchQuery) return
+    let cancelled = false
+    const run = async (): Promise<void> => {
+      setTorrentLoading(true)
+      setTorrentError(null)
+      setQualityFilter('all')
+      try {
+        const raw = await searchPublicIndexers(searchQuery)
+        if (cancelled) return
+        setTorrentResults(sortTorrentResults(raw, qualityPref))
+      } catch (e) {
+        if (!cancelled) {
+          setTorrentResults([])
+          setTorrentError(e instanceof Error ? e.message : 'Torrent search failed')
+        }
+      } finally {
+        if (!cancelled) setTorrentLoading(false)
+      }
+    }
+    const t = window.setTimeout(() => void run(), 200)
+    return () => {
+      cancelled = true
+      window.clearTimeout(t)
+    }
+  }, [searchQuery, qualityPref])
+
+  const filteredTorrents = useMemo(() => {
+    if (qualityFilter === 'all') return torrentResults
+    return torrentResults.filter((r) => guessQualityFromName(r.name) === qualityFilter)
+  }, [torrentResults, qualityFilter])
+
+  const streamPick = useMemo(
+    () =>
+      getBestStream(torrentResults, selectedRes, {
+        isMovieLike: mediaType === 'movie'
+      }),
+    [torrentResults, selectedRes, mediaType]
   )
 
-  const loadSubs = async (): Promise<void> => {
-    if (!item || !window.cinevault) return
-    setBusy(true)
-    setError(null)
-    try {
-      const results = await window.cinevault.subs.search({
-        query: item.title,
-        imdbId: imdbId || undefined,
-        tmdbId: mediaType !== 'anime' ? externalId : undefined,
-        season: mediaType !== 'movie' ? season : undefined,
-        episode: mediaType !== 'movie' ? episode?.episodeNumber : undefined,
-        languages: subLang,
-        type: mediaType === 'movie' ? 'movie' : 'episode'
-      })
-      setSubs(results)
-      setSelectedSub(results[0]?.fileId ?? null)
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Subtitle search failed')
-    } finally {
-      setBusy(false)
+  const {
+    bestStream,
+    highestAvailableRes,
+    isTargetAvailable
+  } = streamPick
+
+  useEffect(() => {
+    if (torrentLoading || torrentResults.length === 0) return
+    if (selectedRes === 'Auto') {
+      setResAdjustedNote(null)
+      return
     }
-  }
+    const pick = getBestStream(torrentResults, selectedRes, {
+      isMovieLike: mediaType === 'movie'
+    })
+    if (pick.isTargetAvailable) {
+      return
+    }
+    if (autoDowngrade && pick.highestAvailableRes) {
+      const from = selectedRes
+      const to = pick.highestAvailableRes
+      if (from !== to) {
+        setSelectedRes(to)
+        setResAdjustedNote(`${from} unavailable · Adjusted to ${to}`)
+      }
+      return
+    }
+    setResAdjustedNote(null)
+  }, [torrentLoading, torrentResults, mediaType, autoDowngrade])
+
+  useEffect(() => {
+    if (!resAdjustedNote) return
+    const t = window.setTimeout(() => setResAdjustedNote(null), 4500)
+    return () => window.clearTimeout(t)
+  }, [resAdjustedNote])
+
+  const qualityOptions = useMemo(() => {
+    const present = new Set(torrentResults.map((r) => guessQualityFromName(r.name)))
+    const order: Array<Quality | 'unknown'> = ['2160p', '1440p', '1080p', '720p', 'unknown']
+    return order.filter((q) => present.has(q))
+  }, [torrentResults])
+
+  const activeLocal = useMemo(
+    () => localSources.find((s) => s.id === selectedLocal) || null,
+    [localSources, selectedLocal]
+  )
 
   const addStream = (): void => {
     if (!item || !streamUrl.trim()) return
@@ -160,58 +455,113 @@ export function DetailPage(): JSX.Element {
       url: streamUrl.trim(),
       kind: isHls ? 'hls' : 'http'
     }
-    const next = [...sources.filter((s) => s.kind !== 'local' || true), src]
-    // keep locals + customs
-    const merged = [...sources.filter((s) => s.id !== src.id), src]
-    setSources(merged)
-    setSelectedSource(src.id)
+    const merged = [...localSources.filter((s) => s.id !== src.id), src]
+    setLocalSources(merged)
+    setSelectedLocal(src.id)
     const customs = merged.filter((s) => s.kind !== 'local')
     localStorage.setItem(`streams:${item.id}`, JSON.stringify(customs))
     setStreamUrl('')
   }
 
-  const startWatch = async (): Promise<void> => {
-    if (!item || !activeSource) {
-      setError('Add a local library match or paste an HTTP/HLS stream URL first.')
-      return
+  const resolveSubtitles = async (
+    preferred?: UnifiedSubtitle | null
+  ): Promise<{
+    path: string | null
+    url: string | null
+    label?: string
+  }> => {
+    if (!item) return { path: null, url: null }
+    const track = preferred || subs[0]
+    if (!track) return { path: null, url: null }
+    const resolved = await resolveSubtitleTrack(track, subLang)
+    return {
+      path: resolved.path,
+      url: resolved.url || resolved.blobUrl,
+      label: formatSubtitleMenuLabel(track)
     }
-    setBusy(true)
+  }
+
+  const playTorrent = async (
+    result: PublicSearchResult,
+    opts?: { fromStart?: boolean }
+  ): Promise<void> => {
+    if (!item || !result.magnetUri || startingId) return
+    const { warnIfCellular } = await import('../lib/mobileNetwork')
+    if (!(await warnIfCellular('torrent playback'))) return
+    setStartingId(result.id)
     setError(null)
+    const fromStart = opts?.fromStart || forceFromStart
+    const resumeAt =
+      !fromStart && savedProgress && savedProgress.currentTime > 3
+        ? savedProgress.currentTime
+        : undefined
     try {
-      let subtitlePath: string | null = null
-      let subtitleLabel: string | undefined
-      if (selectedSub != null && window.cinevault) {
-        subtitlePath = await window.cinevault.subs.download(selectedSub, `${item.title}.srt`)
-        subtitleLabel = subs.find((s) => s.fileId === selectedSub)?.language
+      const cacheId = `${item.id}-${season || 0}-${episode?.episodeNumber || 0}-${Date.now()}`
+      const source = await startTorrentPlayback({
+        cacheId,
+        magnetUri: result.magnetUri,
+        label: result.name,
+        preferredQuality: qualityPref
+      })
+
+      // Prefer prefetched tracks; never block playback on a slow subtitle API.
+      let bestTrack: UnifiedSubtitle | null =
+        rankSubtitlesByRelease(subs, result.name)[0] || null
+      const id = imdbId || item.imdbId
+      if (id) {
+        try {
+          const ranked = await Promise.race([
+            getAvailableSubtitles({
+              imdbId: id,
+              type: mediaType === 'movie' ? 'movie' : 'series',
+              lang: subLang,
+              season: mediaType !== 'movie' ? season : undefined,
+              episode: mediaType !== 'movie' ? episode?.episodeNumber : undefined,
+              title: item.title,
+              releaseHint: result.name
+            }),
+            new Promise<UnifiedSubtitle[]>((resolve) => {
+              window.setTimeout(() => resolve([]), 2500)
+            })
+          ])
+          if (ranked.length) {
+            setSubs(ranked)
+            bestTrack = ranked[0]
+          }
+        } catch {
+          /* keep prefetched bestTrack */
+        }
       }
 
-      const cacheId = `${item.id}-${season || 0}-${episode?.episodeNumber || 0}-${Date.now()}`
-      let playUrl = activeSource.url
-      let playKind = activeSource.kind
-
-      // Progressive cache for remote HTTP (not HLS)
-      if (activeSource.kind === 'http' && window.cinevault) {
-        const ext = playUrl.split('?')[0].split('.').pop() || 'mp4'
-        // Start download in background; play network URL immediately (watch while caching)
-        void window.cinevault.download.start({
-          id: cacheId,
-          url: playUrl,
-          fileName: `${cacheId}.${ext}`
-        })
+      let subtitlePath: string | null = null
+      let subtitleUrl: string | null = null
+      let subtitleLabel: string | undefined
+      try {
+        const resolved = await Promise.race([
+          resolveSubtitles(bestTrack),
+          new Promise<{ path: string | null; url: string | null; label?: string }>((resolve) => {
+            window.setTimeout(() => resolve({ path: null, url: null }), 3000)
+          })
+        ])
+        subtitlePath = resolved.path
+        subtitleUrl = resolved.url
+        subtitleLabel = resolved.label
+      } catch {
+        /* player can load subtitles later */
       }
 
       if (window.cinevault) {
-        await window.cinevault.cache.upsert({
+        void window.cinevault.cache.upsert({
           id: cacheId,
           title: item.title,
           mediaType: item.mediaType,
-          filePath: playKind === 'local' ? activeSource.url : '',
+          filePath: '',
           createdAt: Date.now(),
           lastWatchedAt: Date.now(),
           completed: false,
-          progressSeconds: 0,
+          progressSeconds: resumeAt || 0,
           durationSeconds: 0,
-          sourceUrl: activeSource.kind !== 'local' ? activeSource.url : undefined
+          sourceUrl: result.magnetUri
         })
       }
 
@@ -225,13 +575,95 @@ export function DetailPage(): JSX.Element {
         externalId: item.externalId,
         season: mediaType !== 'movie' ? season : undefined,
         episode: mediaType !== 'movie' ? episode?.episodeNumber : undefined,
-        source: { ...activeSource, url: playUrl, kind: playKind },
+        episodeTitle: mediaType !== 'movie' ? episode?.title : undefined,
+        showTitle: item.title,
+        posterUrl: item.posterUrl,
+        backdropUrl: item.backdropUrl,
+        imdbId: imdbId || item.imdbId || null,
+        source,
         subtitlePath,
+        subtitleUrl,
         subtitleLabel,
-        resolution: (activeSource.quality !== 'unknown' ? activeSource.quality : qualityPref) as Quality
+        subtitleLang: subLang,
+        resolution: (source.quality !== 'unknown' ? source.quality : qualityPref) as Quality,
+        resumeSeconds: fromStart ? 0 : resumeAt
       })
+      setForceFromStart(false)
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Could not start playback')
+      setError(toUiError(e, 'Could not start torrent playback'))
+    } finally {
+      setStartingId(null)
+    }
+  }
+
+  const startLocalWatch = async (): Promise<void> => {
+    if (!item || !activeLocal) {
+      setError({ message: 'Select a local or custom stream first.' })
+      return
+    }
+    setBusy(true)
+    setError(null)
+    try {
+      const { path: subtitlePath, url: subtitleUrl, label: subtitleLabel } =
+        await resolveSubtitles()
+      const cacheId = `${item.id}-${season || 0}-${episode?.episodeNumber || 0}-${Date.now()}`
+      const playUrl = activeLocal.url
+      const playKind = activeLocal.kind
+
+      if (activeLocal.kind === 'http' && window.cinevault) {
+        const ext = playUrl.split('?')[0].split('.').pop() || 'mp4'
+        void window.cinevault.download.start({
+          id: cacheId,
+          url: playUrl,
+          fileName: `${cacheId}.${ext}`
+        })
+      }
+
+      if (window.cinevault) {
+        await window.cinevault.cache.upsert({
+          id: cacheId,
+          title: item.title,
+          mediaType: item.mediaType,
+          filePath: playKind === 'local' ? activeLocal.url : '',
+          createdAt: Date.now(),
+          lastWatchedAt: Date.now(),
+          completed: false,
+          progressSeconds: 0,
+          durationSeconds: 0,
+          sourceUrl: activeLocal.kind !== 'local' ? activeLocal.url : undefined
+        })
+      }
+
+      setSession({
+        cacheId,
+        title:
+          mediaType === 'movie'
+            ? item.title
+            : `${item.title} · S${season}E${episode?.episodeNumber ?? 1}`,
+        mediaType: item.mediaType,
+        externalId: item.externalId,
+        season: mediaType !== 'movie' ? season : undefined,
+        episode: mediaType !== 'movie' ? episode?.episodeNumber : undefined,
+        episodeTitle: mediaType !== 'movie' ? episode?.title : undefined,
+        showTitle: item.title,
+        posterUrl: item.posterUrl,
+        backdropUrl: item.backdropUrl,
+        imdbId: imdbId || item.imdbId || null,
+        source: { ...activeLocal, url: playUrl, kind: playKind },
+        subtitlePath,
+        subtitleUrl,
+        subtitleLabel,
+        subtitleLang: subLang,
+        resolution: (activeLocal.quality !== 'unknown' ? activeLocal.quality : qualityPref) as Quality,
+        resumeSeconds: forceFromStart
+          ? 0
+          : savedProgress && savedProgress.currentTime > 3
+            ? savedProgress.currentTime
+            : undefined
+      })
+      setForceFromStart(false)
+    } catch (e) {
+      setError(toUiError(e, 'Could not start playback'))
     } finally {
       setBusy(false)
     }
@@ -239,130 +671,580 @@ export function DetailPage(): JSX.Element {
 
   if (error && !item) {
     return (
-      <div>
-        <button className="btn ghost" type="button" onClick={() => navigate(-1)}>
-          ← Back
+      <div className="detail-page">
+        <button className="detail-back" type="button" onClick={() => navigate(-1)}>
+          <ArrowLeft size={18} strokeWidth={1.75} />
+          Back
         </button>
-        <div className="card-block" style={{ marginTop: 16, color: 'var(--danger)' }}>
-          {error}
+        <div className="detail-inline-error" style={{ marginTop: 16 }}>
+          <span>{error.message}</span>
+          {error.action && (
+            <Link
+              to={error.action.to}
+              state={{ settingsTab: 'subtitles' }}
+              className="detail-error-link"
+            >
+              {error.action.label}
+            </Link>
+          )}
         </div>
       </div>
     )
   }
 
-  if (!item) return <div className="muted">Loading…</div>
+  if (!item) {
+    return (
+      <div className="detail-page detail-loading">
+        <span className="feed-spinner" aria-hidden />
+        <span className="muted">Loading…</span>
+      </div>
+    )
+  }
 
-  const fav = isFavorite(item.mediaType, item.externalId)
   const showEpisodes = mediaType === 'series' || mediaType === 'anime'
+  const visibleEpisodes =
+    mediaType === 'series' ? episodesForSeason(episodes, season) : episodes
+  const year = releaseYear(item.releaseDate)
+  const synopsis = episode && showEpisodes ? episode.overview || item.overview : item.overview
+  const cast = extras.cast || []
+  const stills = extras.stills || []
+  const backdrop = pickSharpHeroUrl(item.backdropUrl, stills)
+
+  const openTrailer = async (): Promise<void> => {
+    if (!item) return
+    setTrailerBusy(true)
+    try {
+      const { trailer: resolved, searchUrl } = await resolveTrailerForItem(
+        {
+          title: item.title,
+          mediaType: item.mediaType,
+          externalId: item.externalId,
+          imdbId: item.imdbId || imdbId
+        },
+        {
+          youtubeId: extras.trailerYoutubeId,
+          tmdbApiKey: settings?.tmdbApiKey
+        }
+      )
+      if (resolved) {
+        setTrailer(resolved)
+      } else {
+        await openTrailerSearch(item.title)
+        // Also try opening searchUrl if openTrailerSearch failed silently
+        void searchUrl
+      }
+    } catch {
+      if (extras.trailerYoutubeId) {
+        setTrailer(buildTrailerInfo(extras.trailerYoutubeId, `${item.title} Trailer`))
+      } else {
+        await openTrailerSearch(item.title)
+      }
+    } finally {
+      setTrailerBusy(false)
+    }
+  }
 
   return (
-    <div>
-      <button className="btn ghost" type="button" onClick={() => navigate(-1)}>
-        ← Back
-      </button>
-      <div className="detail" style={{ marginTop: 12 }}>
-        <div>
-          <div className="detail-hero">
-            {item.backdropUrl || item.posterUrl ? (
-              <img className="backdrop" src={item.backdropUrl || item.posterUrl || ''} alt="" />
-            ) : null}
-            <div className="shade" />
+    <div className="detail-page">
+      <section className="detail-hero-immersive" aria-label={item.title}>
+        <div className="detail-hero-media" aria-hidden={!backdrop}>
+          {backdrop && (
+            <img
+              className="detail-hero-bg"
+              src={backdrop}
+              alt=""
+              decoding="async"
+              fetchPriority="high"
+            />
+          )}
+          <div className="detail-hero-scrim detail-hero-scrim-x" />
+          <div className="detail-hero-scrim detail-hero-scrim-y" />
+        </div>
+        <button className="detail-back" type="button" onClick={() => navigate(-1)}>
+          <ArrowLeft size={18} strokeWidth={1.75} />
+        </button>
+        <div className="detail-hero-content">
+          <h1 className="detail-hero-title">{item.title}</h1>
+          {extras.tagline && <p className="detail-tagline">{extras.tagline}</p>}
+          <div className="detail-hero-meta">
+            <span className="detail-hero-year">{year}</span>
+            {item.rating > 0 && (
+              <>
+                <span className="detail-meta-sep" aria-hidden>
+                  |
+                </span>
+                <span className="detail-score">
+                  <span className="detail-score-star" aria-hidden>
+                    ★
+                  </span>{' '}
+                  {item.rating.toFixed(1)}
+                </span>
+              </>
+            )}
+            {extras.ageRating && <span className="detail-cert">{extras.ageRating}</span>}
+            {extras.runtimeMinutes != null && extras.runtimeMinutes > 0 && (
+              <span>{formatRuntime(extras.runtimeMinutes)}</span>
+            )}
+            {item.genres.slice(0, 4).map((g) => (
+              <span key={g} className="detail-tag">
+                {g}
+              </span>
+            ))}
           </div>
-          <div className="detail-copy">
-            <h1 className="page-title">{item.title}</h1>
-            <p className="page-sub">
-              {item.releaseDate || 'Unknown date'} · ★ {item.rating.toFixed(1)} ·{' '}
-              {item.genres.join(' · ') || 'Uncategorized'}
-            </p>
-            <p style={{ maxWidth: 680, lineHeight: 1.55 }}>{item.overview || 'No overview.'}</p>
-            {episode && showEpisodes && (
-              <div className="card-block" style={{ marginTop: 16 }}>
-                <strong>
-                  S{episode.seasonNumber}E{episode.episodeNumber} · {episode.title}
-                </strong>
-                <p className="muted" style={{ marginBottom: 0 }}>
-                  {episode.overview || 'No episode synopsis.'}
-                </p>
+
+          <div className="detail-actions">
+            <div className="detail-actions-row">
+              <button
+                type="button"
+                className={`detail-watch-btn${
+                  !torrentLoading && isTargetAvailable && bestStream ? ' ready' : ''
+                }`}
+                disabled={
+                  torrentLoading || !isTargetAvailable || !bestStream || Boolean(startingId)
+                }
+                title={
+                  !torrentLoading && !isTargetAvailable
+                    ? `No ${selectedRes} torrents found. Highest available: ${highestAvailableRes || '—'}`
+                    : bestStream
+                      ? `Play ${bestStream.name}`
+                      : undefined
+                }
+                onClick={() => {
+                  if (bestStream) void playTorrent(bestStream)
+                }}
+              >
+                {torrentLoading ? (
+                  <span className="detail-watch-spinner" aria-hidden />
+                ) : (
+                  <Play size={16} className="detail-watch-play-icon" fill="currentColor" />
+                )}
+                <span>
+                  {torrentLoading
+                    ? 'Finding…'
+                    : savedProgress && !forceFromStart
+                      ? `Resume (${formatTime(savedProgress.currentTime)})`
+                      : 'Watch Now'}
+                </span>
+              </button>
+
+              <div className="detail-res-select-wrap">
+                <select
+                  className="detail-res-select"
+                  value={selectedRes}
+                  aria-label="Preferred resolution"
+                  onChange={(e) => {
+                    setSelectedRes(e.target.value as TargetRes)
+                    setResAdjustedNote(null)
+                  }}
+                >
+                  <option value="4K">4K</option>
+                  <option value="1080p">1080p</option>
+                  <option value="720p">720p</option>
+                  <option value="Auto">Auto</option>
+                </select>
+                <ChevronDown size={14} className="detail-res-chevron" aria-hidden />
+              </div>
+
+              {savedProgress && (
+                <button
+                  type="button"
+                  className="detail-restart-btn"
+                  title="Start from beginning"
+                  aria-label="Start from beginning"
+                  disabled={
+                    torrentLoading || !isTargetAvailable || !bestStream || Boolean(startingId)
+                  }
+                  onClick={() => {
+                    setForceFromStart(true)
+                    if (bestStream) void playTorrent(bestStream, { fromStart: true })
+                  }}
+                >
+                  <RotateCcw size={16} strokeWidth={1.75} />
+                </button>
+              )}
+
+              <span className="detail-actions-sep" aria-hidden />
+
+              <button
+                className="detail-btn trailer"
+                type="button"
+                disabled={trailerBusy}
+                title={
+                  extras.trailerYoutubeId
+                    ? 'Watch trailer'
+                    : 'Watch trailer (opens in-app or YouTube search)'
+                }
+                onClick={() => void openTrailer()}
+              >
+                <Clapperboard size={18} strokeWidth={1.75} />
+                {trailerBusy ? 'Loading…' : 'Watch Trailer'}
+              </button>
+
+              <div className="detail-actions-icons">
+                <button
+                  className={`detail-icon-btn detail-watch-later-btn${
+                    item && isWatchLaterSaved(item.id) ? ' on' : ''
+                  }`}
+                  type="button"
+                  title="Watch Later"
+                  aria-label="Watch Later"
+                  aria-pressed={Boolean(item && isWatchLaterSaved(item.id))}
+                  onClick={() => {
+                    if (!item) return
+                    toggleWatchLaterItem(catalogToWatchLaterItem(item))
+                  }}
+                >
+                  <Clock size={18} strokeWidth={1.75} />
+                </button>
+
+                <button
+                  className={`detail-icon-btn${fav ? ' on' : ''}`}
+                  type="button"
+                  title={fav ? 'Remove from favorites' : 'Favorite'}
+                  aria-label={fav ? 'Remove from favorites' : 'Favorite'}
+                  onClick={() =>
+                    toggleFavorite({
+                      id: item.id,
+                      mediaType: item.mediaType,
+                      externalId: item.externalId,
+                      title: item.title,
+                      posterUrl: item.posterUrl,
+                      releaseDate: item.releaseDate
+                    })
+                  }
+                >
+                  {fav ? (
+                    <Heart size={18} fill="currentColor" strokeWidth={0} />
+                  ) : (
+                    <Heart size={18} strokeWidth={1.75} />
+                  )}
+                </button>
+              </div>
+
+              {!torrentLoading &&
+                !isTargetAvailable &&
+                highestAvailableRes &&
+                selectedRes !== 'Auto' && (
+                  <button
+                    type="button"
+                    className="detail-res-fallback"
+                    onClick={() => {
+                      setSelectedRes(highestAvailableRes)
+                      setResAdjustedNote(null)
+                    }}
+                  >
+                    No {selectedRes} available · Switch to {highestAvailableRes}
+                  </button>
+                )}
+
+              {resAdjustedNote && (
+                <span className="detail-res-toast" role="status">
+                  {resAdjustedNote}
+                </span>
+              )}
+            </div>
+
+            {savedProgress && !forceFromStart && savedProgress.duration > 0 && (
+              <p className="detail-remaining">
+                {formatRemaining(savedProgress).replace(/\s*left$/i, '')} remaining
+              </p>
+            )}
+          </div>
+        </div>
+      </section>
+
+      <div className="detail-body">
+        {(synopsis || item.overview) && (
+          <section className="detail-section detail-synopsis-block">
+            <p className="detail-synopsis">{synopsis || item.overview}</p>
+          </section>
+        )}
+
+        {cast.length > 0 && (
+          <section className="detail-section">
+            <div className="detail-section-head">
+              <h2>Cast & Crew</h2>
+            </div>
+            <div className="cast-row">
+              {cast.map((c) => (
+                <div
+                  key={`${c.role}-${c.name}`}
+                  className="cast-chip"
+                  title={c.character || c.role}
+                >
+                  <div className="cast-avatar-wrap">
+                    {c.photoUrl ? (
+                      <img
+                        src={c.photoUrl}
+                        alt={c.name}
+                        className="cast-avatar"
+                        loading="lazy"
+                      />
+                    ) : (
+                      <span className="cast-avatar-fallback" aria-hidden>
+                        {c.name ? c.name.charAt(0).toUpperCase() : '?'}
+                      </span>
+                    )}
+                  </div>
+                  <div className="cast-copy">
+                    <strong className="cast-name">{c.name}</strong>
+                    <span className="cast-role">
+                      {c.role === 'director' ? 'Director' : c.character || 'Cast'}
+                    </span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </section>
+        )}
+
+        {stills.length > 0 && (
+          <section className="detail-section">
+            <div className="detail-section-head">
+              <h2>Stills & Gallery</h2>
+            </div>
+            <HScrollRail className="gallery-rail" aria-label="Stills gallery" role="list">
+              {stills.map((url) => (
+                <button
+                  key={url}
+                  type="button"
+                  className="gallery-thumb"
+                  onClick={() => setLightbox(upgradeImageUrl(url))}
+                >
+                  <img src={url} alt="" loading="lazy" decoding="async" />
+                </button>
+              ))}
+            </HScrollRail>
+          </section>
+        )}
+
+        {lightbox &&
+          createPortal(
+            <div
+              className="gallery-lightbox"
+              role="dialog"
+              aria-modal="true"
+              onClick={() => setLightbox(null)}
+            >
+              <img src={lightbox} alt="" onClick={(e) => e.stopPropagation()} />
+              <button type="button" className="gallery-close" onClick={() => setLightbox(null)}>
+                Close
+              </button>
+            </div>,
+            document.body
+          )}
+
+        {showEpisodes && (
+          <section className="detail-section">
+            <div className="detail-section-head">
+              <h2>Episodes</h2>
+            </div>
+
+            {seasons.length > 0 && (
+              <div className="season-tabs" role="tablist" aria-label="Seasons">
+                {seasons.map((s) => (
+                  <button
+                    key={s.seasonNumber}
+                    type="button"
+                    role="tab"
+                    aria-selected={season === s.seasonNumber}
+                    className={`season-tab${season === s.seasonNumber ? ' active' : ''}`}
+                    onClick={() => setSeason(s.seasonNumber)}
+                  >
+                    {s.name || `Season ${s.seasonNumber}`}
+                  </button>
+                ))}
               </div>
             )}
 
-            <div className="play-row">
-              <select
-                className="select"
-                value={qualityPref}
-                onChange={(e) => setQualityPref(e.target.value as Quality)}
-              >
-                {QUALITIES.map((q) => (
-                  <option key={q} value={q}>
-                    {q === '1440p' ? '2K (1440p)' : q === '2160p' ? '4K (2160p)' : q}
-                  </option>
-                ))}
-              </select>
-              <select
-                className="select"
-                value={selectedSource}
-                onChange={(e) => setSelectedSource(e.target.value)}
-                style={{ minWidth: 220 }}
-              >
-                <option value="">Select source…</option>
-                {sources.map((s) => (
-                  <option key={s.id} value={s.id}>
-                    {s.label}
-                    {s.hdr ? ' · HDR' : ''}
-                    {s.spatialAudio ? ' · Spatial' : ''}
-                  </option>
-                ))}
-              </select>
-              <select className="select" value={subLang} onChange={(e) => setSubLang(e.target.value)}>
-                {['en', 'es', 'fr', 'de', 'it', 'pt', 'ar', 'he', 'ja', 'ko', 'zh', 'ru'].map((l) => (
-                  <option key={l} value={l}>
-                    Subs: {l}
-                  </option>
-                ))}
-              </select>
-              <button className="btn" type="button" onClick={() => void loadSubs()} disabled={busy}>
-                Find subtitles
-              </button>
-              <select
-                className="select"
-                value={selectedSub ?? ''}
-                onChange={(e) => setSelectedSub(e.target.value ? Number(e.target.value) : null)}
-                style={{ minWidth: 180 }}
-              >
-                <option value="">No subtitles</option>
-                {subs.map((s) => (
-                  <option key={s.id} value={s.fileId}>
-                    {s.language} · {s.release.slice(0, 40)}
-                  </option>
-                ))}
-              </select>
-              <button className="btn primary" type="button" onClick={() => void startWatch()} disabled={busy}>
-                Start watching
-              </button>
-              <button
-                className="btn"
-                type="button"
-                onClick={() =>
-                  toggleFavorite({
-                    id: item.id,
-                    mediaType: item.mediaType,
-                    externalId: item.externalId,
-                    title: item.title,
-                    posterUrl: item.posterUrl,
-                    releaseDate: item.releaseDate
-                  })
-                }
-              >
-                {fav ? '★ Favorited' : '☆ Favorite'}
-              </button>
+            <div className="episode-cards">
+              {visibleEpisodes.map((ep) => {
+                const active = episode?.id === ep.id
+                return (
+                  <button
+                    key={ep.id}
+                    type="button"
+                    className={`episode-card${active ? ' active' : ''}`}
+                    onClick={() => setEpisode(ep)}
+                  >
+                    <div className="episode-thumb">
+                      {ep.stillUrl ? (
+                        <img src={ep.stillUrl} alt="" loading="lazy" decoding="async" />
+                      ) : (
+                        <div className="episode-thumb-empty">{epCode(ep.episodeNumber)}</div>
+                      )}
+                    </div>
+                    <div className="episode-card-body">
+                      <div className="episode-card-top">
+                        <span className="episode-index">{epCode(ep.episodeNumber)}</span>
+                        {ep.airDate && <span className="episode-date">{ep.airDate}</span>}
+                      </div>
+                      <strong className="episode-title">{ep.title}</strong>
+                    </div>
+                  </button>
+                )
+              })}
             </div>
 
-            <div className="card-block" style={{ marginTop: 18 }}>
-              <strong>Add stream URL</strong>
-              <p className="muted">
-                Paste an HTTP progressive or HLS (.m3u8) URL you are authorized to play. Local library
-                matches appear automatically when filenames resemble this title.
-              </p>
+            {episode && (
+              <div className="episode-synopsis">
+                <strong>
+                  {epCode(episode.episodeNumber)} · {episode.title}
+                </strong>
+                <p>{episode.overview || 'No episode synopsis.'}</p>
+              </div>
+            )}
+          </section>
+        )}
+
+        <section className="detail-section">
+          <div className="detail-section-head">
+            <h2>Streams</h2>
+            {!torrentLoading && torrentResults.length > 0 && (
+              <span className="muted">
+                {filteredTorrents.length} of {torrentResults.length}
+              </span>
+            )}
+          </div>
+
+          {!torrentLoading && torrentResults.length > 0 && (
+            <div className="stream-filters">
+              <button
+                type="button"
+                className={`stream-filter${qualityFilter === 'all' ? ' active' : ''}`}
+                onClick={() => setQualityFilter('all')}
+              >
+                All
+              </button>
+              {qualityOptions.map((q) => (
+                <button
+                  key={q}
+                  type="button"
+                  className={`stream-filter${qualityFilter === q ? ' active' : ''}`}
+                  onClick={() => setQualityFilter(q)}
+                >
+                  {q === 'unknown' ? 'Other' : qualityLabel(q)}
+                </button>
+              ))}
+            </div>
+          )}
+
+          {torrentLoading && (
+            <div className="stream-status" role="status">
+              <span className="feed-spinner" aria-hidden />
+              Finding streams…
+            </div>
+          )}
+
+          {torrentError && <div className="stream-error">{torrentError}</div>}
+
+          {!torrentLoading && !torrentError && torrentResults.length === 0 && (
+            <div className="stream-empty">
+              <Star size={22} strokeWidth={1.5} />
+              <p>No streams found for this title.</p>
+              <Link to="/feeds" className="detail-link">
+                Try Feeds
+              </Link>
+            </div>
+          )}
+
+          {!torrentLoading && filteredTorrents.length === 0 && torrentResults.length > 0 && (
+            <div className="stream-empty">
+              <p>No streams match this resolution.</p>
+            </div>
+          )}
+
+          <div className="stream-list">
+            {filteredTorrents.map((row) => {
+              const q = guessQualityFromName(row.name)
+              const starting = startingId === row.id
+              return (
+                <article
+                  key={row.id}
+                  className="stream-card"
+                  onClick={() => void playTorrent(row)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      e.preventDefault()
+                      void playTorrent(row)
+                    }
+                  }}
+                  role="button"
+                  tabIndex={0}
+                >
+                  <div className="stream-card-main">
+                    <span className={`stream-res ${qualityTone(q)}`}>{qualityLabel(q)}</span>
+                    <div className="stream-card-copy">
+                      <div className="stream-title" title={row.name}>
+                        {row.name}
+                      </div>
+                      <span className="stream-source">{row.source}</span>
+                    </div>
+                  </div>
+                  <div className="stream-card-meta">
+                    <span className="stream-size">{formatFileSize(row.sizeBytes)}</span>
+                    <span
+                      className="stream-health"
+                      title={`${row.seeders} seeders · ${row.leechers} leechers`}
+                    >
+                      <span className="stream-health-dot" />
+                      {row.seeders}
+                    </span>
+                    <button
+                      className="stream-play"
+                      type="button"
+                      disabled={!!startingId || !row.magnetUri}
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        void playTorrent(row)
+                      }}
+                    >
+                      <Play size={14} fill="currentColor" strokeWidth={0} />
+                      {starting ? '…' : 'Play'}
+                    </button>
+                  </div>
+                </article>
+              )
+            })}
+          </div>
+        </section>
+
+        <section className="detail-section advanced">
+          <button
+            className="detail-advanced-toggle"
+            type="button"
+            onClick={() => setShowAdvanced((v) => !v)}
+          >
+            {showAdvanced ? 'Hide' : 'Show'} advanced sources
+          </button>
+          {showAdvanced && (
+            <div className="detail-advanced">
+              {localSources.length > 0 && (
+                <div className="play-row">
+                  <ThemedSelect
+                    variant="default"
+                    aria-label="Local or custom source"
+                    value={selectedLocal}
+                    onChange={setSelectedLocal}
+                    menuMinWidth={260}
+                    options={[
+                      { value: '', label: 'Local / custom source…' },
+                      ...localSources.map((s) => ({
+                        value: s.id,
+                        label: `${s.label}${s.hdr ? ' · HDR' : ''}${s.spatialAudio ? ' · Spatial' : ''}`
+                      }))
+                    ]}
+                  />
+                  <button
+                    className="btn primary"
+                    type="button"
+                    onClick={() => void startLocalWatch()}
+                    disabled={busy || !activeLocal}
+                  >
+                    Play selected
+                  </button>
+                </div>
+              )}
               <div className="play-row">
                 <input
                   className="search"
@@ -375,50 +1257,26 @@ export function DetailPage(): JSX.Element {
                 </button>
               </div>
             </div>
-            {error && (
-              <div className="card-block" style={{ marginTop: 12, color: 'var(--danger)' }}>
-                {error}
-              </div>
+          )}
+        </section>
+
+        {error && (
+          <div className="detail-inline-error" role="alert">
+            <span>{error.message}</span>
+            {error.action && (
+              <Link
+                to={error.action.to}
+                state={{ settingsTab: 'subtitles' }}
+                className="detail-error-link"
+              >
+                {error.action.label}
+              </Link>
             )}
           </div>
-        </div>
-
-        {showEpisodes && (
-          <aside className="detail-side">
-            <div className="nav-label" style={{ marginTop: 0 }}>
-              Seasons
-            </div>
-            <div className="season-list" style={{ flexDirection: 'row', flexWrap: 'wrap', marginBottom: 14 }}>
-              {seasons.map((s) => (
-                <button
-                  key={s.seasonNumber}
-                  type="button"
-                  className={`chip${season === s.seasonNumber ? ' active' : ''}`}
-                  onClick={() => setSeason(s.seasonNumber)}
-                >
-                  {s.name}
-                </button>
-              ))}
-            </div>
-            <div className="nav-label">Episodes</div>
-            <div className="episode-list">
-              {episodes.map((ep) => (
-                <button
-                  key={ep.id}
-                  type="button"
-                  className={`episode-row${episode?.id === ep.id ? ' active' : ''}`}
-                  onClick={() => setEpisode(ep)}
-                >
-                  <strong>
-                    E{ep.episodeNumber} · {ep.title}
-                  </strong>
-                  <p>{ep.overview || ep.airDate || '—'}</p>
-                </button>
-              ))}
-            </div>
-          </aside>
         )}
       </div>
+
+      {trailer && <TrailerModal trailer={trailer} onClose={() => setTrailer(null)} />}
     </div>
   )
 }

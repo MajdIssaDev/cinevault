@@ -16,6 +16,22 @@ export interface CatalogItem {
   imdbId?: string | null
 }
 
+export interface CastMember {
+  name: string
+  character?: string | null
+  photoUrl?: string | null
+  role: 'director' | 'cast'
+}
+
+export interface MediaExtras {
+  tagline?: string | null
+  runtimeMinutes?: number | null
+  ageRating?: string | null
+  trailerYoutubeId?: string | null
+  stills?: string[]
+  cast?: CastMember[]
+}
+
 export interface SeasonInfo {
   seasonNumber: number
   name: string
@@ -39,7 +55,7 @@ export interface StreamSource {
   label: string
   quality: Quality | 'unknown'
   url: string
-  kind: 'local' | 'http' | 'hls'
+  kind: 'local' | 'http' | 'hls' | 'torrent'
   hdr?: boolean
   spatialAudio?: boolean
 }
@@ -60,9 +76,17 @@ export interface PlaybackSession {
   externalId: number
   season?: number
   episode?: number
+  episodeTitle?: string
+  showTitle?: string
+  posterUrl?: string | null
+  backdropUrl?: string | null
+  imdbId?: string | null
   source: StreamSource
   subtitlePath?: string | null
+  subtitleUrl?: string | null
   subtitleLabel?: string
+  /** ISO subtitle language used when starting playback (e.g. en, ar) */
+  subtitleLang?: string
   resolution: Quality
   resumeSeconds?: number
 }

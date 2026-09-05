@@ -2,7 +2,6 @@ import { contextBridge, ipcRenderer } from 'electron'
 import type { AppSettings } from '../main/settings'
 import type { CacheEntry } from '../main/cache'
 import type { LibraryItem } from '../main/library'
-import type { SubtitleResult } from '../main/opensubtitles'
 
 const api = {
   settings: {
@@ -33,12 +32,57 @@ const api = {
   },
   subs: {
     loginTest: (): Promise<{ ok: boolean }> => ipcRenderer.invoke('subs:login-test'),
-    search: (query: Record<string, unknown>): Promise<SubtitleResult[]> =>
-      ipcRenderer.invoke('subs:search', query),
+    search: (query: Record<string, unknown>): Promise<
+      { id: string; language: string; release: string; downloadCount: number; hearingImpaired: boolean; fileId: number; fps: number | null }[]
+    > => ipcRenderer.invoke('subs:search', query),
     download: (fileId: number, name?: string): Promise<string> =>
       ipcRenderer.invoke('subs:download', fileId, name),
     saveVtt: (content: string, name: string): Promise<string> =>
-      ipcRenderer.invoke('subs:save-vtt', content, name)
+      ipcRenderer.invoke('subs:save-vtt', content, name),
+    available: (query: {
+      imdbId?: string
+      type?: 'movie' | 'series' | 'episode' | 'tv'
+      lang?: string
+      season?: number
+      episode?: number
+      title?: string
+      releaseHint?: string
+    }): Promise<
+      {
+        id: string
+        label: string
+        language: string
+        url: string | null
+        provider: 'Subdl' | 'Public'
+        nId?: string
+        downloadUrl?: string
+        releaseName?: string
+        matchScore?: number
+      }[]
+    > => ipcRenderer.invoke('subs:available', query),
+    resolve: (
+      item: {
+        id: string
+        label: string
+        language: string
+        url: string | null
+        provider: 'Subdl' | 'Public'
+        nId?: string
+        downloadUrl?: string
+        releaseName?: string
+        matchScore?: number
+      },
+      lang?: string
+    ): Promise<{
+      path: string | null
+      url: string | null
+      content: string | null
+      label: string
+      language: string
+      provider: 'Subdl' | 'Public'
+    }> => ipcRenderer.invoke('subs:resolve', item, lang),
+    testSubdl: (apiKey?: string): Promise<{ ok: boolean; message: string }> =>
+      ipcRenderer.invoke('subs:test-subdl', apiKey)
   },
   download: {
     start: (opts: { id: string; url: string; fileName: string }): Promise<{ path: string }> =>
@@ -59,7 +103,18 @@ const api = {
   window: {
     minimize: (): Promise<void> => ipcRenderer.invoke('window:minimize'),
     close: (): Promise<void> => ipcRenderer.invoke('window:close'),
-    toggleMaximize: (): Promise<boolean> => ipcRenderer.invoke('window:toggle-maximize')
+    toggleMaximize: (): Promise<boolean> => ipcRenderer.invoke('window:toggle-maximize'),
+    isMaximized: (): Promise<boolean> => ipcRenderer.invoke('window:is-maximized'),
+    onMaximizedChanged: (cb: (maximized: boolean) => void): (() => void) => {
+      const handler = (_event: unknown, maximized: boolean): void => cb(Boolean(maximized))
+      ipcRenderer.on('window:maximized-changed', handler)
+      return () => ipcRenderer.removeListener('window:maximized-changed', handler)
+    },
+    setTitleBarOverlay: (_opts: {
+      color: string
+      symbolColor: string
+      height?: number
+    }): Promise<boolean> => ipcRenderer.invoke('window:set-titlebar-overlay')
   },
   pip: {
     open: (bounds?: { x: number; y: number; width: number; height: number }): Promise<boolean> =>
@@ -75,15 +130,56 @@ const api = {
   },
   shell: {
     openPath: (path: string): Promise<string> => ipcRenderer.invoke('shell:open-path', path),
+    openExternal: (url: string): Promise<boolean> => ipcRenderer.invoke('shell:open-external', url),
     showItem: (path: string): Promise<boolean> => ipcRenderer.invoke('shell:show-item', path)
   },
   torznab: {
-    get: (url: string): Promise<{ status: number; body: string }> =>
+    get: (url: string): Promise<{ status: number; body: string; error?: string }> =>
       ipcRenderer.invoke('torznab:get', url)
   },
+  torrent: {
+    start: (opts: {
+      id: string
+      magnetUri: string
+      fileName?: string
+    }): Promise<{ streamUrl: string; fileName: string; size: number }> =>
+      ipcRenderer.invoke('torrent:start', opts),
+    status: (
+      id: string
+    ): Promise<{
+      progress: number
+      downloadSpeed: number
+      uploadSpeed: number
+      peers: number
+      downloaded: number
+      total: number
+      ready: boolean
+      done: boolean
+      error?: string
+      streamUrl?: string
+      fileName?: string
+    } | null> => ipcRenderer.invoke('torrent:status', id),
+    stop: (id: string): Promise<boolean> => ipcRenderer.invoke('torrent:stop', id)
+  },
   updater: {
-    onStatus: (cb: (payload: unknown) => void): (() => void) => {
-      const handler = (_: unknown, payload: unknown): void => cb(payload)
+    getVersion: (): Promise<string> => ipcRenderer.invoke('updater:get-version'),
+    check: (): Promise<{ ok: boolean; reason?: string; updateInfo?: string | null }> =>
+      ipcRenderer.invoke('updater:check'),
+    download: (): Promise<{ ok: boolean; reason?: string }> => ipcRenderer.invoke('updater:download'),
+    install: (): Promise<{ ok: boolean }> => ipcRenderer.invoke('updater:install'),
+    onStatus: (cb: (payload: {
+        status: string
+        version?: string
+        releaseNotes?: string | null
+        percent?: number
+        bytesPerSecond?: number
+        transferred?: number
+        total?: number
+        message?: string
+        silent?: boolean
+      }) => void): (() => void) => {
+      const handler = (_event: unknown, payload: unknown): void =>
+        cb(payload as Parameters<typeof cb>[0])
       ipcRenderer.on('updater:status', handler)
       return () => ipcRenderer.removeListener('updater:status', handler)
     }

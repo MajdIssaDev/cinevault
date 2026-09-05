@@ -11,6 +11,7 @@ export interface FeedResult {
 export interface TorznabHttpResponse {
   status: number
   body: string
+  error?: string
 }
 
 export type TorznabGet = (url: string) => Promise<TorznabHttpResponse>
@@ -207,7 +208,10 @@ export class TorznabClient {
   async search(endpoint: string, apiKey: string, query: string): Promise<FeedResult[]> {
     if (!endpoint.trim() || !apiKey.trim()) throw new Error(MISSING_SETTINGS)
     const url = buildSearchUrl(endpoint, apiKey, query)
-    const { status, body } = await this.http(url)
+    const { status, body, error } = await this.http(url)
+    if (status === 0) {
+      throw new Error(error || 'Could not reach Torznab indexer')
+    }
     return parseTorznabXml(body, status)
   }
 }

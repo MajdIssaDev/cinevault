@@ -7,6 +7,7 @@ export type ThemeMode = 'dark' | 'light' | 'system'
 export interface AppSettings {
   theme: ThemeMode
   tmdbApiKey: string
+  subdlApiKey: string
   openSubtitlesApiKey: string
   openSubtitlesUsername: string
   openSubtitlesPassword: string
@@ -19,13 +20,12 @@ export interface AppSettings {
   preferHdr: boolean
   preferSpatialAudio: boolean
   updateChannel: 'latest'
-  torznabEndpoint: string
-  torznabApiKey: string
 }
 
 const DEFAULTS: AppSettings = {
   theme: 'dark',
   tmdbApiKey: '',
+  subdlApiKey: '',
   openSubtitlesApiKey: '',
   openSubtitlesUsername: '',
   openSubtitlesPassword: '',
@@ -37,9 +37,7 @@ const DEFAULTS: AppSettings = {
   autoDeleteOnComplete: true,
   preferHdr: true,
   preferSpatialAudio: true,
-  updateChannel: 'latest',
-  torznabEndpoint: '',
-  torznabApiKey: ''
+  updateChannel: 'latest'
 }
 
 function settingsPath(): string {

@@ -31,7 +31,7 @@ async function ensureLogin(): Promise<string> {
   if (session?.token) return session.token
   const settings = loadSettings()
   if (!settings.openSubtitlesApiKey || !settings.openSubtitlesUsername || !settings.openSubtitlesPassword) {
-    throw new Error('OpenSubtitles credentials missing. Add them in Settings.')
+    throw new Error('OPENSUBTITLES_CREDENTIALS_MISSING')
   }
   const res = await osFetch('/login', {
     method: 'POST',

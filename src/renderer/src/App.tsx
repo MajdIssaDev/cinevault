@@ -10,9 +10,15 @@ import { LibraryPage } from './pages/LibraryPage'
 import { FeedPage } from './pages/FeedPage'
 import { PlayerPage } from './pages/PlayerPage'
 import { PipPage } from './pages/PipPage'
+import { syncTitleBarOverlay } from './lib/titlebarOverlay'
+import { initMobileOta } from './lib/mobileOta'
+import { lockCatalogOrientation, lockPlayerOrientation } from './lib/mobileOrientation'
+import { isMobileShell } from './lib/platform'
+import { TitleBar } from './components/TitleBar'
 
 export default function App(): JSX.Element {
   const loadSettings = useAppStore((s) => s.loadSettings)
+  const settings = useAppStore((s) => s.settings)
   const session = useAppStore((s) => s.session)
   const location = useLocation()
 
@@ -20,12 +26,43 @@ export default function App(): JSX.Element {
     void loadSettings()
   }, [loadSettings])
 
+  useEffect(() => {
+    if (isMobileShell()) {
+      document.documentElement.classList.add('is-mobile-shell')
+      void initMobileOta()
+    }
+  }, [])
+
+  useEffect(() => {
+    syncTitleBarOverlay(Boolean(session))
+  }, [session, settings?.theme])
+
+  // Catalog = portrait · Player = landscape (native only)
+  useEffect(() => {
+    if (!isMobileShell()) return
+    if (session) void lockPlayerOrientation()
+    else void lockCatalogOrientation()
+  }, [session])
+
+  useEffect(() => {
+    const updater = window.cinevault?.updater
+    if (!updater) return
+    return updater.onStatus((payload) => {
+      if (payload.status === 'available' || payload.status === 'ready') {
+        useAppStore.getState().setUpdateBadge(true, payload.version ?? null)
+      } else if (payload.status === 'none') {
+        useAppStore.getState().setUpdateBadge(false, null)
+      }
+    })
+  }, [])
+
   if (location.pathname === '/pip' || location.hash === '#/pip') {
     return <PipPage />
   }
 
   return (
     <>
+      <TitleBar />
       <Shell>
         <Routes>
           <Route path="/" element={<Navigate to="/movies" replace />} />

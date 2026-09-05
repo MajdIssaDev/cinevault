@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, shell, screen, nativeTheme, protocol, net } from 'electron'
+import { app, BrowserWindow, ipcMain, shell, screen, protocol, net } from 'electron'
 import { join, normalize } from 'path'
 import { pathToFileURL } from 'url'
 import { electronApp, optimizer, is } from './utils'
@@ -6,8 +6,10 @@ import { registerCacheHandlers } from './cache'
 import { registerSettingsHandlers } from './settings'
 import { registerLibraryHandlers } from './library'
 import { registerOpenSubtitlesHandlers } from './opensubtitles'
+import { registerSubtitleEngineHandlers } from './subtitlesEngine'
 import { registerDownloaderHandlers } from './downloader'
 import { registerTorznabHandlers } from './torznab'
+import { destroyAllTorrents, registerTorrentHandlers } from './torrent'
 import { setupAutoUpdater } from './updater'
 
 protocol.registerSchemesAsPrivileged([
@@ -34,13 +36,9 @@ function createMainWindow(): void {
     minWidth: 1100,
     minHeight: 700,
     show: false,
-    backgroundColor: nativeTheme.shouldUseDarkColors ? '#0b0d10' : '#f4f6f8',
-    titleBarStyle: 'hidden',
-    titleBarOverlay: {
-      color: nativeTheme.shouldUseDarkColors ? '#0b0d10' : '#f4f6f8',
-      symbolColor: nativeTheme.shouldUseDarkColors ? '#e8ecf1' : '#1a1f26',
-      height: 36
-    },
+    backgroundColor: '#090d16',
+    frame: false,
+    autoHideMenuBar: true,
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
       contextIsolation: true,
@@ -55,6 +53,13 @@ function createMainWindow(): void {
     shell.openExternal(details.url)
     return { action: 'deny' }
   })
+
+  const emitMaximized = (): void => {
+    if (!mainWindow || mainWindow.isDestroyed()) return
+    mainWindow.webContents.send('window:maximized-changed', mainWindow.isMaximized())
+  }
+  mainWindow.on('maximize', emitMaximized)
+  mainWindow.on('unmaximize', emitMaximized)
 
   if (is.dev && process.env.ELECTRON_RENDERER_URL) {
     mainWindow.loadURL(process.env.ELECTRON_RENDERER_URL)
@@ -128,11 +133,13 @@ app.whenReady().then(() => {
   registerCacheHandlers()
   registerLibraryHandlers()
   registerOpenSubtitlesHandlers()
+  registerSubtitleEngineHandlers()
   registerDownloaderHandlers()
   registerTorznabHandlers()
+  registerTorrentHandlers()
 
   createMainWindow()
-  setupAutoUpdater(mainWindow)
+  setupAutoUpdater(() => mainWindow)
 
   ipcMain.handle('window:minimize', () => mainWindow?.minimize())
   ipcMain.handle('window:close', () => mainWindow?.close())
@@ -145,6 +152,9 @@ app.whenReady().then(() => {
     mainWindow.maximize()
     return true
   })
+  ipcMain.handle('window:is-maximized', () => Boolean(mainWindow?.isMaximized()))
+  // Kept for compatibility; custom title bar no longer uses native overlay.
+  ipcMain.handle('window:set-titlebar-overlay', () => false)
 
   ipcMain.handle('pip:open', (_e, bounds?: { x: number; y: number; width: number; height: number }) => {
     if (pipWindow && !pipWindow.isDestroyed()) {
@@ -166,6 +176,11 @@ app.whenReady().then(() => {
   })
 
   ipcMain.handle('shell:open-path', async (_e, path: string) => shell.openPath(path))
+  ipcMain.handle('shell:open-external', async (_e, url: string) => {
+    if (typeof url !== 'string' || !/^https?:\/\//i.test(url)) return false
+    await shell.openExternal(url)
+    return true
+  })
   ipcMain.handle('shell:show-item', (_e, path: string) => {
     shell.showItemInFolder(path)
     return true
@@ -177,5 +192,6 @@ app.whenReady().then(() => {
 })
 
 app.on('window-all-closed', () => {
+  void destroyAllTorrents()
   if (process.platform !== 'darwin') app.quit()
 })

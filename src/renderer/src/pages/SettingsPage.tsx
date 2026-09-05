@@ -1,6 +1,40 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
+import { useLocation } from 'react-router-dom'
+import {
+  Captions,
+  ExternalLink,
+  FolderOpen,
+  Info,
+  MonitorPlay,
+  Palette,
+  RefreshCw,
+  Save
+} from 'lucide-react'
 import { useAppStore } from '../store'
 import type { AppSettings } from '../../../main/settings'
+import { ThemedSelect } from '../components/ThemedSelect'
+import { openExternal } from '../lib/openExternal'
+
+type TabId = 'appearance' | 'subtitles' | 'playback' | 'storage' | 'about'
+
+const TABS: { id: TabId; label: string; icon: typeof Palette }[] = [
+  { id: 'appearance', label: 'Appearance', icon: Palette },
+  { id: 'subtitles', label: 'Subtitles', icon: Captions },
+  { id: 'playback', label: 'Playback', icon: MonitorPlay },
+  { id: 'storage', label: 'Storage & Library', icon: FolderOpen },
+  { id: 'about', label: 'About', icon: Info }
+]
+
+type UpdateUiState =
+  | { kind: 'idle' }
+  | { kind: 'checking' }
+  | { kind: 'latest' }
+  | { kind: 'available'; version: string; notes: string | null }
+  | { kind: 'downloading'; percent: number; bytesPerSecond: number }
+  | { kind: 'ready'; version: string }
+  | { kind: 'error'; message: string }
+
+const SUB_LANGS = ['en', 'es', 'fr', 'de', 'it', 'pt', 'pl', 'ar', 'he', 'ja', 'ko', 'zh', 'ru']
 
 function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`
@@ -9,265 +43,566 @@ function formatBytes(n: number): string {
   return `${(n / 1024 ** 3).toFixed(2)} GB`
 }
 
+function formatSpeed(bps: number): string {
+  if (!bps || bps <= 0) return '—'
+  return `${formatBytes(bps)}/s`
+}
+
+function Toggle({
+  checked,
+  onChange,
+  label,
+  description
+}: {
+  checked: boolean
+  onChange: (next: boolean) => void
+  label: string
+  description?: string
+}): JSX.Element {
+  return (
+    <label className="settings-toggle-row">
+      <span className="settings-toggle-copy">
+        <span className="settings-toggle-label">{label}</span>
+        {description && <span className="settings-toggle-desc">{description}</span>}
+      </span>
+      <button
+        type="button"
+        role="switch"
+        aria-checked={checked}
+        className={`settings-switch${checked ? ' on' : ''}`}
+        onClick={() => onChange(!checked)}
+      >
+        <span className="settings-switch-thumb" />
+      </button>
+    </label>
+  )
+}
+
+function Field({
+  label,
+  children
+}: {
+  label: string
+  children: ReactNode
+}): JSX.Element {
+  return (
+    <div className="settings-field">
+      <label>{label}</label>
+      {children}
+    </div>
+  )
+}
+
 export function SettingsPage(): JSX.Element {
   const settings = useAppStore((s) => s.settings)
   const saveSettings = useAppStore((s) => s.saveSettings)
+  const setUpdateBadge = useAppStore((s) => s.setUpdateBadge)
+  const location = useLocation()
+  const initialTab =
+    (location.state as { settingsTab?: TabId } | null)?.settingsTab &&
+    TABS.some((t) => t.id === (location.state as { settingsTab?: TabId }).settingsTab)
+      ? ((location.state as { settingsTab: TabId }).settingsTab)
+      : 'appearance'
   const [draft, setDraft] = useState<AppSettings | null>(settings)
+  const [tab, setTab] = useState<TabId>(initialTab)
   const [cacheStats, setCacheStats] = useState<{ bytes: number; count: number; directory: string } | null>(
     null
   )
   const [msg, setMsg] = useState<string | null>(null)
+  const [saving, setSaving] = useState(false)
+  const [appVersion, setAppVersion] = useState('…')
+  const [updateUi, setUpdateUi] = useState<UpdateUiState>({ kind: 'idle' })
 
   useEffect(() => setDraft(settings), [settings])
   useEffect(() => {
+    const next = (location.state as { settingsTab?: TabId } | null)?.settingsTab
+    if (next && TABS.some((t) => t.id === next)) setTab(next)
+  }, [location.state])
+  useEffect(() => {
     void window.cinevault?.cache.stats().then(setCacheStats)
   }, [])
+  useEffect(() => {
+    void window.cinevault?.updater.getVersion().then(setAppVersion).catch(() => setAppVersion('1.0.0'))
+  }, [])
 
-  if (!draft) return <div className="muted">Loading settings…</div>
+  useEffect(() => {
+    const updater = window.cinevault?.updater
+    if (!updater) return
+    return updater.onStatus((payload) => {
+      switch (payload.status) {
+        case 'checking':
+          setUpdateUi({ kind: 'checking' })
+          break
+        case 'available':
+          setUpdateUi({
+            kind: 'available',
+            version: payload.version || '?',
+            notes: payload.releaseNotes ?? null
+          })
+          setUpdateBadge(true, payload.version ?? null)
+          break
+        case 'none':
+          setUpdateUi({ kind: 'latest' })
+          setUpdateBadge(false, null)
+          break
+        case 'downloading':
+          setUpdateUi({
+            kind: 'downloading',
+            percent: payload.percent ?? 0,
+            bytesPerSecond: payload.bytesPerSecond ?? 0
+          })
+          break
+        case 'ready':
+          setUpdateUi({ kind: 'ready', version: payload.version || '?' })
+          setUpdateBadge(true, payload.version ?? null)
+          break
+        case 'error':
+          if (payload.silent) {
+            setUpdateUi({
+              kind: 'error',
+              message: 'Unable to reach update server. You can keep using this version.'
+            })
+          } else {
+            setUpdateUi({
+              kind: 'error',
+              message: payload.message || 'Update check failed'
+            })
+          }
+          break
+        default:
+          break
+      }
+    })
+  }, [setUpdateBadge])
+
+  useEffect(() => {
+    if (!msg) return
+    const t = window.setTimeout(() => setMsg(null), 3200)
+    return () => window.clearTimeout(t)
+  }, [msg])
+
+  if (!draft) {
+    return (
+      <div className="settings-page">
+        <p className="settings-loading">Loading settings…</p>
+      </div>
+    )
+  }
 
   const set = <K extends keyof AppSettings>(key: K, value: AppSettings[K]): void => {
     setDraft({ ...draft, [key]: value })
   }
 
+  const onSave = async (): Promise<void> => {
+    setSaving(true)
+    try {
+      await saveSettings(draft)
+      setMsg('Settings saved')
+    } catch (e) {
+      setMsg(e instanceof Error ? e.message : 'Save failed')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const checkUpdates = async (): Promise<void> => {
+    setUpdateUi({ kind: 'checking' })
+    try {
+      await window.cinevault.updater.check()
+    } catch {
+      setUpdateUi({
+        kind: 'error',
+        message: 'Unable to reach update server. You can keep using this version.'
+      })
+    }
+  }
+
+  const cachePath = cacheStats?.directory || draft.cacheDirectory
+  const updateStatusText = ((): string => {
+    switch (updateUi.kind) {
+      case 'checking':
+        return 'Checking for updates…'
+      case 'latest':
+        return "You're on the latest version"
+      case 'available':
+        return `Update v${updateUi.version} available`
+      case 'downloading':
+        return `Downloading update… ${Math.round(updateUi.percent)}%`
+      case 'ready':
+        return `Update v${updateUi.version} ready to install`
+      case 'error':
+        return updateUi.message
+      default:
+        return 'Check GitHub Releases for new builds'
+    }
+  })()
+
   return (
-    <div>
-      <h1 className="page-title">Settings</h1>
-      <p className="page-sub">Appearance, APIs, library folders, cache, and playback preferences.</p>
-
-      <div className="settings-grid">
-        <section className="card-block">
-          <h3 style={{ marginTop: 0 }}>Appearance</h3>
-          <div className="field">
-            <label>Theme</label>
-            <select value={draft.theme} onChange={(e) => set('theme', e.target.value as AppSettings['theme'])}>
-              <option value="dark">Dark</option>
-              <option value="light">Light</option>
-              <option value="system">System</option>
-            </select>
-          </div>
-        </section>
-
-        <section className="card-block">
-          <h3 style={{ marginTop: 0 }}>Catalog APIs</h3>
-          <div className="field">
-            <label>TMDB API key</label>
-            <input
-              value={draft.tmdbApiKey}
-              onChange={(e) => set('tmdbApiKey', e.target.value)}
-              placeholder="Required for movies & series"
-            />
-          </div>
-          <p className="muted">Anime uses AniList (no key). Get a TMDB key at themoviedb.org.</p>
-        </section>
-
-        <section className="card-block">
-          <h3 style={{ marginTop: 0 }}>Torznab / RSS</h3>
-          <div className="field">
-            <label>Endpoint URL</label>
-            <input
-              value={draft.torznabEndpoint ?? ''}
-              onChange={(e) => set('torznabEndpoint', e.target.value)}
-              placeholder="http://127.0.0.1:9696/1/api"
-            />
-          </div>
-          <div className="field">
-            <label>API key</label>
-            <input
-              type="password"
-              value={draft.torznabApiKey ?? ''}
-              onChange={(e) => set('torznabApiKey', e.target.value)}
-              placeholder="Indexer API key"
-              autoComplete="off"
-            />
-          </div>
-          <p className="muted">
-            User-operated indexer URL (Prowlarr or Jackett Torznab). CineVault does not ship a built-in catalog.
-          </p>
-        </section>
-
-        <section className="card-block">
-          <h3 style={{ marginTop: 0 }}>OpenSubtitles</h3>
-          <div className="field">
-            <label>API key</label>
-            <input
-              value={draft.openSubtitlesApiKey}
-              onChange={(e) => set('openSubtitlesApiKey', e.target.value)}
-            />
-          </div>
-          <div className="field">
-            <label>Username</label>
-            <input
-              value={draft.openSubtitlesUsername}
-              onChange={(e) => set('openSubtitlesUsername', e.target.value)}
-            />
-          </div>
-          <div className="field">
-            <label>Password</label>
-            <input
-              type="password"
-              value={draft.openSubtitlesPassword}
-              onChange={(e) => set('openSubtitlesPassword', e.target.value)}
-            />
-          </div>
-          <div className="field">
-            <label>Default subtitle language</label>
-            <select
-              value={draft.defaultSubtitleLanguage}
-              onChange={(e) => set('defaultSubtitleLanguage', e.target.value)}
-            >
-              {['en', 'es', 'fr', 'de', 'it', 'pt', 'ar', 'he', 'ja', 'ko', 'zh', 'ru'].map((l) => (
-                <option key={l} value={l}>
-                  {l}
-                </option>
-              ))}
-            </select>
+    <div className="settings-page">
+      <div className="settings-container">
+        <header className="settings-header">
+          <div>
+            <h1 className="settings-title">Settings</h1>
+            <p className="settings-subtitle">
+              Appearance, subtitles, playback, storage, and app updates.
+            </p>
           </div>
           <button
-            className="btn"
             type="button"
-            style={{ marginTop: 10 }}
-            onClick={async () => {
-              await saveSettings(draft)
-              try {
-                await window.cinevault.subs.loginTest()
-                setMsg('OpenSubtitles login OK')
-              } catch (e) {
-                setMsg(e instanceof Error ? e.message : 'Login failed')
-              }
-            }}
+            className="settings-save"
+            disabled={saving}
+            onClick={() => void onSave()}
           >
-            Test login
+            <Save size={16} strokeWidth={2} />
+            {saving ? 'Saving…' : 'Save Changes'}
           </button>
-        </section>
+        </header>
 
-        <section className="card-block">
-          <h3 style={{ marginTop: 0 }}>Playback</h3>
-          <div className="field">
-            <label>Default quality</label>
-            <select
-              value={draft.defaultQuality}
-              onChange={(e) => set('defaultQuality', e.target.value as AppSettings['defaultQuality'])}
-            >
-              <option value="720p">720p (minimum)</option>
-              <option value="1080p">1080p (default)</option>
-              <option value="1440p">2K (1440p)</option>
-              <option value="2160p">4K (2160p)</option>
-            </select>
-          </div>
-          <label style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 10 }}>
-            <input
-              type="checkbox"
-              checked={draft.preferHdr}
-              onChange={(e) => set('preferHdr', e.target.checked)}
-            />
-            Prefer HDR / Dolby Vision sources when labeled
-          </label>
-          <label style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 8 }}>
-            <input
-              type="checkbox"
-              checked={draft.preferSpatialAudio}
-              onChange={(e) => set('preferSpatialAudio', e.target.checked)}
-            />
-            Prefer spatial / Atmos audio tracks when labeled
-          </label>
-        </section>
+        <div className="settings-layout">
+          <nav className="settings-rail" aria-label="Settings sections">
+            {TABS.map(({ id, label, icon: Icon }) => (
+              <button
+                key={id}
+                type="button"
+                className={`settings-rail-item${tab === id ? ' active' : ''}`}
+                onClick={() => setTab(id)}
+              >
+                <Icon size={16} strokeWidth={1.75} aria-hidden />
+                {label}
+              </button>
+            ))}
+          </nav>
 
-        <section className="card-block">
-          <h3 style={{ marginTop: 0 }}>Library folders</h3>
-          <ul>
-            {draft.libraryFolders.map((f) => (
-              <li key={f} style={{ marginBottom: 8 }}>
-                <code>{f}</code>{' '}
+          <div className="settings-panel">
+            {tab === 'appearance' && (
+              <section className="settings-card">
+                <h2 className="settings-card-title">Appearance</h2>
+                <p className="settings-card-desc">Choose how CineVault looks across the app.</p>
+                <Field label="Theme">
+                  <ThemedSelect
+                    variant="settings"
+                    aria-label="Theme"
+                    value={draft.theme}
+                    onChange={(v) => set('theme', v as AppSettings['theme'])}
+                    options={[
+                      { value: 'dark', label: 'Dark' },
+                      { value: 'light', label: 'Light' },
+                      { value: 'system', label: 'System' }
+                    ]}
+                  />
+                </Field>
+                <p className="settings-hint">
+                  Movies, series, and anime load automatically — no catalog API keys required.
+                </p>
+              </section>
+            )}
+
+            {tab === 'subtitles' && (
+              <section className="settings-card">
+                <h2 className="settings-card-title">Subtitles</h2>
+                <p className="settings-card-desc">
+                  Subtitles work automatically out of the box. Add a free Subdl key to unlock larger
+                  catalogs and enhanced Arabic synchronization.
+                </p>
+
+                <div className="settings-account-hint">
+                  <p>
+                    No account required for basic public subtitles. Optional Subdl unlocks more
+                    matches — create a free key on subdl.com if you want it.
+                  </p>
+                  <div className="settings-account-links">
+                    <button
+                      type="button"
+                      className="settings-link-btn"
+                      onClick={() => void openExternal('https://subdl.com')}
+                    >
+                      <ExternalLink size={14} strokeWidth={2} />
+                      Open Subdl
+                    </button>
+                  </div>
+                </div>
+
+                <div className="settings-stack">
+                  <Field label="Subdl API Key (Optional)">
+                    <input
+                      className="settings-input"
+                      value={draft.subdlApiKey}
+                      onChange={(e) => set('subdlApiKey', e.target.value)}
+                      autoComplete="off"
+                      placeholder="Paste your Subdl API key"
+                    />
+                  </Field>
+                  <Field label="Default language">
+                    <ThemedSelect
+                      variant="settings"
+                      aria-label="Default subtitle language"
+                      value={draft.defaultSubtitleLanguage}
+                      onChange={(v) => set('defaultSubtitleLanguage', v)}
+                      options={SUB_LANGS.map((l) => ({
+                        value: l,
+                        label:
+                          l === 'ar'
+                            ? 'Arabic (ar)'
+                            : l === 'en'
+                              ? 'English (en)'
+                              : l === 'pl'
+                                ? 'Polish (pl)'
+                                : l.toUpperCase()
+                      }))}
+                    />
+                  </Field>
+                </div>
                 <button
-                  className="btn ghost"
                   type="button"
+                  className="settings-btn-ghost"
                   onClick={async () => {
-                    await window.cinevault.library.removeFolder(f)
-                    const next = await window.cinevault.settings.get()
-                    setDraft(next)
+                    await saveSettings(draft)
+                    try {
+                      const { testSubdlKey } = await import('../services/subtitleService')
+                      const result = await testSubdlKey(draft.subdlApiKey)
+                      setMsg(result.message)
+                    } catch (e) {
+                      setMsg(e instanceof Error ? e.message : 'Key test failed')
+                    }
                   }}
                 >
-                  Remove
+                  Test Key
                 </button>
-              </li>
-            ))}
-          </ul>
-          <button
-            className="btn"
-            type="button"
-            onClick={async () => {
-              await window.cinevault.library.pickFolder()
-              const next = await window.cinevault.settings.get()
-              setDraft(next)
-            }}
-          >
-            Add folder
-          </button>
-        </section>
+              </section>
+            )}
 
-        <section className="card-block">
-          <h3 style={{ marginTop: 0 }}>Cache & storage</h3>
-          <p className="muted">
-            Directory: <code>{cacheStats?.directory || draft.cacheDirectory}</code>
-          </p>
-          <p className="muted">
-            {cacheStats
-              ? `${cacheStats.count} entries · ${formatBytes(cacheStats.bytes)}`
-              : 'Calculating…'}
-          </p>
-          <div className="field">
-            <label>Keep unfinished downloads (hours)</label>
-            <input
-              type="number"
-              min={1}
-              value={draft.cacheRetentionHours}
-              onChange={(e) => set('cacheRetentionHours', Number(e.target.value) || 48)}
-            />
-          </div>
-          <label style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 10 }}>
-            <input
-              type="checkbox"
-              checked={draft.autoDeleteOnComplete}
-              onChange={(e) => set('autoDeleteOnComplete', e.target.checked)}
-            />
-            Delete cached media after finishing a title
-          </label>
-          <div className="play-row">
-            <button
-              className="btn"
-              type="button"
-              onClick={async () => {
-                await window.cinevault.cache.openFolder()
-              }}
-            >
-              Open cache folder
-            </button>
-            <button
-              className="btn"
-              type="button"
-              onClick={async () => {
-                if (!confirm('Delete all cached media?')) return
-                await window.cinevault.cache.clearAll()
-                setCacheStats(await window.cinevault.cache.stats())
-                setMsg('Cache cleared')
-              }}
-            >
-              Clear cache
-            </button>
-          </div>
-        </section>
+            {tab === 'playback' && (
+              <section className="settings-card">
+                <h2 className="settings-card-title">Playback</h2>
+                <p className="settings-card-desc">Default stream quality and preferred source traits.</p>
+                <Field label="Resolution">
+                  <ThemedSelect
+                    variant="settings"
+                    aria-label="Default resolution"
+                    value={draft.defaultQuality}
+                    onChange={(v) => set('defaultQuality', v as AppSettings['defaultQuality'])}
+                    options={[
+                      { value: '2160p', label: '4K (2160p)' },
+                      { value: '1440p', label: '2K (1440p)' },
+                      { value: '1080p', label: '1080p' },
+                      { value: '720p', label: '720p' }
+                    ]}
+                  />
+                </Field>
+                <div className="settings-toggles">
+                  <Toggle
+                    checked={draft.preferHdr}
+                    onChange={(v) => set('preferHdr', v)}
+                    label="Prefer HDR / Dolby Vision sources"
+                    description="When torrent labels mention HDR, DV, or Dolby Vision"
+                  />
+                  <Toggle
+                    checked={draft.preferSpatialAudio}
+                    onChange={(v) => set('preferSpatialAudio', v)}
+                    label="Prefer spatial / Atmos audio tracks"
+                    description="When labels mention Atmos, TrueHD, or DTS:X"
+                  />
+                </div>
+              </section>
+            )}
 
-        <button
-          className="btn primary"
-          type="button"
-          onClick={async () => {
-            await saveSettings(draft)
-            setMsg('Settings saved')
-          }}
-        >
-          Save settings
-        </button>
-        {msg && <div className="toast">{msg}</div>}
+            {tab === 'storage' && (
+              <>
+                <section className="settings-card">
+                  <h2 className="settings-card-title">Cache & storage</h2>
+                  <p className="settings-card-desc">
+                    {cacheStats
+                      ? `${cacheStats.count} entries · ${formatBytes(cacheStats.bytes)}`
+                      : 'Calculating cache size…'}
+                  </p>
+
+                  <div className="settings-path-row">
+                    <code className="settings-path" title={cachePath}>
+                      {cachePath}
+                    </code>
+                    <button
+                      type="button"
+                      className="settings-btn-ghost"
+                      onClick={() => void window.cinevault.cache.openFolder()}
+                    >
+                      Open Folder
+                    </button>
+                  </div>
+
+                  <Field label="Keep unfinished downloads (hours)">
+                    <input
+                      className="settings-input settings-input-narrow"
+                      type="number"
+                      min={1}
+                      value={draft.cacheRetentionHours}
+                      onChange={(e) => set('cacheRetentionHours', Number(e.target.value) || 48)}
+                    />
+                  </Field>
+
+                  <div className="settings-toggles">
+                    <Toggle
+                      checked={draft.autoDeleteOnComplete}
+                      onChange={(v) => set('autoDeleteOnComplete', v)}
+                      label="Delete cached media after finishing"
+                      description="Removes downloaded files once playback completes"
+                    />
+                  </div>
+
+                  <div className="settings-danger">
+                    <div>
+                      <strong>Danger zone</strong>
+                      <p>Permanently delete all cached media from disk.</p>
+                    </div>
+                    <button
+                      type="button"
+                      className="settings-btn-danger"
+                      onClick={async () => {
+                        if (!confirm('Delete all cached media?')) return
+                        try {
+                          await window.cinevault.cache.clearAll()
+                          useAppStore.setState({ lastSession: null, session: null })
+                          setCacheStats(await window.cinevault.cache.stats())
+                          setMsg('Cache cleared')
+                        } catch (e) {
+                          setMsg(e instanceof Error ? e.message : 'Cache clear failed')
+                        }
+                      }}
+                    >
+                      Clear Cache
+                    </button>
+                  </div>
+                </section>
+
+                <section className="settings-card">
+                  <h2 className="settings-card-title">Library folders</h2>
+                  <p className="settings-card-desc">
+                    Local folders scanned for playable files on the Local & streams page.
+                  </p>
+                  {draft.libraryFolders.length === 0 ? (
+                    <p className="settings-hint">No folders added yet.</p>
+                  ) : (
+                    <ul className="settings-folder-list">
+                      {draft.libraryFolders.map((f) => (
+                        <li key={f}>
+                          <code className="settings-path">{f}</code>
+                          <button
+                            type="button"
+                            className="settings-btn-ghost settings-btn-sm"
+                            onClick={async () => {
+                              await window.cinevault.library.removeFolder(f)
+                              const next = await window.cinevault.settings.get()
+                              setDraft(next)
+                            }}
+                          >
+                            Remove
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                  <button
+                    type="button"
+                    className="settings-btn-ghost"
+                    onClick={async () => {
+                      await window.cinevault.library.pickFolder()
+                      const next = await window.cinevault.settings.get()
+                      setDraft(next)
+                    }}
+                  >
+                    Add Folder
+                  </button>
+                </section>
+              </>
+            )}
+
+            {tab === 'about' && (
+              <section className="settings-card">
+                <h2 className="settings-card-title">About</h2>
+                <p className="settings-card-desc">
+                  CineVault version and GitHub Releases updates.
+                </p>
+
+                <div className="settings-about-version">
+                  <span className="settings-about-label">Current version</span>
+                  <span className="settings-about-value">v{appVersion}</span>
+                </div>
+
+                <p className="settings-update-status" role="status">
+                  {updateUi.kind === 'checking' && (
+                    <span className="settings-update-spinner" aria-hidden />
+                  )}
+                  {updateStatusText}
+                </p>
+
+                {updateUi.kind === 'available' && updateUi.notes && (
+                  <pre className="settings-release-notes">{updateUi.notes}</pre>
+                )}
+
+                {updateUi.kind === 'downloading' && (
+                  <div className="settings-update-progress">
+                    <div className="settings-update-bar" aria-hidden>
+                      <span style={{ width: `${Math.min(100, Math.max(0, updateUi.percent))}%` }} />
+                    </div>
+                    <div className="settings-update-meta">
+                      <span>{Math.round(updateUi.percent)}%</span>
+                      <span>{formatSpeed(updateUi.bytesPerSecond)}</span>
+                    </div>
+                  </div>
+                )}
+
+                <div className="settings-update-actions">
+                  {(updateUi.kind === 'idle' ||
+                    updateUi.kind === 'checking' ||
+                    updateUi.kind === 'latest' ||
+                    updateUi.kind === 'error' ||
+                    updateUi.kind === 'available') && (
+                    <button
+                      type="button"
+                      className="settings-btn-ghost"
+                      disabled={updateUi.kind === 'checking'}
+                      onClick={() => void checkUpdates()}
+                    >
+                      <RefreshCw
+                        size={15}
+                        strokeWidth={2}
+                        className={updateUi.kind === 'checking' ? 'spin' : undefined}
+                      />
+                      {updateUi.kind === 'checking' ? 'Checking…' : 'Check for Updates'}
+                    </button>
+                  )}
+
+                  {updateUi.kind === 'available' && (
+                    <button
+                      type="button"
+                      className="settings-save"
+                      onClick={() => void window.cinevault.updater.download()}
+                    >
+                      Download now
+                    </button>
+                  )}
+
+                  {updateUi.kind === 'downloading' && (
+                    <span className="muted" style={{ fontSize: 12 }}>
+                      Downloading update in the background…
+                    </span>
+                  )}
+
+                  {updateUi.kind === 'ready' && (
+                    <button
+                      type="button"
+                      className="settings-save"
+                      onClick={() => void window.cinevault.updater.install()}
+                    >
+                      Restart to Update
+                    </button>
+                  )}
+                </div>
+              </section>
+            )}
+          </div>
+        </div>
+
+        {msg && <div className="settings-toast">{msg}</div>}
       </div>
     </div>
   )

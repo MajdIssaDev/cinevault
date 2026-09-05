@@ -56,10 +56,11 @@ const MEDIA_FIELDS = `
 
 export async function fetchPopularAnime(page = 1): Promise<CatalogItem[]> {
   const data = await anilist<{
-    Page: { media: Parameters<typeof mapAnime>[0][] }
+    Page: { media: Parameters<typeof mapAnime>[0][]; pageInfo?: { hasNextPage: boolean } }
   }>(
     `query ($page: Int) {
       Page(page: $page, perPage: 24) {
+        pageInfo { hasNextPage }
         media(type: ANIME, sort: POPULARITY_DESC, isAdult: false) { ${MEDIA_FIELDS} }
       }
     }`,
@@ -68,16 +69,16 @@ export async function fetchPopularAnime(page = 1): Promise<CatalogItem[]> {
   return data.Page.media.map(mapAnime)
 }
 
-export async function searchAnime(query: string): Promise<CatalogItem[]> {
+export async function searchAnime(query: string, page = 1): Promise<CatalogItem[]> {
   const data = await anilist<{
     Page: { media: Parameters<typeof mapAnime>[0][] }
   }>(
-    `query ($q: String) {
-      Page(page: 1, perPage: 24) {
+    `query ($q: String, $page: Int) {
+      Page(page: $page, perPage: 24) {
         media(type: ANIME, search: $q, isAdult: false, sort: SEARCH_MATCH) { ${MEDIA_FIELDS} }
       }
     }`,
-    { q: query }
+    { q: query, page }
   )
   return data.Page.media.map(mapAnime)
 }

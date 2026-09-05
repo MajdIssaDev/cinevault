@@ -1,6 +1,6 @@
 {
   "name": "cinevault",
-  "version": "1.0.0",
+    "version": "1.1.0",
   "description": "Modern media catalog and player for movies, series, and anime — local library & HTTP streams",
   "main": "./out/main/index.js",
   "author": "CineVault",
@@ -13,19 +13,39 @@
     "dist": "npm run build && electron-builder --win",
     "dist:dir": "npm run build && electron-builder --win --dir",
     "postinstall": "electron-builder install-app-deps",
-    "typecheck": "tsc --noEmit -p tsconfig.web.json && tsc --noEmit -p tsconfig.node.json"
+    "typecheck": "tsc --noEmit -p tsconfig.web.json && tsc --noEmit -p tsconfig.node.json",
+    "mobile:web": "vite build --config vite.mobile.config.ts",
+    "mobile:sync": "npx cap sync",
+    "mobile:build": "npm run mobile:web && npx cap sync",
+    "mobile:android": "npm run mobile:build && npx cap open android",
+    "mobile:ios": "npm run mobile:build && npx cap open ios",
+    "mobile:ota:zip": "npm run mobile:web && npx @capgo/cli bundle zip dist --path dist.zip"
   },
   "dependencies": {
+    "@capacitor/app": "^8.1.1",
+    "@capacitor/browser": "^8.0.4",
+    "@capacitor/core": "^8.5.1",
+    "@capacitor/network": "^8.0.1",
+    "@capacitor/screen-orientation": "^8.0.1",
+    "@capgo/capacitor-updater": "^8.51.15",
     "electron-updater": "^6.3.9",
+    "framer-motion": "^13.2.0",
     "hls.js": "^1.5.17",
+    "jszip": "^3.10.1",
+    "lucide-react": "^1.41.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-router-dom": "^6.28.0",
+    "webtorrent": "^1.9.7",
     "zustand": "^5.0.1"
   },
   "devDependencies": {
+    "@capacitor/android": "^8.5.1",
+    "@capacitor/cli": "^8.5.1",
+    "@capacitor/ios": "^8.5.1",
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
+    "@types/webtorrent": "^0.109.8",
     "@vitejs/plugin-react": "^4.3.3",
     "electron": "^33.2.0",
     "electron-builder": "^25.1.8",
@@ -36,6 +56,12 @@
   "build": {
     "appId": "com.cinevault.app",
     "productName": "CineVault",
+    "npmRebuild": false,
+    "asarUnpack": [
+      "**/node_modules/utp-native/**",
+      "**/node_modules/bufferutil/**",
+      "**/node_modules/utf-8-validate/**"
+    ],
     "directories": {
       "output": "release",
       "buildResources": "build"
@@ -47,37 +73,45 @@
       {
         "from": "resources",
         "to": "resources",
-        "filter": ["**/*"]
+        "filter": [
+          "**/*"
+        ]
       }
     ],
-    "publish": [
-      {
-        "provider": "github",
-        "owner": "MajdIssaDev",
-        "repo": "cinevault"
-      }
-    ],
+    "publish": {
+      "provider": "github",
+      "owner": "MajdIssaDev",
+      "repo": "cinevault"
+    },
     "win": {
       "target": [
         {
           "target": "nsis",
-          "arch": ["x64"]
+          "arch": [
+            "x64"
+          ]
         },
         {
           "target": "portable",
-          "arch": ["x64"]
+          "arch": [
+            "x64"
+          ]
         }
       ],
       "icon": "build/icon.ico"
     },
     "nsis": {
       "oneClick": false,
+      "perMachine": false,
+      "allowElevation": true,
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
       "shortcutName": "CineVault",
       "uninstallDisplayName": "CineVault",
       "deleteAppDataOnUninstall": false,
+      "runAfterFinish": true,
+      "menuCategory": false,
       "license": "LICENSE",
       "artifactName": "${productName}-Setup-${version}-${arch}.${ext}"
     },

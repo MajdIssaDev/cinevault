@@ -10,6 +10,7 @@ import {
 } from 'fs'
 import { join } from 'path'
 import { loadSettings } from './settings'
+import { destroyAllTorrents } from './torrent'
 
 export interface CacheEntry {
   id: string
@@ -116,13 +117,28 @@ export function registerCacheHandlers(): void {
     return true
   })
 
-  ipcMain.handle('cache:clear-all', () => {
+  ipcMain.handle('cache:clear-all', async () => {
+
+    // Release file locks held by WebTorrent before deleting
+    await destroyAllTorrents()
+
     const dir = ensureCacheDir()
+    const failures: string[] = []
     for (const name of readdirSync(dir)) {
       if (name === 'cache-index.json') continue
-      rmSync(join(dir, name), { recursive: true, force: true })
+      const full = join(dir, name)
+      try {
+        rmSync(full, { recursive: true, force: true, maxRetries: 8, retryDelay: 150 })
+      } catch (err) {
+        failures.push(`${name}:${err instanceof Error ? err.message : String(err)}`)
+      }
     }
     writeIndex([])
+
+
+    if (failures.length) {
+      throw new Error(`Some cache files could not be deleted (in use): ${failures[0]}`)
+    }
     return true
   })
 

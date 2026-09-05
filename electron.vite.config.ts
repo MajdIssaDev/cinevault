@@ -15,6 +15,9 @@ export default defineConfig({
         '@renderer': resolve('src/renderer/src')
       }
     },
+    optimizeDeps: {
+      include: ['framer-motion']
+    },
     plugins: [react()]
   }
 })
