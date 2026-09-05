@@ -1,5 +1,6 @@
 import type { Quality, StreamSource } from '../types'
 import type { PublicSearchResult } from '../services/publicSearchService'
+import { isBrowserPreferredVideo, parseTorrentVideo } from './torrentParser'
 
 export function guessQualityFromName(name: string): Quality | 'unknown' {
   const n = name.toLowerCase()
@@ -47,11 +48,12 @@ export function sortTorrentResults(
 ): PublicSearchResult[] {
   const pref = qualityRank(preferred)
   const playability = (name: string): number => {
+    const v = parseTorrentVideo(name)
     const n = name.toLowerCase()
-    if (/\bmp4\b/.test(n) && /\b(x264|h\.?264|avc)\b/.test(n)) return 3
-    if (/\bmp4\b/.test(n)) return 2
-    if (/\b(x264|h\.?264|avc)\b/.test(n)) return 2
-    if (/\b(hevc|x265|h\.?265|10.?bit)\b/.test(n)) return 0
+    if (v.isX264 && !v.isHevc && /\bmp4\b/.test(n)) return 4
+    if (isBrowserPreferredVideo(name)) return 3
+    if (/\bmp4\b/.test(n) && !v.isHevc) return 2
+    if (v.isHevc) return 0
     if (/\bmkv\b/.test(n)) return 1
     return 1
   }

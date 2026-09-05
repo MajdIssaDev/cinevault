@@ -1,6 +1,7 @@
 /**
- * Parse audio codec hints from torrent / release names.
+ * Parse audio / video codec hints from torrent / release names.
  * Chromium can decode AAC / MP3 / Opus / FLAC natively; AC3/DTS/Atmos usually cannot.
+ * Prefer x264/H.264 over HEVC/x265 for in-app playback.
  */
 
 export type AudioCodec = 'AAC' | 'AC3' | 'EAC3' | 'DTS' | 'UNKNOWN'
@@ -11,6 +12,35 @@ export type ParsedTorrentAudio = {
   isAudioSupported: boolean
   /** Short badge label, e.g. "AAC 2.0" / "DTS-HD" / null if unknown. */
   audioLabel: string | null
+}
+
+export type ParsedTorrentVideo = {
+  /** HEVC / x265 / 10-bit — often fails in Chromium without HW decode. */
+  isHevc: boolean
+  /** x264 / H.264 / AVC — preferred for in-app playback. */
+  isX264: boolean
+  /** Short badge, e.g. "x264" / "HEVC" / null if unknown. */
+  videoLabel: string | null
+}
+
+const HEVC_RE = /(hevc|x265|h265|10bit|10-bit)/i
+const X264_RE = /(x264|h264|avc)/i
+
+export function parseTorrentVideo(name: string): ParsedTorrentVideo {
+  const n = name || ''
+  const isHevc = HEVC_RE.test(n)
+  const isX264 = X264_RE.test(n)
+  let videoLabel: string | null = null
+  if (isHevc && isX264) videoLabel = 'x264/HEVC'
+  else if (isHevc) videoLabel = 'HEVC'
+  else if (isX264) videoLabel = 'x264'
+  return { isHevc, isX264, videoLabel }
+}
+
+/** True when the release is clearly browser-friendly H.264 (not HEVC/10-bit tagged). */
+export function isBrowserPreferredVideo(name: string): boolean {
+  const v = parseTorrentVideo(name)
+  return v.isX264 && !v.isHevc
 }
 
 const NATIVE_RE =
@@ -100,6 +130,6 @@ export function hasExplicitUnsupportedAudio(name: string): boolean {
 
 export function withParsedAudio<T extends { name: string }>(
   item: T
-): T & ParsedTorrentAudio {
-  return { ...item, ...parseTorrentAudio(item.name) }
+): T & ParsedTorrentAudio & ParsedTorrentVideo {
+  return { ...item, ...parseTorrentAudio(item.name), ...parseTorrentVideo(item.name) }
 }

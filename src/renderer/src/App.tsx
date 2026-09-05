@@ -37,6 +37,11 @@ export default function App(): JSX.Element {
     syncTitleBarOverlay(Boolean(session))
   }, [session, settings?.theme])
 
+  useEffect(() => {
+    document.documentElement.classList.toggle('player-open', Boolean(session))
+    return () => document.documentElement.classList.remove('player-open')
+  }, [session])
+
   // Catalog = portrait · Player = landscape (native only)
   useEffect(() => {
     if (!isMobileShell()) return

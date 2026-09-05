@@ -131,7 +131,11 @@ const api = {
   shell: {
     openPath: (path: string): Promise<string> => ipcRenderer.invoke('shell:open-path', path),
     openExternal: (url: string): Promise<boolean> => ipcRenderer.invoke('shell:open-external', url),
-    showItem: (path: string): Promise<boolean> => ipcRenderer.invoke('shell:show-item', path)
+    showItem: (path: string): Promise<boolean> => ipcRenderer.invoke('shell:show-item', path),
+    openExternalPlayer: (
+      streamUrl: string
+    ): Promise<{ success: boolean; player?: string; error?: string }> =>
+      ipcRenderer.invoke('shell:open-external-player', streamUrl)
   },
   torznab: {
     get: (url: string): Promise<{ status: number; body: string; error?: string }> =>

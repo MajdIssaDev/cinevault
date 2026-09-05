@@ -40,6 +40,7 @@ import {
 } from '../lib/torrentPlayback'
 import { getBestStream } from '../lib/streamScorer'
 import { searchPublicIndexers } from '../services/publicSearchService'
+import { isBrowserPreferredVideo, parseTorrentVideo } from '../lib/torrentParser'
 
 const ICON = { size: 20, strokeWidth: 1.75 } as const
 
@@ -134,11 +135,14 @@ function calculateForwardBuffer(
   return { forwardSec: 0, pct: 0 }
 }
 
+function isHevcRelease(label: string): boolean {
+  return parseTorrentVideo(label).isHevc
+}
+
 function playbackWarning(label: string): string | null {
+  // HEVC uses the interactive recovery card — keep only soft MKV tip here.
+  if (isHevcRelease(label)) return null
   const n = label.toLowerCase()
-  if (/\b(hevc|x265|h\.?265)\b/.test(n) || /\b10.?bit\b/.test(n)) {
-    return 'This release is HEVC/x265 (often 10-bit). The built-in player frequently cannot decode it — pick an x264 / MP4 torrent instead.'
-  }
   if (n.includes('.mkv') || /\bmkv\b/.test(n)) {
     return 'MKV can take longer to start in-app. Prefer an MP4 release if playback stays black.'
   }
@@ -210,6 +214,8 @@ export function PlayerPage(): JSX.Element {
   const [forwardBufferSec, setForwardBufferSec] = useState(0)
   const [stallRecovery, setStallRecovery] = useState<{ speedLabel: string } | null>(null)
   const [stallSwitchBusy, setStallSwitchBusy] = useState(false)
+  const [hevcSwitchBusy, setHevcSwitchBusy] = useState(false)
+  const [vlcBusy, setVlcBusy] = useState(false)
   const stallNudgedRef = useRef(false)
   const prioritizeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const [seekFlash, setSeekFlash] = useState<{ dir: -1 | 1; seconds: number } | null>(null)
@@ -226,6 +232,7 @@ export function PlayerPage(): JSX.Element {
   const upNextDismissedRef = useRef(false)
   const upNextShownRef = useRef(false)
   const codecHint = playbackWarning(session.source.label || session.title)
+  const hevcBlocked = isHevcRelease(session.source.label || session.title) && videoWidth === 0
 
   useEffect(() => {
     setSubLang(session.subtitleLang || settings?.defaultSubtitleLanguage || 'en')
@@ -237,9 +244,22 @@ export function PlayerPage(): JSX.Element {
     if (idleTimerRef.current) clearTimeout(idleTimerRef.current)
     idleTimerRef.current = setTimeout(() => {
       const v = videoRef.current
-      if (v && !v.paused) setChromeVisible(false)
-    }, 10_000)
+      if (v && !v.paused && !showSubs && !showStats) setChromeVisible(false)
+    }, 2500)
   }
+
+  useEffect(() => {
+    document.documentElement.classList.toggle('player-chrome-hidden', !chromeVisible)
+    return () => document.documentElement.classList.remove('player-chrome-hidden')
+  }, [chromeVisible])
+
+  useEffect(() => {
+    bumpChrome()
+    return () => {
+      if (idleTimerRef.current) clearTimeout(idleTimerRef.current)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- reset idle when playback or panels change
+  }, [session.cacheId, playing, showSubs, showStats])
 
   const tryStartPlayback = (): void => {
     const video = videoRef.current
@@ -317,7 +337,10 @@ export function PlayerPage(): JSX.Element {
       if (!waitingSinceRef.current) return
       const waited = Date.now() - waitingSinceRef.current
       if (waited < 12_000) return
-      if (codecHint && sourceAttachedRef.current && !video.videoWidth) {
+      if (isHevcRelease(session.source.label || session.title) && sourceAttachedRef.current && !video.videoWidth) {
+        // Surface HEVC recovery card via hevcBlocked (videoWidth stays 0).
+        setBuffering(true)
+      } else if (codecHint && sourceAttachedRef.current && !video.videoWidth) {
         setMediaError(codecHint)
       }
     }, 4000)
@@ -1098,6 +1121,131 @@ export function PlayerPage(): JSX.Element {
     }
   }
 
+  const switchToX264Stream = async (): Promise<void> => {
+    if (hevcSwitchBusy || session.source.kind !== 'torrent') return
+    setHevcSwitchBusy(true)
+    setSubToast('Finding an x264 stream…')
+    const prevCacheId = session.cacheId
+    const currentLabel = session.source.label || ''
+    try {
+      const title = session.showTitle || session.title.replace(/\s·\sS\d+E\d+.*$/, '')
+      const query = buildCatalogSearchQuery({
+        title,
+        mediaType: session.mediaType,
+        season: session.season,
+        episode: session.episode
+      })
+      const raw = await searchPublicIndexers(query)
+      const sorted = sortTorrentResults(raw, qualityPref)
+      const target =
+        session.resolution === '2160p' || session.resolution === '1440p'
+          ? ('4K' as const)
+          : session.resolution === '720p'
+            ? ('720p' as const)
+            : ('1080p' as const)
+      const pick = getBestStream(sorted, target, {
+        isMovieLike: session.mediaType === 'movie',
+        preferX264: true
+      })
+      const fallback = getBestStream(sorted, 'Auto', {
+        isMovieLike: session.mediaType === 'movie',
+        preferX264: true
+      })
+      const x264Candidates = sorted.filter(
+        (t) => t.magnetUri && isBrowserPreferredVideo(t.name) && t.name !== currentLabel
+      )
+      const chosen =
+        (pick.bestStream && isBrowserPreferredVideo(pick.bestStream.name)
+          ? pick.bestStream
+          : null) ||
+        (fallback.bestStream && isBrowserPreferredVideo(fallback.bestStream.name)
+          ? fallback.bestStream
+          : null) ||
+        x264Candidates[0] ||
+        null
+
+      if (!chosen?.magnetUri) {
+        setSubToast('No x264 streams found for this title')
+        if (subToastTimerRef.current) clearTimeout(subToastTimerRef.current)
+        subToastTimerRef.current = setTimeout(() => setSubToast(null), 3200)
+        return
+      }
+
+      const source = await startTorrentPlayback({
+        cacheId: `${session.mediaType}-${session.externalId}-${session.season || 0}-${session.episode || 0}-${Date.now()}`,
+        magnetUri: chosen.magnetUri,
+        label: chosen.name,
+        preferredQuality: qualityPref
+      })
+
+      sourceAttachedRef.current = false
+      initialStartedRef.current = false
+      resumeGateRef.current = null
+      setMediaError(null)
+      setStallRecovery(null)
+      setVideoWidth(0)
+      setVideoHeight(0)
+      setBuffering(true)
+      setSubToast(null)
+
+      setSession({
+        ...session,
+        cacheId: source.id,
+        source,
+        resolution: source.quality !== 'unknown' ? source.quality : qualityPref,
+        resumeSeconds: videoRef.current?.currentTime || session.resumeSeconds || 0
+      })
+
+      void window.cinevault?.torrent.stop(prevCacheId)
+    } catch (e) {
+      setSubToast(e instanceof Error ? e.message : 'Could not switch to x264')
+      if (subToastTimerRef.current) clearTimeout(subToastTimerRef.current)
+      subToastTimerRef.current = setTimeout(() => setSubToast(null), 3200)
+    } finally {
+      setHevcSwitchBusy(false)
+    }
+  }
+
+  const openInExternalPlayer = async (): Promise<void> => {
+    if (vlcBusy) return
+    const url = session.source.url
+    if (!url) {
+      setSubToast('Stream URL not ready yet')
+      if (subToastTimerRef.current) clearTimeout(subToastTimerRef.current)
+      subToastTimerRef.current = setTimeout(() => setSubToast(null), 2800)
+      return
+    }
+    if (!window.cinevault?.shell?.openExternalPlayer) {
+      setSubToast('External player requires the desktop app')
+      if (subToastTimerRef.current) clearTimeout(subToastTimerRef.current)
+      subToastTimerRef.current = setTimeout(() => setSubToast(null), 2800)
+      return
+    }
+    setVlcBusy(true)
+    try {
+      const result = await window.cinevault.shell.openExternalPlayer(url)
+      if (!result.success) {
+        setSubToast(result.error || 'Could not open VLC — is it installed?')
+        if (subToastTimerRef.current) clearTimeout(subToastTimerRef.current)
+        subToastTimerRef.current = setTimeout(() => setSubToast(null), 3600)
+      } else {
+        setSubToast(
+          result.player === 'system'
+            ? 'Opened with system default player'
+            : 'Opened in external player'
+        )
+        if (subToastTimerRef.current) clearTimeout(subToastTimerRef.current)
+        subToastTimerRef.current = setTimeout(() => setSubToast(null), 2400)
+      }
+    } catch (e) {
+      setSubToast(e instanceof Error ? e.message : 'Could not open external player')
+      if (subToastTimerRef.current) clearTimeout(subToastTimerRef.current)
+      subToastTimerRef.current = setTimeout(() => setSubToast(null), 3200)
+    } finally {
+      setVlcBusy(false)
+    }
+  }
+
   useEffect(() => {
     durationRef.current = duration
   }, [duration])
@@ -1538,14 +1686,51 @@ export function PlayerPage(): JSX.Element {
             {seekFlash.dir < 0 ? `−${seekFlash.seconds}s` : `+${seekFlash.seconds}s`}
           </div>
         )}
-        {(buffering || mediaError) && !seekFlash && (
+        {(buffering || mediaError || hevcBlocked) && !seekFlash && (
           <div
-            className={`player-buffering${mediaError || (codecHint && !videoWidth) ? ' is-message' : ' is-orbit'}`}
+            className={`player-buffering${
+              hevcBlocked
+                ? ' is-hevc-card'
+                : mediaError || (codecHint && !videoWidth)
+                  ? ' is-message'
+                  : ' is-orbit'
+            }`}
             onClick={(e) => e.stopPropagation()}
             role="status"
             aria-live="polite"
           >
-            {mediaError ? (
+            {hevcBlocked ? (
+              <div className="hevc-recovery-card">
+                <h2 className="hevc-recovery-title">HEVC / 10-Bit Codec Detected</h2>
+                <p className="hevc-recovery-sub">
+                  Your browser engine cannot decode this video track directly.
+                </p>
+                <div className="hevc-recovery-actions">
+                  <button
+                    type="button"
+                    className="hevc-btn-primary"
+                    disabled={hevcSwitchBusy || session.source.kind !== 'torrent'}
+                    onClick={() => void switchToX264Stream()}
+                  >
+                    {hevcSwitchBusy ? 'Switching…' : 'Switch to x264 Stream'}
+                  </button>
+                  <button
+                    type="button"
+                    className="hevc-btn-secondary"
+                    disabled={vlcBusy || !session.source.url}
+                    onClick={() => void openInExternalPlayer()}
+                  >
+                    {vlcBusy ? 'Opening…' : 'Open in VLC'}
+                  </button>
+                </div>
+                {dl?.progress != null ? (
+                  <p className="hevc-recovery-meta">
+                    {(dl.progress * 100).toFixed(0)}% downloaded
+                    {dl.speed ? ` · ↓ ${formatSpeed(dl.speed)}` : ''}
+                  </p>
+                ) : null}
+              </div>
+            ) : mediaError ? (
               <span className="player-buffering-msg">{mediaError}</span>
             ) : codecHint && !videoWidth ? (
               <span className="player-buffering-msg">

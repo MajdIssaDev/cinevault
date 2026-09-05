@@ -1,5 +1,6 @@
 import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Search } from 'lucide-react'
+import { AnimatePresence, motion } from 'framer-motion'
+import { Search, X } from 'lucide-react'
 import type { CatalogItem, MediaType } from '../types'
 import { useAppStore } from '../store'
 import { PosterCard } from '../components/PosterCard'
@@ -43,6 +44,26 @@ const ANIME_GENRES = [
   'Sports',
   'Supernatural'
 ]
+
+const EASE_OUT_EXPO: [number, number, number, number] = [0.16, 1, 0.3, 1]
+
+const gridVariants = {
+  hidden: { opacity: 0 },
+  visible: {
+    opacity: 1,
+    transition: { staggerChildren: 0.04, delayChildren: 0.05 }
+  }
+}
+
+const cardVariants = {
+  hidden: { opacity: 0, scale: 0.94, y: 12 },
+  visible: {
+    opacity: 1,
+    scale: 1,
+    y: 0,
+    transition: { duration: 0.25, ease: 'easeOut' as const }
+  }
+}
 
 function genresFor(mediaType: MediaType): string[] {
   if (mediaType === 'movie') return YTS_GENRES
@@ -410,33 +431,90 @@ export function CatalogPage({ mediaType }: { mediaType: MediaType }): JSX.Elemen
     }
   }, [items, sortBy])
 
+  const browseFeaturedRef = useRef<CatalogItem | null>(null)
+
   const featured = useMemo(() => {
-    if (searchQuery.trim()) return null
+    if (searchQuery.trim()) return browseFeaturedRef.current
     // Prefer titles that actually have a landscape backdrop
-    return sorted.find((i) => i.backdropUrl) || null
+    const next = sorted.find((i) => i.backdropUrl) || null
+    browseFeaturedRef.current = next
+    return next
   }, [sorted, searchQuery])
 
   const genres = genresFor(mediaType)
   const title = mediaType === 'movie' ? 'Movies' : mediaType === 'series' ? 'Series' : 'Anime'
+  const isSearching = searchQuery.trim().length > 0
+
+  const clearSearch = (): void => {
+    onSearchInputChange('')
+  }
 
   return (
-    <div className="catalog-page">
-      {featured && <CatalogHero item={featured} />}
+    <div className={`catalog-page${isSearching ? ' is-searching' : ''}`}>
+      <AnimatePresence initial={false}>
+        {!isSearching && featured && (
+          <motion.div
+            key="catalog-hero"
+            className="catalog-browse-hero"
+            initial={{ opacity: 0, height: 0 }}
+            animate={{
+              opacity: 1,
+              height: 'auto',
+              transition: { duration: 0.35, ease: 'easeInOut' }
+            }}
+            exit={{
+              opacity: 0,
+              height: 0,
+              marginBottom: 0,
+              transition: { duration: 0.3, ease: 'easeInOut' }
+            }}
+            style={{ overflow: 'hidden' }}
+          >
+            <CatalogHero item={featured} />
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       <div className="catalog-body">
-        {!searchQuery.trim() && <ContinueWatchingRow mediaType={mediaType} />}
-        {!searchQuery.trim() && (
-          <WatchLaterShelf
-            mediaType={mediaType === 'series' ? 'tv' : mediaType}
-          />
-        )}
+        <AnimatePresence initial={false}>
+          {!isSearching && (
+            <motion.div
+              key="catalog-shelves"
+              className="catalog-browse-shelves"
+              initial={{ opacity: 0, height: 0 }}
+              animate={{
+                opacity: 1,
+                height: 'auto',
+                transition: { duration: 0.35, ease: 'easeInOut' }
+              }}
+              exit={{
+                opacity: 0,
+                height: 0,
+                marginBottom: 0,
+                transition: { duration: 0.3, ease: 'easeInOut' }
+              }}
+              style={{ overflow: 'hidden' }}
+            >
+              <ContinueWatchingRow mediaType={mediaType} />
+              <WatchLaterShelf mediaType={mediaType === 'series' ? 'tv' : mediaType} />
+            </motion.div>
+          )}
+        </AnimatePresence>
 
-        <div className="catalog-toolbar">
+        <motion.div
+          layout
+          className="catalog-toolbar"
+          transition={{ duration: 0.3, ease: 'easeOut' }}
+        >
           <div className="catalog-heading">
-            <h1 className="catalog-section-title">{title}</h1>
+            <h1 className="catalog-section-title">{isSearching ? `Search · ${title}` : title}</h1>
           </div>
           <div className="catalog-tools">
-            <label className="catalog-search-wrap">
+            <motion.label
+              layout
+              className={`catalog-search-wrap${isSearching ? ' is-searching' : ''}`}
+              transition={{ duration: 0.3, ease: 'easeOut' }}
+            >
               <span className="catalog-search-icon" aria-hidden>
                 <Search size={16} strokeWidth={2} />
               </span>
@@ -447,7 +525,25 @@ export function CatalogPage({ mediaType }: { mediaType: MediaType }): JSX.Elemen
                 onChange={(e) => onSearchInputChange(e.target.value)}
                 aria-label={`Search ${title.toLowerCase()}`}
               />
-            </label>
+              <AnimatePresence initial={false}>
+                {isSearching && (
+                  <motion.button
+                    key="search-clear"
+                    type="button"
+                    className="catalog-search-clear"
+                    title="Clear search"
+                    aria-label="Clear search"
+                    initial={{ opacity: 0, scale: 0.85 }}
+                    animate={{ opacity: 1, scale: 1 }}
+                    exit={{ opacity: 0, scale: 0.85 }}
+                    transition={{ duration: 0.18 }}
+                    onClick={clearSearch}
+                  >
+                    <X size={14} strokeWidth={2.5} />
+                  </motion.button>
+                )}
+              </AnimatePresence>
+            </motion.label>
             <ThemedSelect
               variant="catalog"
               className="catalog-sort-select"
@@ -463,7 +559,7 @@ export function CatalogPage({ mediaType }: { mediaType: MediaType }): JSX.Elemen
               ]}
             />
           </div>
-        </div>
+        </motion.div>
 
         <GenreChips aria-label="Genres">
           <button
@@ -505,11 +601,27 @@ export function CatalogPage({ mediaType }: { mediaType: MediaType }): JSX.Elemen
           <div className="empty">No titles found. Try another search or genre.</div>
         )}
 
-        <div className="poster-grid">
-          {sorted.map((item) => (
-            <PosterCard key={item.id} item={item} />
-          ))}
-        </div>
+        <AnimatePresence mode="wait" initial={false}>
+          <motion.div
+            key={isSearching ? 'search-results' : 'catalog-browse-grid'}
+            className="poster-grid"
+            variants={gridVariants}
+            initial="hidden"
+            animate="visible"
+            exit={{
+              opacity: 0,
+              y: 10,
+              transition: { duration: 0.22, ease: EASE_OUT_EXPO }
+            }}
+            transition={{ duration: 0.3, ease: EASE_OUT_EXPO }}
+          >
+            {sorted.map((item) => (
+              <motion.div key={item.id} className="poster-grid-item" variants={cardVariants}>
+                <PosterCard item={item} />
+              </motion.div>
+            ))}
+          </motion.div>
+        </AnimatePresence>
         <div ref={sentinelRef} data-catalog-sentinel style={{ height: 1 }} aria-hidden />
         {loadingMore && (
           <div className="muted" style={{ padding: '16px 0' }}>

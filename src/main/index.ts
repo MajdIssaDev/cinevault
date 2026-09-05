@@ -1,4 +1,6 @@
 import { app, BrowserWindow, ipcMain, shell, screen, protocol, net } from 'electron'
+import { spawn } from 'child_process'
+import { existsSync } from 'fs'
 import { join, normalize } from 'path'
 import { pathToFileURL } from 'url'
 import { electronApp, optimizer, is } from './utils'
@@ -11,6 +13,12 @@ import { registerDownloaderHandlers } from './downloader'
 import { registerTorznabHandlers } from './torznab'
 import { destroyAllTorrents, registerTorrentHandlers } from './torrent'
 import { setupAutoUpdater } from './updater'
+
+// Unlock platform HEVC decoding + GPU paths before Chromium boots.
+app.commandLine.appendSwitch('enable-features', 'PlatformHEVCDecoderSupport')
+app.commandLine.appendSwitch('ignore-gpu-blocklist')
+app.commandLine.appendSwitch('enable-gpu-rasterization')
+app.commandLine.appendSwitch('enable-zero-copy')
 
 protocol.registerSchemesAsPrivileged([
   {
@@ -185,6 +193,82 @@ app.whenReady().then(() => {
     shell.showItemInFolder(path)
     return true
   })
+  ipcMain.handle(
+    'shell:open-external-player',
+    async (
+      _e,
+      streamUrl: unknown
+    ): Promise<{ success: boolean; player?: string; error?: string }> => {
+      if (typeof streamUrl !== 'string' || !streamUrl.trim()) {
+        return { success: false, error: 'Invalid stream URL' }
+      }
+      const url = streamUrl.trim()
+      if (!/^(https?:\/\/|magnet:)/i.test(url)) {
+        return { success: false, error: 'Unsupported stream URL' }
+      }
+
+      const absolutePlayers: string[] =
+        process.platform === 'win32'
+          ? [
+              'C:\\Program Files\\VideoLAN\\VLC\\vlc.exe',
+              'C:\\Program Files (x86)\\VideoLAN\\VLC\\vlc.exe',
+              'C:\\Program Files\\mpv\\mpv.exe',
+              join(process.env.LOCALAPPDATA || '', 'Programs', 'VideoLAN', 'VLC', 'vlc.exe')
+            ]
+          : process.platform === 'darwin'
+            ? [
+                '/Applications/VLC.app/Contents/MacOS/VLC',
+                '/Applications/mpv.app/Contents/MacOS/mpv',
+                '/opt/homebrew/bin/mpv',
+                '/usr/local/bin/mpv'
+              ]
+            : ['/usr/bin/vlc', '/usr/local/bin/vlc', '/usr/bin/mpv', '/usr/local/bin/mpv']
+
+      for (const exe of absolutePlayers) {
+        if (!exe || !existsSync(exe)) continue
+        try {
+          const child = spawn(exe, [url], {
+            detached: true,
+            stdio: 'ignore',
+            windowsHide: true
+          })
+          child.unref()
+          return { success: true, player: exe }
+        } catch {
+          /* try next */
+        }
+      }
+
+      // PATH lookup (vlc / mpv on PATH)
+      for (const bin of ['vlc', 'mpv']) {
+        try {
+          const child = spawn(bin, [url], {
+            detached: true,
+            stdio: 'ignore',
+            shell: process.platform === 'win32',
+            windowsHide: true
+          })
+          child.on('error', () => {
+            /* binary missing from PATH */
+          })
+          child.unref()
+          return { success: true, player: bin }
+        } catch {
+          /* try next */
+        }
+      }
+
+      try {
+        await shell.openExternal(url)
+        return { success: true, player: 'system' }
+      } catch (e) {
+        return {
+          success: false,
+          error: e instanceof Error ? e.message : 'Could not open external player'
+        }
+      }
+    }
+  )
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createMainWindow()

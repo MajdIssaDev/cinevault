@@ -1,11 +1,14 @@
 /**
  * Pick the healthiest torrent for a target resolution.
+ * Prefer x264/H.264 over HEVC/x265 for default in-app playback.
  */
 import type { PublicSearchResult } from '../services/publicSearchService'
 import { guessQualityFromName, qualityLabel, qualityRank } from './torrentPlayback'
 import {
   hasExplicitUnsupportedAudio,
-  parseTorrentAudio
+  isBrowserPreferredVideo,
+  parseTorrentAudio,
+  parseTorrentVideo
 } from './torrentParser'
 import type { Quality } from '../types'
 
@@ -33,6 +36,9 @@ const QUALITY_TO_TARGET: Partial<Record<Quality | 'unknown', TargetRes>> = {
   '720p': '720p'
 }
 
+/** Minimum seeders to treat an x264 candidate as "healthy". */
+const HEALTHY_X264_SEEDERS = 3
+
 export function qualityToTargetRes(q: Quality | 'unknown'): TargetRes | null {
   return QUALITY_TO_TARGET[q] || null
 }
@@ -53,12 +59,24 @@ function isCamOrTs(name: string): boolean {
   )
 }
 
+function videoMeta(t: PublicSearchResult): ReturnType<typeof parseTorrentVideo> {
+  if (typeof t.isHevc === 'boolean' && typeof t.isX264 === 'boolean') {
+    return {
+      isHevc: t.isHevc,
+      isX264: t.isX264,
+      videoLabel: t.videoLabel ?? null
+    }
+  }
+  return parseTorrentVideo(t.name)
+}
+
 function playabilityScore(name: string): number {
+  const v = parseTorrentVideo(name)
   const n = name.toLowerCase()
-  if (/\bmp4\b/.test(n) && /\b(x264|h\.?264|avc)\b/.test(n)) return 4
-  if (/\b(x264|h\.?264|avc)\b/.test(n)) return 3
-  if (/\bmp4\b/.test(n)) return 2
-  if (/\b(hevc|x265|h\.?265)\b/.test(n)) return 1
+  if (v.isX264 && !v.isHevc && /\bmp4\b/.test(n)) return 5
+  if (v.isX264 && !v.isHevc) return 4
+  if (/\bmp4\b/.test(n) && !v.isHevc) return 2
+  if (v.isHevc) return 0
   return 1
 }
 
@@ -97,7 +115,7 @@ function scoreTorrent(t: PublicSearchResult, isMovieLike: boolean): number {
   else score += Math.max(0, t.seeders)
 
   if (isCamOrTs(t.name)) score -= 80
-  score += playabilityScore(t.name) * 6
+  score += playabilityScore(t.name) * 8
   score += sizeScore(t.sizeBytes, isMovieLike) * 4
   if (t.leechers > 0 && t.seeders / Math.max(1, t.leechers) >= 2) score += 4
 
@@ -110,6 +128,10 @@ function scoreTorrent(t: PublicSearchResult, isMovieLike: boolean): number {
   } else if (audio.isAudioSupported && audio.audioLabel) {
     score += 14
   }
+
+  const video = videoMeta(t)
+  if (video.isX264 && !video.isHevc) score += 28
+  else if (video.isHevc) score -= 35
 
   return score
 }
@@ -155,12 +177,21 @@ function emptyPick(
   }
 }
 
+function preferX264Pool(pool: PublicSearchResult[]): PublicSearchResult[] {
+  const x264 = pool.filter((t) => isBrowserPreferredVideo(t.name))
+  if (!x264.length) return pool
+  const healthy = x264.filter((t) => t.seeders >= HEALTHY_X264_SEEDERS)
+  // Only fall through to HEVC when no x264 exists at all for this resolution.
+  return healthy.length > 0 ? healthy : x264
+}
+
 export function getBestStream(
   torrents: PublicSearchResult[],
   targetRes: TargetRes,
-  opts?: { isMovieLike?: boolean }
+  opts?: { isMovieLike?: boolean; preferX264?: boolean }
 ): StreamPick {
   const isMovieLike = opts?.isMovieLike !== false
+  const preferX264 = opts?.preferX264 !== false
   const availableResolutions = listAvailableTargets(torrents)
   const highestAvailableRes =
     highestWithMinSeeders(torrents, 5) || availableResolutions[0] || null
@@ -192,7 +223,12 @@ export function getBestStream(
     return audio.isAudioSupported || audio.audioCodec === 'UNKNOWN'
   })
   // Prefer native-friendly audio when any exist; otherwise fall back to cinema codecs.
-  const pool = compatible.length > 0 ? compatible : candidates
+  let pool = compatible.length > 0 ? compatible : candidates
+
+  // Prefer x264 / H.264 over HEVC for Chromium; only use HEVC if no x264 exists.
+  if (preferX264) {
+    pool = preferX264Pool(pool)
+  }
 
   const ranked = [...pool].sort((a, b) => {
     const as = scoreTorrent(a, isMovieLike)

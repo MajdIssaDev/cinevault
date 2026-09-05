@@ -12,6 +12,9 @@ export interface PublicSearchResult {
   audioCodec: AudioCodec
   isAudioSupported: boolean
   audioLabel: string | null
+  isHevc: boolean
+  isX264: boolean
+  videoLabel: string | null
 }
 
 const APIBAY_URL = 'https://apibay.org/q.php'
