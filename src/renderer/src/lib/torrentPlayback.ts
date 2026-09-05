@@ -40,7 +40,7 @@ export function qualityRank(q: Quality | 'unknown'): number {
   }
 }
 
-/** Prefer preferred quality, then playable codecs (mp4/x264), then seeders. */
+/** Prefer preferred quality, then native audio, then playable codecs (mp4/x264), then seeders. */
 export function sortTorrentResults(
   results: PublicSearchResult[],
   preferred: Quality
@@ -55,12 +55,24 @@ export function sortTorrentResults(
     if (/\bmkv\b/.test(n)) return 1
     return 1
   }
+  const audioRank = (t: PublicSearchResult): number => {
+    const meta = t.audioCodec
+      ? { codec: t.audioCodec, ok: t.isAudioSupported, label: t.audioLabel }
+      : null
+    if (meta && !meta.ok) return 0
+    if (meta?.codec === 'AAC' && meta.label) return 3
+    if (meta?.ok && meta.label) return 2
+    return 1
+  }
   return [...results].sort((a, b) => {
     const aq = qualityRank(guessQualityFromName(a.name))
     const bq = qualityRank(guessQualityFromName(b.name))
     const aDist = aq === 0 ? 99 : Math.abs(aq - pref)
     const bDist = bq === 0 ? 99 : Math.abs(bq - pref)
     if (aDist !== bDist) return aDist - bDist
+    const aa = audioRank(a)
+    const ba = audioRank(b)
+    if (aa !== ba) return ba - aa
     const ap = playability(a.name)
     const bp = playability(b.name)
     if (ap !== bp) return bp - ap

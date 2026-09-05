@@ -44,15 +44,15 @@ function WatchLaterCard({
       <button
         type="button"
         className="watch-later-remove"
-        title="Remove from Watch Later"
-        aria-label={`Remove ${item.title}`}
+        title="Remove from list"
+        aria-label="Remove item"
         onClick={(e) => {
           e.preventDefault()
           e.stopPropagation()
           onRemove(item.id)
         }}
       >
-        <X size={14} strokeWidth={2} />
+        <X size={14} strokeWidth={2.5} />
       </button>
     </article>
   )

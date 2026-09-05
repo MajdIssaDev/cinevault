@@ -1,4 +1,5 @@
 import { fetchJson } from '../lib/http'
+import { withParsedAudio, type AudioCodec } from '../lib/torrentParser'
 
 export interface PublicSearchResult {
   id: string
@@ -8,6 +9,9 @@ export interface PublicSearchResult {
   leechers: number
   magnetUri: string
   source: string
+  audioCodec: AudioCodec
+  isAudioSupported: boolean
+  audioLabel: string | null
 }
 
 const APIBAY_URL = 'https://apibay.org/q.php'
@@ -84,7 +88,7 @@ function mapApibayItem(item: ApibayItem): PublicSearchResult | null {
   const hash = (item.info_hash ?? '').trim()
   if (!id || id === '0' || !name || !hash || /no results/i.test(name)) return null
 
-  return {
+  return withParsedAudio({
     id: `apibay-${id}`,
     name,
     sizeBytes: parseCount(item.size),
@@ -92,7 +96,7 @@ function mapApibayItem(item: ApibayItem): PublicSearchResult | null {
     leechers: parseCount(item.leechers),
     magnetUri: buildMagnetUri(hash, name),
     source: 'Apibay'
-  }
+  })
 }
 
 async function searchApibay(query: string): Promise<PublicSearchResult[]> {
@@ -111,7 +115,7 @@ function mapYtsTorrent(movie: YtsMovie, torrent: YtsTorrent): PublicSearchResult
   const peers = parseCount(torrent.peers)
   const leechers = peers >= seeders ? Math.max(0, peers - seeders) : peers
 
-  return {
+  return withParsedAudio({
     id: `yts-${movie.id}-${torrent.hash}`,
     name,
     sizeBytes: parseCount(torrent.size_bytes),
@@ -119,7 +123,7 @@ function mapYtsTorrent(movie: YtsMovie, torrent: YtsTorrent): PublicSearchResult
     leechers,
     magnetUri: buildMagnetUri(torrent.hash, name),
     source: 'YTS'
-  }
+  })
 }
 
 async function searchYts(query: string): Promise<PublicSearchResult[]> {

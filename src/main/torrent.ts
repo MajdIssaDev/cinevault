@@ -31,6 +31,8 @@ interface ActiveTorrent {
   ready: boolean
   error?: string
   streamUrl?: string
+  lastPlayheadSec?: number
+  lastDurationSec?: number
 }
 
 let client: WebTorrent.Instance | null = null
@@ -177,6 +179,7 @@ async function ensureStream(opts: {
   }
 
   const server = opts.torrent.createServer() as Server
+  attachRangePrioritizer(server, opts.torrent, index)
   const port = await listenServer(server)
   const streamUrl = `http://127.0.0.1:${port}/${index}`
 
@@ -342,6 +345,149 @@ async function stopTorrent(id: string): Promise<boolean> {
   return true
 }
 
+type TorrentFilePieces = WebTorrent.TorrentFile & {
+  _startPiece?: number
+  _endPiece?: number
+}
+
+/** Jump torrent priority to the HTTP Range byte offset (seek). */
+function prioritizePiecesAtByte(
+  torrent: WebTorrent.Torrent,
+  file: TorrentFilePieces,
+  byteOffset: number
+): void {
+  const startPiece = file._startPiece ?? 0
+  const endPiece = file._endPiece ?? startPiece
+  const pieceLength = Math.max(1, torrent.pieceLength || 16_384)
+  const rel = Math.max(0, byteOffset)
+  const pieceIndex = Math.min(
+    endPiece,
+    Math.max(startPiece, startPiece + Math.floor(rel / pieceLength))
+  )
+  const critEnd = Math.min(endPiece, pieceIndex + 20)
+  const behindEnd = Math.max(startPiece - 1, pieceIndex - 5 - 1)
+  try {
+    if (behindEnd >= startPiece) {
+      torrent.deselect(startPiece, behindEnd, 0)
+    }
+    torrent.critical(pieceIndex, critEnd)
+    torrent.select(pieceIndex, critEnd, 2)
+  } catch {
+    /* ignore */
+  }
+}
+
+function attachRangePrioritizer(
+  server: Server,
+  torrent: WebTorrent.Torrent,
+  fileIndex: number
+): void {
+  server.on('request', (req) => {
+    try {
+      const range = req.headers.range
+      if (!range || typeof range !== 'string') return
+      const m = /bytes=(\d+)/i.exec(range)
+      if (!m) return
+      const byteOffset = Number.parseInt(m[1], 10)
+      if (!Number.isFinite(byteOffset) || byteOffset < 0) return
+      const file = torrent.files[fileIndex] as TorrentFilePieces | undefined
+      if (!file) return
+      prioritizePiecesAtByte(torrent, file, byteOffset)
+    } catch {
+      /* ignore */
+    }
+  })
+}
+
+/** Sliding download window around the playhead (critical + high priority). */
+function prioritizePlaybackWindow(opts: {
+  id: string
+  currentTime: number
+  duration: number
+}): boolean {
+  const entry = active.get(opts.id)
+  if (!entry?.ready) return false
+  const file = entry.torrent.files[entry.fileIndex] as TorrentFilePieces | undefined
+  if (!file) return false
+
+  const startPiece = file._startPiece ?? 0
+  const endPiece = file._endPiece ?? startPiece
+  const pieceLength = Math.max(1, entry.torrent.pieceLength || 16_384)
+  const fileLength = file.length || entry.total || 0
+  if (fileLength <= 0 || endPiece < startPiece) return false
+
+  const duration = opts.duration > 1 ? opts.duration : entry.lastDurationSec || 0
+  const currentTime = Math.max(0, opts.currentTime || 0)
+  entry.lastPlayheadSec = currentTime
+  if (duration > 1) entry.lastDurationSec = duration
+
+  const bytePos =
+    duration > 1 ? Math.min(fileLength - 1, Math.floor((currentTime / duration) * fileLength)) : 0
+  prioritizePiecesAtByte(entry.torrent, file, bytePos)
+
+  // Also warm the next ~100MB as high priority beyond the critical window
+  try {
+    const pieceAt = Math.min(
+      endPiece,
+      Math.max(startPiece, startPiece + Math.floor(bytePos / pieceLength))
+    )
+    const criticalPieces = 20
+    const highPieces = Math.max(16, Math.ceil((100 * 1024 * 1024) / pieceLength))
+    const critEnd = Math.min(endPiece, pieceAt + criticalPieces)
+    const highStart = Math.min(endPiece, critEnd + 1)
+    const highEnd = Math.min(endPiece, critEnd + highPieces)
+    if (highStart <= highEnd) {
+      entry.torrent.select(highStart, highEnd, 1)
+    }
+  } catch {
+    /* ignore */
+  }
+  return true
+}
+
+function announceTorrent(torrent: WebTorrent.Torrent): void {
+  try {
+    const discovery = (torrent as unknown as { discovery?: { tracker?: { update?: () => void } } })
+      .discovery
+    discovery?.tracker?.update?.()
+  } catch {
+    /* ignore */
+  }
+  try {
+    const anyT = torrent as unknown as { announce?: () => void }
+    anyT.announce?.()
+  } catch {
+    /* ignore */
+  }
+}
+
+/** Force re-request of the playhead window + tracker announce (stall recovery). */
+function nudgeTorrent(id: string): boolean {
+  const entry = active.get(id)
+  if (!entry?.ready) return false
+  const ok = prioritizePlaybackWindow({
+    id,
+    currentTime: entry.lastPlayheadSec || 0,
+    duration: entry.lastDurationSec || 0
+  })
+  announceTorrent(entry.torrent)
+  try {
+    // Brief pause/resume of selection can unstick some wires.
+    const file = entry.torrent.files[entry.fileIndex] as TorrentFilePieces | undefined
+    if (file) {
+      const startPiece = file._startPiece ?? 0
+      const endPiece = Math.min(
+        file._endPiece ?? startPiece,
+        startPiece + Math.max(8, Math.ceil((20 * 1024 * 1024) / Math.max(1, entry.torrent.pieceLength || 16384)))
+      )
+      entry.torrent.critical(startPiece, endPiece)
+    }
+  } catch {
+    /* ignore */
+  }
+  return ok
+}
+
 export function registerTorrentHandlers(): void {
   ipcMain.handle(
     'torrent:start',
@@ -358,6 +504,26 @@ export function registerTorrentHandlers(): void {
   })
 
   ipcMain.handle('torrent:stop', async (_e, id: string) => stopTorrent(id))
+
+  ipcMain.handle(
+    'torrent:prioritize',
+    (
+      _e,
+      opts: { id: string; currentTime: number; duration: number }
+    ): boolean => {
+      if (!opts?.id) return false
+      return prioritizePlaybackWindow({
+        id: opts.id,
+        currentTime: opts.currentTime || 0,
+        duration: opts.duration || 0
+      })
+    }
+  )
+
+  ipcMain.handle('torrent:nudge', (_e, id: string): boolean => {
+    if (!id) return false
+    return nudgeTorrent(id)
+  })
 }
 
 export async function destroyAllTorrents(): Promise<void> {

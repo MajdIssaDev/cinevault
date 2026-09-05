@@ -1379,57 +1379,56 @@ button { cursor: pointer; border: none; background: none; user-select: none; -we
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
   padding-left: 3px;
 }
-.poster-card .fav {
+.poster-card .fav,
+.poster-watch-later {
   position: absolute;
   top: 8px;
-  left: 42px;
   z-index: 3;
   width: 30px;
   height: 30px;
   border-radius: 999px;
-  border: 0;
+  border: 1px solid rgba(255, 255, 255, 0.14);
   background: rgba(0, 0, 0, 0.55);
-  color: rgba(255, 255, 255, 0.55);
-  opacity: 0;
-  transition: opacity 0.2s ease, color 0.15s ease, transform 0.2s ease;
-}
-.poster-card:hover .fav,
-.poster-card .fav.on {
-  opacity: 1;
-}
-.poster-watch-later {
-  position: absolute;
-  top: 8px;
-  left: 8px;
-  z-index: 4;
-  width: 30px;
-  height: 30px;
-  border-radius: 999px;
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  background: rgba(255, 255, 255, 0.1);
-  color: #fff;
+  color: rgba(255, 255, 255, 0.88);
   display: grid;
   place-items: center;
+  padding: 0;
   opacity: 0;
+  cursor: pointer;
   transition:
     opacity 0.2s ease,
     background 0.15s ease,
     color 0.15s ease,
-    border-color 0.15s ease;
+    border-color 0.15s ease,
+    transform 0.2s ease;
 }
+.poster-watch-later {
+  left: 8px;
+  z-index: 4;
+}
+.poster-card .fav {
+  left: 42px;
+}
+.poster-card:hover .fav,
+.poster-card .fav.on,
 .poster-card:hover .poster-watch-later,
 .poster-watch-later.on {
   opacity: 1;
 }
+.poster-card .fav:hover,
 .poster-watch-later:hover {
-  background: rgba(255, 255, 255, 0.2);
+  background: rgba(0, 0, 0, 0.72);
+  border-color: rgba(255, 255, 255, 0.28);
+  color: #fff;
 }
 .poster-watch-later.on {
-  background: rgba(14, 165, 233, 0.2);
-  border-color: rgba(14, 165, 233, 0.4);
+  background: rgba(14, 165, 233, 0.22);
+  border-color: rgba(14, 165, 233, 0.45);
   color: #38bdf8;
 }
 .poster-card .fav.on {
+  background: rgba(244, 114, 182, 0.22);
+  border-color: rgba(244, 114, 182, 0.45);
   color: #f472b6;
 }
 .poster-card .fav.bump {
@@ -2229,6 +2228,22 @@ button { cursor: pointer; border: none; background: none; user-select: none; -we
   animation: detail-res-toast-in 0.25s ease;
 }
 
+.detail-audio-warn {
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
+  height: auto;
+  min-height: 32px;
+  padding: 6px 12px;
+  border-radius: 999px;
+  border: 1px solid rgba(245, 158, 11, 0.3);
+  background: rgba(245, 158, 11, 0.12);
+  color: #fcd34d;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.3;
+}
+
 @keyframes detail-res-toast-in {
   from {
     opacity: 0;
@@ -2251,28 +2266,31 @@ button { cursor: pointer; border: none; background: none; user-select: none; -we
   min-width: 40px;
   padding: 0 12px;
   border-radius: 999px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  border: 1px solid rgba(255, 255, 255, 0.14);
   background: rgba(255, 255, 255, 0.1);
-  color: #fff;
+  color: rgba(255, 255, 255, 0.88);
   cursor: pointer;
   backdrop-filter: none;
   -webkit-backdrop-filter: none;
-  transition: background 0.15s ease;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
 }
 .detail-icon-btn:hover,
 .detail-pill:hover {
-  background: rgba(255, 255, 255, 0.2);
+  background: rgba(255, 255, 255, 0.18);
+  border-color: rgba(255, 255, 255, 0.22);
+  color: #fff;
 }
 .detail-icon-btn.on {
   color: #f472b6;
+  background: rgba(244, 114, 182, 0.2);
+  border-color: rgba(244, 114, 182, 0.4);
 }
 .detail-icon-btn.detail-watch-later-btn {
-  background: rgba(255, 255, 255, 0.1);
-  border-color: rgba(255, 255, 255, 0.1);
-  color: #d4d4d4;
+  /* same off-state as sibling icon buttons */
+  color: rgba(255, 255, 255, 0.88);
 }
 .detail-icon-btn.detail-watch-later-btn:hover {
-  background: rgba(255, 255, 255, 0.2);
+  background: rgba(255, 255, 255, 0.18);
   color: #fff;
 }
 .detail-icon-btn.detail-watch-later-btn.on {
@@ -2600,6 +2618,13 @@ button { cursor: pointer; border: none; background: none; user-select: none; -we
   min-width: 0;
   flex: 1;
 }
+.stream-badges {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
+  flex: 0 0 auto;
+}
 .stream-res {
   flex: 0 0 auto;
   padding: 2px 8px;
@@ -2608,6 +2633,26 @@ button { cursor: pointer; border: none; background: none; user-select: none; -we
   font-weight: 700;
   letter-spacing: 0.02em;
   font-variant-numeric: tabular-nums;
+  text-align: center;
+}
+.stream-audio {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2px 8px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+  background: rgba(255, 255, 255, 0.1);
+  color: #d4d4d4;
+  border: 1px solid transparent;
+}
+.stream-audio.warn {
+  background: rgba(245, 158, 11, 0.1);
+  border: 1px solid rgba(245, 158, 11, 0.3);
+  color: #fcd34d;
 }
 .stream-res.uhd {
   background: rgba(16, 185, 129, 0.1);
@@ -3654,6 +3699,63 @@ button { cursor: pointer; border: none; background: none; user-select: none; -we
   backdrop-filter: blur(6px);
   border: 1px solid rgba(255, 255, 255, 0.1);
 }
+.stall-recovery-toast {
+  position: absolute;
+  top: 58px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 8;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: min(640px, calc(100% - 32px));
+  padding: 10px 12px 10px 16px;
+  border-radius: 14px;
+  background: rgba(2, 6, 23, 0.88);
+  color: rgba(255, 255, 255, 0.92);
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.35;
+  backdrop-filter: blur(10px);
+  border: 1px solid rgba(245, 158, 11, 0.35);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+}
+.stall-recovery-toast > span {
+  min-width: 0;
+  flex: 1;
+}
+.stall-recovery-btn {
+  flex-shrink: 0;
+  height: 32px;
+  padding: 0 12px;
+  border-radius: 999px;
+  border: 0;
+  background: linear-gradient(90deg, #0ea5e9, #06b6d4);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 650;
+  cursor: pointer;
+}
+.stall-recovery-btn:disabled {
+  opacity: 0.65;
+  cursor: wait;
+}
+.stall-recovery-dismiss {
+  flex-shrink: 0;
+  height: 32px;
+  padding: 0 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: transparent;
+  color: #d4d4d4;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.stall-recovery-dismiss:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: #fff;
+}
 .player-stage video {
   width: 100%;
   height: 100%;
@@ -4342,20 +4444,28 @@ button { cursor: pointer; border: none; background: none; user-select: none; -we
 }
 .watch-later-remove {
   position: absolute;
-  top: 8px;
-  right: 8px;
-  z-index: 2;
+  top: 10px;
+  right: 10px;
+  z-index: 20;
   width: 28px;
   height: 28px;
   border-radius: 999px;
-  border: 1px solid rgba(255, 255, 255, 0.14);
-  background: rgba(0, 0, 0, 0.65);
-  color: #fff;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: rgba(2, 6, 23, 0.8);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  color: rgba(255, 255, 255, 0.9);
   display: grid;
   place-items: center;
   opacity: 0;
   pointer-events: none;
-  transition: opacity 0.15s ease, background 0.15s ease;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.6);
+  transition:
+    opacity 0.15s ease,
+    background 0.15s ease,
+    color 0.15s ease,
+    border-color 0.15s ease,
+    transform 0.15s ease;
   cursor: pointer;
 }
 .watch-later-card:hover .watch-later-remove {
@@ -4363,8 +4473,12 @@ button { cursor: pointer; border: none; background: none; user-select: none; -we
   pointer-events: auto;
 }
 .watch-later-remove:hover {
-  background: rgba(239, 68, 68, 0.85);
-  border-color: transparent;
+  background: #e11d48;
+  border-color: #f43f5e;
+  color: #fff;
+}
+.watch-later-remove:active {
+  transform: scale(0.9);
 }
 .watch-later-card-meta {
   min-width: 0;
@@ -4384,6 +4498,21 @@ button { cursor: pointer; border: none; background: none; user-select: none; -we
 }
 
 /* —— Continue Watching —— */
+.continue-watching-anim.catalog-shelf {
+  margin-bottom: 0; /* framer-motion drives marginBottom */
+}
+.continue-card-motion {
+  flex: 0 0 auto;
+  overflow: hidden;
+}
+.continue-card-motion .continue-card {
+  width: 224px;
+}
+@media (min-width: 640px) {
+  .continue-card-motion .continue-card {
+    width: 256px;
+  }
+}
 .continue-card {
   position: relative;
   flex: 0 0 auto;
@@ -4461,20 +4590,28 @@ button { cursor: pointer; border: none; background: none; user-select: none; -we
 }
 .continue-card-remove {
   position: absolute;
-  top: 8px;
-  right: 8px;
-  z-index: 2;
+  top: 10px;
+  right: 10px;
+  z-index: 20;
   width: 28px;
   height: 28px;
   border-radius: 999px;
-  border: 1px solid rgba(255, 255, 255, 0.14);
-  background: rgba(0, 0, 0, 0.65);
-  color: #fff;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: rgba(2, 6, 23, 0.8);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  color: rgba(255, 255, 255, 0.9);
   display: grid;
   place-items: center;
   opacity: 0;
   pointer-events: none;
-  transition: opacity 0.15s ease, background 0.15s ease;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.6);
+  transition:
+    opacity 0.15s ease,
+    background 0.15s ease,
+    color 0.15s ease,
+    border-color 0.15s ease,
+    transform 0.15s ease;
   cursor: pointer;
 }
 .continue-card:hover .continue-card-remove {
@@ -4482,8 +4619,12 @@ button { cursor: pointer; border: none; background: none; user-select: none; -we
   pointer-events: auto;
 }
 .continue-card-remove:hover {
-  background: rgba(239, 68, 68, 0.85);
-  border-color: transparent;
+  background: #e11d48;
+  border-color: #f43f5e;
+  color: #fff;
+}
+.continue-card-remove:active {
+  transform: scale(0.9);
 }
 .continue-card-progress {
   border-radius: 0;

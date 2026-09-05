@@ -3,6 +3,10 @@
  */
 import type { PublicSearchResult } from '../services/publicSearchService'
 import { guessQualityFromName, qualityLabel, qualityRank } from './torrentPlayback'
+import {
+  hasExplicitUnsupportedAudio,
+  parseTorrentAudio
+} from './torrentParser'
 import type { Quality } from '../types'
 
 export type TargetRes = '4K' | '1080p' | '720p' | 'Auto'
@@ -13,6 +17,8 @@ export type StreamPick = {
   isTargetAvailable: boolean
   availableResolutions: TargetRes[]
   matchedRes: TargetRes | null
+  /** True when the chosen stream has AC3/DTS/Atmos-style audio. */
+  hasUnsupportedAudio: boolean
 }
 
 const TARGET_TO_QUALITY: Record<Exclude<TargetRes, 'Auto'>, Quality> = {
@@ -71,6 +77,17 @@ function sizeScore(bytes: number, isMovieLike: boolean): number {
   return 1
 }
 
+function audioMeta(t: PublicSearchResult): ReturnType<typeof parseTorrentAudio> {
+  if (t.audioCodec && t.audioLabel !== undefined && typeof t.isAudioSupported === 'boolean') {
+    return {
+      audioCodec: t.audioCodec,
+      isAudioSupported: t.isAudioSupported,
+      audioLabel: t.audioLabel
+    }
+  }
+  return parseTorrentAudio(t.name)
+}
+
 function scoreTorrent(t: PublicSearchResult, isMovieLike: boolean): number {
   let score = 0
   if (t.seeders >= 50) score += 40
@@ -83,6 +100,17 @@ function scoreTorrent(t: PublicSearchResult, isMovieLike: boolean): number {
   score += playabilityScore(t.name) * 6
   score += sizeScore(t.sizeBytes, isMovieLike) * 4
   if (t.leechers > 0 && t.seeders / Math.max(1, t.leechers) >= 2) score += 4
+
+  const audio = audioMeta(t)
+  if (hasExplicitUnsupportedAudio(t.name) || (!audio.isAudioSupported && audio.audioCodec !== 'UNKNOWN')) {
+    score -= 55
+  } else if (audio.audioCodec === 'AAC' && audio.audioLabel) {
+    // Prefer labeled native AAC over unlabeled / other native
+    score += 22
+  } else if (audio.isAudioSupported && audio.audioLabel) {
+    score += 14
+  }
+
   return score
 }
 
@@ -113,6 +141,20 @@ function highestWithMinSeeders(
   return available[0] || null
 }
 
+function emptyPick(
+  highestAvailableRes: TargetRes | null,
+  availableResolutions: TargetRes[]
+): StreamPick {
+  return {
+    bestStream: null,
+    highestAvailableRes,
+    isTargetAvailable: false,
+    availableResolutions,
+    matchedRes: null,
+    hasUnsupportedAudio: false
+  }
+}
+
 export function getBestStream(
   torrents: PublicSearchResult[],
   targetRes: TargetRes,
@@ -129,13 +171,7 @@ export function getBestStream(
   }
 
   if (!effective || effective === 'Auto') {
-    return {
-      bestStream: null,
-      highestAvailableRes,
-      isTargetAvailable: false,
-      availableResolutions,
-      matchedRes: null
-    }
+    return emptyPick(highestAvailableRes, availableResolutions)
   }
 
   const want = TARGET_TO_QUALITY[effective]
@@ -148,25 +184,40 @@ export function getBestStream(
 
   const isTargetAvailable = candidates.length > 0
   if (!isTargetAvailable) {
-    return {
-      bestStream: null,
-      highestAvailableRes,
-      isTargetAvailable: false,
-      availableResolutions,
-      matchedRes: null
-    }
+    return emptyPick(highestAvailableRes, availableResolutions)
   }
 
-  const ranked = [...candidates].sort(
-    (a, b) => scoreTorrent(b, isMovieLike) - scoreTorrent(a, isMovieLike)
+  const compatible = candidates.filter((t) => {
+    const audio = audioMeta(t)
+    return audio.isAudioSupported || audio.audioCodec === 'UNKNOWN'
+  })
+  // Prefer native-friendly audio when any exist; otherwise fall back to cinema codecs.
+  const pool = compatible.length > 0 ? compatible : candidates
+
+  const ranked = [...pool].sort((a, b) => {
+    const as = scoreTorrent(a, isMovieLike)
+    const bs = scoreTorrent(b, isMovieLike)
+    if (bs !== as) return bs - as
+    // Tie-break: labeled AAC beats everything else at same score
+    const aAac = audioMeta(a).audioCodec === 'AAC' && Boolean(audioMeta(a).audioLabel) ? 1 : 0
+    const bAac = audioMeta(b).audioCodec === 'AAC' && Boolean(audioMeta(b).audioLabel) ? 1 : 0
+    if (bAac !== aAac) return bAac - aAac
+    return b.seeders - a.seeders
+  })
+
+  const best = ranked[0] || null
+  const hasUnsupportedAudio = Boolean(
+    best &&
+      (!audioMeta(best).isAudioSupported || hasExplicitUnsupportedAudio(best.name))
   )
 
   return {
-    bestStream: ranked[0] || null,
+    bestStream: best,
     highestAvailableRes,
-    isTargetAvailable: Boolean(ranked[0]),
+    isTargetAvailable: Boolean(best),
     availableResolutions,
-    matchedRes: effective
+    matchedRes: effective,
+    hasUnsupportedAudio
   }
 }
 

@@ -87,6 +87,53 @@ function bufferedEnd(video: HTMLVideoElement | null): number {
   }
 }
 
+/** How far ahead of currentTime the HTML5 buffer extends (target window → %). */
+const unstickAtByVideo = new WeakMap<HTMLVideoElement, number>()
+
+function calculateForwardBuffer(
+  video: HTMLVideoElement,
+  targetSeconds = 15
+): { forwardSec: number; pct: number } {
+  const current = video.currentTime
+  try {
+    for (let i = 0; i < video.buffered.length; i++) {
+      const start = video.buffered.start(i)
+      const end = video.buffered.end(i)
+
+      // 1. Playhead is inside a buffered range
+      if (current >= start && current <= end) {
+        const forwardSec = Math.max(0, end - current)
+        return {
+          forwardSec,
+          pct: Math.min(100, Math.round((forwardSec / targetSeconds) * 100))
+        }
+      }
+
+      // 2. Keyframe deadlock: playhead is stuck just before a valid chunk
+      if (current < start && start - current <= 1.5) {
+        const last = unstickAtByVideo.get(video) || 0
+        if (Date.now() - last > 400) {
+          unstickAtByVideo.set(video, Date.now())
+          try {
+            video.currentTime = start + 0.05
+          } catch {
+            /* ignore seek errors */
+          }
+        }
+        const t = video.currentTime
+        const forwardSec = Math.max(0, end - t)
+        return {
+          forwardSec,
+          pct: Math.min(100, Math.round((forwardSec / targetSeconds) * 100))
+        }
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+  return { forwardSec: 0, pct: 0 }
+}
+
 function playbackWarning(label: string): string | null {
   const n = label.toLowerCase()
   if (/\b(hevc|x265|h\.?265)\b/.test(n) || /\b10.?bit\b/.test(n)) {
@@ -115,6 +162,8 @@ export function PlayerPage(): JSX.Element {
   const sourceAttachedRef = useRef(false)
   const resumeGateRef = useRef<number | null>(null)
   const initialStartedRef = useRef(false)
+  /** User/app wants playback; stays true across waiting-induced pauses. */
+  const wantPlaybackRef = useRef(true)
   const dlProgressRef = useRef(0)
   const holdTimersRef = useRef<
     Map<string, { delay?: ReturnType<typeof setTimeout>; interval?: ReturnType<typeof setInterval> }>
@@ -157,6 +206,12 @@ export function PlayerPage(): JSX.Element {
   const [mediaError, setMediaError] = useState<string | null>(null)
   const [mediaAttached, setMediaAttached] = useState(false)
   const [waitTargetPct, setWaitTargetPct] = useState<number | null>(null)
+  const [forwardBufferPct, setForwardBufferPct] = useState(0)
+  const [forwardBufferSec, setForwardBufferSec] = useState(0)
+  const [stallRecovery, setStallRecovery] = useState<{ speedLabel: string } | null>(null)
+  const [stallSwitchBusy, setStallSwitchBusy] = useState(false)
+  const stallNudgedRef = useRef(false)
+  const prioritizeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const [seekFlash, setSeekFlash] = useState<{ dir: -1 | 1; seconds: number } | null>(null)
   const [subToast, setSubToast] = useState<string | null>(null)
   const [availableSubs, setAvailableSubs] = useState<UnifiedSubtitle[]>([])
@@ -189,14 +244,15 @@ export function PlayerPage(): JSX.Element {
   const tryStartPlayback = (): void => {
     const video = videoRef.current
     if (!video || !sourceAttachedRef.current) return
+    if (!wantPlaybackRef.current) return
     void video.play().then(() => {
       initialStartedRef.current = true
       resumeGateRef.current = null
       setWaitTargetPct(null)
       setBuffering(false)
       waitingSinceRef.current = null
+      setPlaying(true)
     }).catch(() => {
-      setPlaying(false)
       setBuffering(true)
     })
   }
@@ -205,6 +261,7 @@ export function PlayerPage(): JSX.Element {
     const video = videoRef.current
     if (!video || sourceAttachedRef.current) return
     sourceAttachedRef.current = true
+    wantPlaybackRef.current = true
     video.src = src
     if (scrubVideoRef.current) scrubVideoRef.current.src = src
     setMediaAttached(true)
@@ -213,8 +270,12 @@ export function PlayerPage(): JSX.Element {
     const onMeta = (): void => {
       if (resumeAt > 0) video.currentTime = resumeAt
     }
+    const resumeIfWanted = (): void => {
+      if (wantPlaybackRef.current && video.paused) tryStartPlayback()
+    }
     video.addEventListener('loadedmetadata', onMeta, { once: true })
-    video.addEventListener('canplay', () => tryStartPlayback(), { once: true })
+    video.addEventListener('canplay', resumeIfWanted)
+    video.addEventListener('canplaythrough', resumeIfWanted)
     video.addEventListener('loadeddata', () => tryStartPlayback(), { once: true })
   }
 
@@ -231,6 +292,7 @@ export function PlayerPage(): JSX.Element {
     waitingSinceRef.current = Date.now()
     sourceAttachedRef.current = false
     initialStartedRef.current = false
+    wantPlaybackRef.current = true
     resumeGateRef.current = 0.05
     dlProgressRef.current = 0
 
@@ -544,9 +606,37 @@ export function PlayerPage(): JSX.Element {
     if (!video) return
 
     const refreshBuffer = (): void => {
-      const end = bufferedEnd(video)
+      const fwd = calculateForwardBuffer(video, 15)
+      setForwardBufferPct(fwd.pct)
+      setForwardBufferSec(fwd.forwardSec)
       const dur = video.duration || duration || 0
+      // Timeline fill: end of the buffered range that contains the playhead
+      let end = video.currentTime
+      try {
+        for (let i = 0; i < video.buffered.length; i++) {
+          const start = video.buffered.start(i)
+          const rangeEnd = video.buffered.end(i)
+          if (video.currentTime >= start && video.currentTime <= rangeEnd) {
+            end = rangeEnd
+            break
+          }
+        }
+      } catch {
+        end = bufferedEnd(video)
+      }
       setBufferPct(dur > 0 ? Math.min(100, (end / dur) * 100) : 0)
+    }
+
+    const syncTorrentWindow = (): void => {
+      if (session.source.kind !== 'torrent') return
+      if (prioritizeTimerRef.current) clearTimeout(prioritizeTimerRef.current)
+      prioritizeTimerRef.current = setTimeout(() => {
+        void window.cinevault?.torrent.prioritize({
+          id: session.cacheId,
+          currentTime: video.currentTime,
+          duration: video.duration || durationRef.current || 0
+        })
+      }, 180)
     }
 
     const onTime = (): void => {
@@ -560,38 +650,53 @@ export function PlayerPage(): JSX.Element {
       const cue = findActiveCue(cuesRef.current, video.currentTime, subOffsetMsRef.current)
       setSubText(cue?.text || '')
       refreshBuffer()
+      syncTorrentWindow()
     }
     const onMeta = (): void => {
       setDuration(video.duration || 0)
       setVideoWidth(video.videoWidth)
       setVideoHeight(video.videoHeight)
       refreshBuffer()
+      syncTorrentWindow()
     }
     const onPlay = (): void => {
+      wantPlaybackRef.current = true
       setPlaying(true)
       bumpChrome()
+      syncTorrentWindow()
     }
     const onPause = (): void => {
-      setPlaying(false)
+      // Waiting-induced pause keeps wantPlayback; intentional pause clears it below via togglePlay.
       setChromeVisible(true)
       if (idleTimerRef.current) clearTimeout(idleTimerRef.current)
+      if (!waitingSinceRef.current) {
+        setPlaying(false)
+      }
     }
     const onWaiting = (): void => {
       setBuffering(true)
       waitingSinceRef.current = Date.now()
+      stallNudgedRef.current = false
+      const fwd = calculateForwardBuffer(video, 15)
+      setForwardBufferPct(fwd.pct)
+      setForwardBufferSec(fwd.forwardSec)
+      // Pause to stop decoder thrash, but keep wantPlayback so canplay can resume.
       if (!video.paused) video.pause()
       const p = dlProgressRef.current
       if (p < 0.999) {
-        const gate = Math.min(1, p + 0.05)
-        resumeGateRef.current = gate
-        setWaitTargetPct(Math.ceil(gate * 100))
+        resumeGateRef.current = Math.min(1, p + 0.05)
       } else {
         resumeGateRef.current = null
-        setWaitTargetPct(null)
       }
+      setWaitTargetPct(null)
+      syncTorrentWindow()
     }
     const onPlaying = (): void => {
+      wantPlaybackRef.current = true
+      setPlaying(true)
       setBuffering(false)
+      setStallRecovery(null)
+      stallNudgedRef.current = false
       setVideoWidth(video.videoWidth)
       setVideoHeight(video.videoHeight)
       if (waitingSinceRef.current) {
@@ -604,6 +709,17 @@ export function PlayerPage(): JSX.Element {
     }
     const onStalled = (): void => {
       setBuffering(true)
+      if (!waitingSinceRef.current) waitingSinceRef.current = Date.now()
+      const fwd = calculateForwardBuffer(video, 15)
+      setForwardBufferPct(fwd.pct)
+      setForwardBufferSec(fwd.forwardSec)
+      setWaitTargetPct(null)
+      syncTorrentWindow()
+    }
+    const onCanPlay = (): void => {
+      if (wantPlaybackRef.current && video.paused) {
+        tryStartPlayback()
+      }
     }
     const onError = (): void => {
       const err = video.error
@@ -636,9 +752,12 @@ export function PlayerPage(): JSX.Element {
     video.addEventListener('error', onError)
     video.addEventListener('progress', onProgress)
     video.addEventListener('resize', onResize)
+    video.addEventListener('canplay', onCanPlay)
+    video.addEventListener('canplaythrough', onCanPlay)
     // Immediate sync after attach / cue changes
     onSeeked()
     return () => {
+      if (prioritizeTimerRef.current) clearTimeout(prioritizeTimerRef.current)
       video.removeEventListener('timeupdate', onTime)
       video.removeEventListener('seeked', onSeeked)
       video.removeEventListener('loadedmetadata', onMeta)
@@ -650,8 +769,39 @@ export function PlayerPage(): JSX.Element {
       video.removeEventListener('error', onError)
       video.removeEventListener('progress', onProgress)
       video.removeEventListener('resize', onResize)
+      video.removeEventListener('canplay', onCanPlay)
+      video.removeEventListener('canplaythrough', onCanPlay)
     }
-  }, [cues, subtitleOffsetMs, duration, session.source.url, dl?.peers, dl?.speed, dl?.progress])
+  }, [cues, subtitleOffsetMs, duration, session.source.url, session.source.kind, session.cacheId])
+
+  // Stall watchdog: nudge peers after 6s slow buffer; offer switch after 12s
+  useEffect(() => {
+    if (!buffering || session.source.kind !== 'torrent') return
+    const tick = window.setInterval(() => {
+      const since = waitingSinceRef.current
+      if (!since) return
+      const waited = Date.now() - since
+      const speed = dl?.speed ?? 0
+      if (waited >= 6000 && speed < 50 * 1024) {
+        if (!stallNudgedRef.current) {
+          stallNudgedRef.current = true
+          void window.cinevault?.torrent.nudge(session.cacheId)
+          const video = videoRef.current
+          if (video) {
+            void window.cinevault?.torrent.prioritize({
+              id: session.cacheId,
+              currentTime: video.currentTime,
+              duration: video.duration || durationRef.current || 0
+            })
+          }
+        }
+      }
+      if (waited >= 12_000 && speed < 50 * 1024) {
+        setStallRecovery({ speedLabel: formatSpeed(speed) })
+      }
+    }, 1000)
+    return () => window.clearInterval(tick)
+  }, [buffering, dl?.speed, session.cacheId, session.source.kind])
 
   // Persist progress
   useEffect(() => {
@@ -886,6 +1036,68 @@ export function PlayerPage(): JSX.Element {
     }
   }
 
+  const switchToHealthierStream = async (): Promise<void> => {
+    if (stallSwitchBusy || session.source.kind !== 'torrent') return
+    setStallSwitchBusy(true)
+    setSubToast('Finding a healthier 1080p stream…')
+    const prevCacheId = session.cacheId
+    try {
+      const title = session.showTitle || session.title.replace(/\s·\sS\d+E\d+.*$/, '')
+      const query = buildCatalogSearchQuery({
+        title,
+        mediaType: session.mediaType,
+        season: session.season,
+        episode: session.episode
+      })
+      const raw = await searchPublicIndexers(query)
+      const sorted = sortTorrentResults(raw, qualityPref)
+      const pick = getBestStream(sorted, '1080p', {
+        isMovieLike: session.mediaType === 'movie'
+      })
+      const fallback = getBestStream(sorted, 'Auto', {
+        isMovieLike: session.mediaType === 'movie'
+      })
+      const chosen = pick.bestStream || fallback.bestStream || sorted[0]
+      if (!chosen?.magnetUri) {
+        setSubToast('No alternate streams found')
+        if (subToastTimerRef.current) clearTimeout(subToastTimerRef.current)
+        subToastTimerRef.current = setTimeout(() => setSubToast(null), 2800)
+        return
+      }
+
+      const source = await startTorrentPlayback({
+        cacheId: `${session.mediaType}-${session.externalId}-${session.season || 0}-${session.episode || 0}-${Date.now()}`,
+        magnetUri: chosen.magnetUri,
+        label: chosen.name,
+        preferredQuality: qualityPref
+      })
+
+      sourceAttachedRef.current = false
+      initialStartedRef.current = false
+      resumeGateRef.current = null
+      setMediaError(null)
+      setStallRecovery(null)
+      setBuffering(true)
+      setSubToast(null)
+
+      setSession({
+        ...session,
+        cacheId: source.id,
+        source,
+        resolution: source.quality !== 'unknown' ? source.quality : qualityPref,
+        resumeSeconds: videoRef.current?.currentTime || session.resumeSeconds || 0
+      })
+
+      void window.cinevault?.torrent.stop(prevCacheId)
+    } catch (e) {
+      setSubToast(e instanceof Error ? e.message : 'Could not switch stream')
+      if (subToastTimerRef.current) clearTimeout(subToastTimerRef.current)
+      subToastTimerRef.current = setTimeout(() => setSubToast(null), 3200)
+    } finally {
+      setStallSwitchBusy(false)
+    }
+  }
+
   useEffect(() => {
     durationRef.current = duration
   }, [duration])
@@ -979,8 +1191,15 @@ export function PlayerPage(): JSX.Element {
     const video = videoRef.current
     if (!video) return
     bumpChrome()
-    if (video.paused) void video.play()
-    else video.pause()
+    if (video.paused) {
+      wantPlaybackRef.current = true
+      void video.play().catch(() => undefined)
+    } else {
+      wantPlaybackRef.current = false
+      waitingSinceRef.current = null
+      video.pause()
+      setPlaying(false)
+    }
   }
 
   const toggleFullscreen = (): void => {
@@ -1079,16 +1298,24 @@ export function PlayerPage(): JSX.Element {
   const seekTo = (t: number): void => {
     const video = videoRef.current
     if (!video) return
-    const end = bufferedEnd(video)
+    const fwd = calculateForwardBuffer(video, 15)
     const dur = video.duration || duration || 0
     const target = Math.max(0, Math.min(t, dur || t))
-    if (session.source.kind === 'torrent' && end > 1 && target > end + 1.5) {
+    if (session.source.kind === 'torrent' && fwd.forwardSec < 1.5 && target > video.currentTime + 1.5) {
       setBuffering(true)
+      waitingSinceRef.current = Date.now()
     }
     video.currentTime = target
     setCurrent(target)
     const cue = findActiveCue(cuesRef.current, target, subOffsetMsRef.current)
     setSubText(cue?.text || '')
+    if (session.source.kind === 'torrent') {
+      void window.cinevault?.torrent.prioritize({
+        id: session.cacheId,
+        currentTime: target,
+        duration: dur
+      })
+    }
     bumpChrome()
   }
 
@@ -1267,6 +1494,29 @@ export function PlayerPage(): JSX.Element {
           {subToast}
         </div>
       )}
+      {stallRecovery && (
+        <div className="stall-recovery-toast" role="status" onClick={(e) => e.stopPropagation()}>
+          <span>
+            Stream speed dropped ({stallRecovery.speedLabel}) · Switch to a 1080p stream with more
+            seeders?
+          </span>
+          <button
+            type="button"
+            className="stall-recovery-btn"
+            disabled={stallSwitchBusy}
+            onClick={() => void switchToHealthierStream()}
+          >
+            {stallSwitchBusy ? 'Switching…' : 'Switch'}
+          </button>
+          <button
+            type="button"
+            className="stall-recovery-dismiss"
+            onClick={() => setStallRecovery(null)}
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
 
       <div
         className={`player-stage${buffering && !seekFlash ? ' is-buffering' : ''}`}
@@ -1312,7 +1562,11 @@ export function PlayerPage(): JSX.Element {
                   </div>
                   <div className="orbit-core">
                     <div className="orbit-pct">
-                      {dl?.progress != null ? `${Math.min(100, Math.round(dl.progress * 100))}%` : '—'}
+                      {mediaAttached
+                        ? `${forwardBufferPct}%`
+                        : dl?.progress != null
+                          ? `${Math.min(100, Math.round(dl.progress * 100))}%`
+                          : '—'}
                     </div>
                     <div className="orbit-speed">{dl ? formatSpeed(dl.speed) : '…'}</div>
                   </div>
@@ -1320,8 +1574,8 @@ export function PlayerPage(): JSX.Element {
                 <p className="orbit-note">
                   {!mediaAttached
                     ? '~5% to start playback'
-                    : waitTargetPct != null
-                      ? `~${waitTargetPct}% to continue`
+                    : forwardBufferPct < 100
+                      ? `Buffering ahead · ${forwardBufferSec.toFixed(0)}s / 15s`
                       : 'Buffering…'}
                 </p>
               </>

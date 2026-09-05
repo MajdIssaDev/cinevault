@@ -159,7 +159,13 @@ const api = {
       streamUrl?: string
       fileName?: string
     } | null> => ipcRenderer.invoke('torrent:status', id),
-    stop: (id: string): Promise<boolean> => ipcRenderer.invoke('torrent:stop', id)
+    stop: (id: string): Promise<boolean> => ipcRenderer.invoke('torrent:stop', id),
+    prioritize: (opts: {
+      id: string
+      currentTime: number
+      duration: number
+    }): Promise<boolean> => ipcRenderer.invoke('torrent:prioritize', opts),
+    nudge: (id: string): Promise<boolean> => ipcRenderer.invoke('torrent:nudge', id)
   },
   updater: {
     getVersion: (): Promise<string> => ipcRenderer.invoke('updater:get-version'),

@@ -401,7 +401,8 @@ export function DetailPage(): JSX.Element {
   const {
     bestStream,
     highestAvailableRes,
-    isTargetAvailable
+    isTargetAvailable,
+    hasUnsupportedAudio
   } = streamPick
 
   useEffect(() => {
@@ -942,6 +943,18 @@ export function DetailPage(): JSX.Element {
                   {resAdjustedNote}
                 </span>
               )}
+
+              {hasUnsupportedAudio && bestStream && (
+                <span
+                  className="detail-audio-warn"
+                  role="status"
+                  title="May require external player or audio transcoding"
+                >
+                  Best match uses{' '}
+                  {bestStream.audioLabel || bestStream.audioCodec || 'cinema audio'} — audio may
+                  be silent in-app
+                </span>
+              )}
             </div>
 
             {savedProgress && !forceFromStart && savedProgress.duration > 0 && (
@@ -1173,7 +1186,28 @@ export function DetailPage(): JSX.Element {
                   tabIndex={0}
                 >
                   <div className="stream-card-main">
-                    <span className={`stream-res ${qualityTone(q)}`}>{qualityLabel(q)}</span>
+                    <div className="stream-badges">
+                      <span className={`stream-res ${qualityTone(q)}`}>{qualityLabel(q)}</span>
+                      {(() => {
+                        const label =
+                          row.audioLabel ||
+                          (row.audioCodec && row.audioCodec !== 'UNKNOWN' ? row.audioCodec : null)
+                        if (!label) return null
+                        const warn = row.isAudioSupported === false
+                        return (
+                          <span
+                            className={`stream-audio${warn ? ' warn' : ''}`}
+                            title={
+                              warn
+                                ? 'May require external player or audio transcoding'
+                                : undefined
+                            }
+                          >
+                            {label}
+                          </span>
+                        )
+                      })()}
+                    </div>
                     <div className="stream-card-copy">
                       <div className="stream-title" title={row.name}>
                         {row.name}
