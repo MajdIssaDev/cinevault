@@ -5,6 +5,8 @@ import {
   useRef,
   useState,
   type CSSProperties,
+  type MouseEvent as ReactMouseEvent,
+  type PointerEvent as ReactPointerEvent,
   type ReactNode
 } from 'react'
 import { createPortal } from 'react-dom'
@@ -30,14 +32,11 @@ type Props = {
   menuMinWidth?: number
 }
 
-function computeMenuStyle(
-  btn: HTMLElement,
-  menuMinWidth?: number
-): CSSProperties {
+function computeMenuStyle(btn: HTMLElement, menuMinWidth?: number): CSSProperties {
   const rect = btn.getBoundingClientRect()
-  const maxH = Math.min(280, window.innerHeight - 24)
+  const maxH = Math.min(320, window.innerHeight - 24)
   const spaceBelow = window.innerHeight - rect.bottom - 12
-  const openUp = spaceBelow < 160 && rect.top > spaceBelow
+  const openUp = spaceBelow < 180 && rect.top > spaceBelow
   const width = Math.max(rect.width, menuMinWidth || 0)
   const left = Math.min(Math.max(8, rect.left), window.innerWidth - width - 8)
   return {
@@ -47,7 +46,7 @@ function computeMenuStyle(
     top: openUp ? undefined : rect.bottom + 6,
     bottom: openUp ? window.innerHeight - rect.top + 6 : undefined,
     maxHeight: maxH,
-    zIndex: 10050
+    zIndex: 200000
   }
 }
 
@@ -67,6 +66,7 @@ export function ThemedSelect({
   const rootRef = useRef<HTMLDivElement>(null)
   const btnRef = useRef<HTMLButtonElement>(null)
   const menuRef = useRef<HTMLDivElement>(null)
+  const ignoreOutsideRef = useRef(false)
   const [open, setOpen] = useState(false)
   const [menuStyle, setMenuStyle] = useState<CSSProperties | null>(null)
 
@@ -79,17 +79,30 @@ export function ThemedSelect({
     setMenuStyle(computeMenuStyle(btn, menuMinWidth))
   }
 
-  const toggle = (): void => {
-    if (open) {
-      setOpen(false)
-      setMenuStyle(null)
-      return
-    }
+  const close = (): void => {
+    setOpen(false)
+    setMenuStyle(null)
+  }
+
+  const openMenu = (): void => {
     const btn = btnRef.current
     if (!btn) return
-    // Position before paint so the menu never flashes at 0,0
+    // Ignore the same gesture that opened the menu so the document listener
+    // does not immediately dismiss it (common in Electron / pointer pipelines).
+    ignoreOutsideRef.current = true
     setMenuStyle(computeMenuStyle(btn, menuMinWidth))
     setOpen(true)
+    window.setTimeout(() => {
+      ignoreOutsideRef.current = false
+    }, 0)
+  }
+
+  const toggle = (e: ReactMouseEvent | ReactPointerEvent): void => {
+    e.preventDefault()
+    e.stopPropagation()
+    if (disabled) return
+    if (open) close()
+    else openMenu()
   }
 
   useLayoutEffect(() => {
@@ -99,25 +112,38 @@ export function ThemedSelect({
 
   useEffect(() => {
     if (!open) return
-    const onDoc = (e: MouseEvent): void => {
-      const t = e.target as Node
-      if (rootRef.current?.contains(t) || menuRef.current?.contains(t)) return
-      setOpen(false)
-      setMenuStyle(null)
+
+    const isInside = (t: EventTarget | null): boolean => {
+      const node = t as Node | null
+      if (!node) return false
+      return Boolean(rootRef.current?.contains(node) || menuRef.current?.contains(node))
     }
+
+    const onOutside = (e: Event): void => {
+      if (ignoreOutsideRef.current) return
+      if (isInside(e.target)) return
+      close()
+    }
+
     const onKey = (e: KeyboardEvent): void => {
-      if (e.key === 'Escape') {
-        setOpen(false)
-        setMenuStyle(null)
-      }
+      if (e.key === 'Escape') close()
     }
+
     const onReposition = (): void => placeMenu()
-    document.addEventListener('mousedown', onDoc)
-    window.addEventListener('keydown', onKey)
-    window.addEventListener('resize', onReposition)
-    window.addEventListener('scroll', onReposition, true)
+
+    // Defer bind so the opening click/pointerdown cannot dismiss immediately.
+    const bindTimer = window.setTimeout(() => {
+      document.addEventListener('pointerdown', onOutside, true)
+      document.addEventListener('mousedown', onOutside, true)
+      window.addEventListener('keydown', onKey)
+      window.addEventListener('resize', onReposition)
+      window.addEventListener('scroll', onReposition, true)
+    }, 0)
+
     return () => {
-      document.removeEventListener('mousedown', onDoc)
+      window.clearTimeout(bindTimer)
+      document.removeEventListener('pointerdown', onOutside, true)
+      document.removeEventListener('mousedown', onOutside, true)
       window.removeEventListener('keydown', onKey)
       window.removeEventListener('resize', onReposition)
       window.removeEventListener('scroll', onReposition, true)
@@ -130,6 +156,9 @@ export function ThemedSelect({
       className={`themed-select${className ? ` ${className}` : ''}${open ? ' open' : ''}`}
       data-variant={variant}
       title={title}
+      onPointerDown={(e) => e.stopPropagation()}
+      onMouseDown={(e) => e.stopPropagation()}
+      onClick={(e) => e.stopPropagation()}
     >
       <button
         ref={btnRef}
@@ -140,6 +169,10 @@ export function ThemedSelect({
         aria-controls={id}
         aria-label={ariaLabel}
         disabled={disabled}
+        onPointerDown={(e) => {
+          // Prevent parent player stage / chrome handlers from eating the gesture.
+          e.stopPropagation()
+        }}
         onClick={toggle}
       >
         {icon && <span className="themed-select-icon">{icon}</span>}
@@ -157,6 +190,9 @@ export function ThemedSelect({
             role="listbox"
             aria-label={ariaLabel}
             style={menuStyle}
+            onPointerDown={(e) => e.stopPropagation()}
+            onMouseDown={(e) => e.stopPropagation()}
+            onClick={(e) => e.stopPropagation()}
           >
             {options.map((opt) => {
               const active = opt.value === value
@@ -169,8 +205,7 @@ export function ThemedSelect({
                   className={`themed-select-option${active ? ' active' : ''}`}
                   onClick={() => {
                     onChange(opt.value)
-                    setOpen(false)
-                    setMenuStyle(null)
+                    close()
                   }}
                 >
                   {opt.label}

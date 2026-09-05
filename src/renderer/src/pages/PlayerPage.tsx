@@ -46,23 +46,62 @@ import { buildAudioRemuxUrl, needsAudioRemux } from '../lib/audioRemux'
 
 const ICON = { size: 20, strokeWidth: 1.75 } as const
 
-const SUB_LANGS = ['en', 'es', 'fr', 'de', 'it', 'pt', 'pl', 'ar', 'he', 'ja', 'ko', 'zh', 'ru'] as const
+const SUB_LANGS = [
+  'en',
+  'es',
+  'fr',
+  'de',
+  'ar',
+  'pt',
+  'ru',
+  'zh',
+  'ja',
+  'ko',
+  'hi',
+  'it',
+  'tr',
+  'pl',
+  'he',
+  'nl',
+  'uk',
+  'id',
+  'vi',
+  'th',
+  'sv',
+  'ro',
+  'cs',
+  'hu',
+  'el'
+] as const
 
 const SUB_LANG_LABELS: Record<string, string> = {
   en: 'English',
   es: 'Spanish',
   fr: 'French',
   de: 'German',
-  it: 'Italian',
-  pt: 'Portuguese',
-  pl: 'Polish',
   ar: 'Arabic',
-  he: 'Hebrew',
+  pt: 'Portuguese',
+  ru: 'Russian',
+  zh: 'Chinese',
   ja: 'Japanese',
   ko: 'Korean',
-  zh: 'Chinese',
-  ru: 'Russian'
+  hi: 'Hindi',
+  it: 'Italian',
+  tr: 'Turkish',
+  pl: 'Polish',
+  he: 'Hebrew',
+  nl: 'Dutch',
+  uk: 'Ukrainian',
+  id: 'Indonesian',
+  vi: 'Vietnamese',
+  th: 'Thai',
+  sv: 'Swedish',
+  ro: 'Romanian',
+  cs: 'Czech',
+  hu: 'Hungarian',
+  el: 'Greek'
 }
+
 
 function SeekGlyph({ dir }: { dir: 'back' | 'forward' }): JSX.Element {
   const Icon = dir === 'back' ? RotateCcw : RotateCw
@@ -1954,63 +1993,64 @@ export function PlayerPage(): JSX.Element {
           </div>
         )}
         {showSubs && (
-          <div className="sub-panel" onClick={(e) => e.stopPropagation()}>
+          <div
+            className="sub-panel"
+            onClick={(e) => e.stopPropagation()}
+            onPointerDown={(e) => e.stopPropagation()}
+            onMouseDown={(e) => e.stopPropagation()}
+          >
             <strong>Subtitles</strong>
-            {(availableSubs.length > 0 || session.imdbId) && (
-              <>
-                <div className="sub-panel-field">
-                  <span>Language</span>
-                  <ThemedSelect
-                    aria-label="Subtitle language"
-                    value={subLang}
-                    onChange={changeSubLang}
-                    disabled={!session.imdbId || subsLoading}
-                    menuMinWidth={160}
-                    options={SUB_LANGS.map((l) => ({
-                      value: l,
-                      label: SUB_LANG_LABELS[l] || l.toUpperCase()
-                    }))}
-                  />
+            <div className="sub-panel-field">
+              <span>Language</span>
+              <ThemedSelect
+                aria-label="Subtitle language"
+                value={subLang}
+                onChange={changeSubLang}
+                disabled={subsLoading}
+                menuMinWidth={180}
+                options={SUB_LANGS.map((l) => ({
+                  value: l,
+                  label: SUB_LANG_LABELS[l] || l.toUpperCase()
+                }))}
+              />
+            </div>
+            <div className="sub-panel-field">
+              <span>Track</span>
+              <ThemedSelect
+                aria-label="Subtitle track"
+                value={activeSubId}
+                onChange={(v) => void applySubtitleTrack(v)}
+                title={
+                  availableSubs.find((s) => s.id === activeSubId)
+                    ? formatSubtitleMenuLabel(
+                        availableSubs.find((s) => s.id === activeSubId)!
+                      )
+                    : undefined
+                }
+                menuMinWidth={300}
+                options={[
+                  { value: '', label: 'Off' },
+                  ...availableSubs.map((s) => ({
+                    value: s.id,
+                    label: formatSubtitleMenuLabel(s)
+                  }))
+                ]}
+                disabled={subsLoading}
+              />
+              {(subsLoading || !activeSubId) && (
+                <div className="sub-panel-status">
+                  {subsLoading
+                    ? 'Loading tracks…'
+                    : availableSubs.length === 0
+                      ? `No ${SUB_LANG_LABELS[subLang] || subLang} tracks`
+                      : cues.length
+                        ? 'Loaded'
+                        : session.imdbId
+                          ? 'Pick a track'
+                          : 'No IMDb id'}
                 </div>
-                <div className="sub-panel-field">
-                  <span>Track</span>
-                  <ThemedSelect
-                    aria-label="Subtitle track"
-                    value={activeSubId}
-                    onChange={(v) => void applySubtitleTrack(v)}
-                    title={
-                      availableSubs.find((s) => s.id === activeSubId)
-                        ? formatSubtitleMenuLabel(
-                            availableSubs.find((s) => s.id === activeSubId)!
-                          )
-                        : undefined
-                    }
-                    menuMinWidth={300}
-                    options={[
-                      { value: '', label: 'Off' },
-                      ...availableSubs.map((s) => ({
-                        value: s.id,
-                        label: formatSubtitleMenuLabel(s)
-                      }))
-                    ]}
-                    disabled={subsLoading}
-                  />
-                  {(subsLoading || !activeSubId) && (
-                    <div className="sub-panel-status">
-                      {subsLoading
-                        ? 'Loading tracks…'
-                        : availableSubs.length === 0
-                          ? `No ${SUB_LANG_LABELS[subLang] || subLang} tracks`
-                          : cues.length
-                            ? 'Loaded'
-                            : session.imdbId
-                              ? 'Pick a track'
-                              : 'No IMDb id'}
-                    </div>
-                  )}
-                </div>
-              </>
-            )}
+              )}
+            </div>
             <div className="sub-panel-field">
               <span>Size ({subSize}px)</span>
               <input

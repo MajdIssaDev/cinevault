@@ -34,7 +34,61 @@ type UpdateUiState =
   | { kind: 'ready'; version: string }
   | { kind: 'error'; message: string }
 
-const SUB_LANGS = ['en', 'es', 'fr', 'de', 'it', 'pt', 'pl', 'ar', 'he', 'ja', 'ko', 'zh', 'ru']
+const SUB_LANGS = [
+  'en',
+  'es',
+  'fr',
+  'de',
+  'ar',
+  'pt',
+  'ru',
+  'zh',
+  'ja',
+  'ko',
+  'hi',
+  'it',
+  'tr',
+  'pl',
+  'he',
+  'nl',
+  'uk',
+  'id',
+  'vi',
+  'th',
+  'sv',
+  'ro',
+  'cs',
+  'hu',
+  'el'
+]
+
+const SUB_LANG_LABELS: Record<string, string> = {
+  en: 'English',
+  es: 'Spanish',
+  fr: 'French',
+  de: 'German',
+  ar: 'Arabic',
+  pt: 'Portuguese',
+  ru: 'Russian',
+  zh: 'Chinese',
+  ja: 'Japanese',
+  ko: 'Korean',
+  hi: 'Hindi',
+  it: 'Italian',
+  tr: 'Turkish',
+  pl: 'Polish',
+  he: 'Hebrew',
+  nl: 'Dutch',
+  uk: 'Ukrainian',
+  id: 'Indonesian',
+  vi: 'Vietnamese',
+  th: 'Thai',
+  sv: 'Swedish',
+  ro: 'Romanian',
+  cs: 'Czech',
+  hu: 'Hungarian',
+  el: 'Greek'
+}
 
 function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`
@@ -340,14 +394,7 @@ export function SettingsPage(): JSX.Element {
                       onChange={(v) => set('defaultSubtitleLanguage', v)}
                       options={SUB_LANGS.map((l) => ({
                         value: l,
-                        label:
-                          l === 'ar'
-                            ? 'Arabic (ar)'
-                            : l === 'en'
-                              ? 'English (en)'
-                              : l === 'pl'
-                                ? 'Polish (pl)'
-                                : l.toUpperCase()
+                        label: `${SUB_LANG_LABELS[l] || l.toUpperCase()} (${l})`
                       }))}
                     />
                   </Field>
