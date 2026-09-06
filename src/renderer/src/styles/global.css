@@ -5187,12 +5187,12 @@ html.player-open .app-shell {
   width: 100%;
   height: 4px;
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.2);
+  background: rgba(255, 255, 255, 0.15);
   overflow: visible;
   transition: height 0.15s ease;
 }
 .timeline-wrap:hover .timeline-track {
-  height: 8px;
+  height: 6px;
 }
 .timeline-download {
   position: absolute;
@@ -5200,8 +5200,11 @@ html.player-open .app-shell {
   bottom: 0;
   z-index: 1;
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.42);
+  background: rgba(255, 255, 255, 0.35);
   pointer-events: none;
+}
+.timeline-download--youtube {
+  left: 0;
 }
 .timeline-progress {
   position: absolute;
@@ -5222,14 +5225,16 @@ html.player-open .app-shell {
   margin-left: -7px;
   border-radius: 50%;
   background: #fff;
-  transform: translateY(-50%);
+  transform: translateY(-50%) scale(0.85);
   box-shadow: 0 0 0 2px #22d3ee, 0 0 10px rgba(34, 211, 238, 0.45);
   pointer-events: none;
+  transition: transform 0.15s ease, width 0.15s ease, height 0.15s ease;
 }
 .timeline-wrap:hover .timeline-thumb {
   width: 16px;
   height: 16px;
   margin-left: -8px;
+  transform: translateY(-50%) scale(1);
 }
 .scrub-preview {
   position: absolute;

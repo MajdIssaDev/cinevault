@@ -58,6 +58,13 @@ import {
   checkIsFinished,
   releaseVideoElement
 } from '../lib/playbackCompletion'
+import {
+  PlayerProgressBar,
+  computeBufferedPercent,
+  formatTimestamp,
+  resolveTrueDuration,
+  type BufferRange
+} from '../components/PlayerProgressBar'
 
 const ICON = { size: 20, strokeWidth: 1.75 } as const
 
@@ -255,8 +262,6 @@ function torrentPriorityDuration(video: HTMLVideoElement | null, fallback = 0): 
   return fallback > 1 ? fallback : 0
 }
 
-type BufferRange = { start: number; end: number }
-
 function readBufferedRanges(video: HTMLVideoElement | null): BufferRange[] {
   if (!video) return []
   const ranges: BufferRange[] = []
@@ -354,7 +359,6 @@ export function PlayerPage(): JSX.Element {
     progress?: number
     contiguousForwardBytes?: number
   } | null>(null)
-  const [bufferPct, setBufferPct] = useState(0)
   const [bufferedRanges, setBufferedRanges] = useState<BufferRange[]>([])
   const [videoWidth, setVideoWidth] = useState(0)
   const [videoHeight, setVideoHeight] = useState(0)
@@ -400,12 +404,16 @@ export function PlayerPage(): JSX.Element {
   const codecHint = playbackWarning(session.source.label || session.title)
   const hevcBlocked = isHevcRelease(session.source.label || session.title) && videoWidth === 0
 
-  const metadataDuration =
-    (session.runtimeSeconds && session.runtimeSeconds > 0 ? session.runtimeSeconds : 0) || 0
-
-  /** Prefer catalog runtime; never trust tiny/fragment remux durations for the scrubber. */
+  /** TMDB / catalog runtime wins for the scrubber; HTML5 duration is fallback only. */
+  const trueDuration = resolveTrueDuration(
+    session.runtimeSeconds,
+    Number.isFinite(duration) && duration > 0 && duration !== Number.POSITIVE_INFINITY
+      ? duration
+      : durationRef.current || 0
+  )
+  /** Keep a max() hint for completion / up-next when both sources exist. */
   const totalDurationSeconds = Math.max(
-    metadataDuration,
+    trueDuration,
     Number.isFinite(duration) && duration > 0 && duration !== Number.POSITIVE_INFINITY
       ? duration
       : 0,
@@ -590,11 +598,12 @@ export function PlayerPage(): JSX.Element {
   }
 
   useEffect(() => {
-    if (metadataDuration > 0) {
-      setDuration((prev) => Math.max(prev, metadataDuration))
-      durationRef.current = Math.max(durationRef.current, metadataDuration)
+    const meta = session.runtimeSeconds || 0
+    if (meta > 0) {
+      setDuration((prev) => Math.max(prev, meta))
+      durationRef.current = Math.max(durationRef.current, meta)
     }
-  }, [session.cacheId, metadataDuration])
+  }, [session.cacheId, session.runtimeSeconds])
 
   const wallClockTime = (videoTime: number): number => remuxOriginRef.current + videoTime
 
@@ -1019,17 +1028,12 @@ export function PlayerPage(): JSX.Element {
 
     const refreshBuffer = (force = false): void => {
       const fwd = calculateForwardBuffer(video)
-      const mediaDur = torrentPriorityDuration(video, duration || durationRef.current || 0)
+      const mediaDur = resolveTrueDuration(
+        session.runtimeSeconds,
+        torrentPriorityDuration(video, duration || durationRef.current || 0)
+      )
       const ranges = readBufferedRanges(video)
-      let end = video.currentTime
-      for (const r of ranges) {
-        if (video.currentTime >= r.start && video.currentTime <= r.end) {
-          end = r.end
-          break
-        }
-      }
-      // Legacy single % is only used as a non-torrent fallback fill.
-      const pct = mediaDur > 0 ? Math.min(100, (end / mediaDur) * 100) : 0
+      const pct = computeBufferedPercent(mediaDur, video.currentTime, ranges, null)
       const rangesKey = ranges.map((r) => `${r.start.toFixed(2)}-${r.end.toFixed(2)}`).join('|')
       const prev = bufferUiRef.current
       if (
@@ -1044,7 +1048,6 @@ export function PlayerPage(): JSX.Element {
       bufferUiRef.current = { pct, fwdPct: fwd.pct, fwdSec: fwd.forwardSec, rangesKey }
       setForwardBufferPct(fwd.pct)
       setForwardBufferSec(fwd.forwardSec)
-      setBufferPct(pct)
       setBufferedRanges(ranges)
     }
 
@@ -1086,9 +1089,10 @@ export function PlayerPage(): JSX.Element {
       const d = video.duration
       if (useAudioRemux) {
         // Fragmented remux streams often report remaining length or Infinity — prefer metadata.
-        if (metadataDuration > 0) {
-          setDuration(metadataDuration)
-          durationRef.current = metadataDuration
+        const meta = session.runtimeSeconds || 0
+        if (meta > 0) {
+          setDuration(meta)
+          durationRef.current = meta
         } else if (Number.isFinite(d) && d > 0 && d !== Number.POSITIVE_INFINITY) {
           const absolute = d + remuxOriginRef.current
           setDuration((prev) => Math.max(prev, absolute))
@@ -2031,8 +2035,10 @@ export function PlayerPage(): JSX.Element {
     const video = videoRef.current
     if (!video) return
     const fwd = calculateForwardBuffer(video)
-    const mediaDur = torrentPriorityDuration(video, durationRef.current || duration || 0)
-    const maxT = mediaDur > 1 ? Math.max(0, mediaDur - 0.35) : t
+    // Byte-map with real container duration; clamp UI seeks to the scrubber runtime.
+    const mapDur = torrentPriorityDuration(video, durationRef.current || duration || 0)
+    const scrubDur = trueDuration > 1 ? trueDuration : mapDur
+    const maxT = scrubDur > 1 ? Math.max(0, scrubDur - 0.35) : t
     const target = Math.max(0, Math.min(t, maxT))
 
     if (useAudioRemux) {
@@ -2060,7 +2066,7 @@ export function PlayerPage(): JSX.Element {
       void window.cinevault?.torrent.prioritize({
         id: session.cacheId,
         currentTime: target,
-        duration: torrentPriorityDuration(video, mediaDur),
+        duration: torrentPriorityDuration(video, mapDur),
         invalidate: true
       })
     }
@@ -2072,7 +2078,7 @@ export function PlayerPage(): JSX.Element {
       void window.cinevault?.torrent.prioritize({
         id: session.cacheId,
         currentTime: target,
-        duration: torrentPriorityDuration(video, mediaDur)
+        duration: torrentPriorityDuration(video, mapDur)
       })
     }
     bumpChrome()
@@ -2222,10 +2228,8 @@ export function PlayerPage(): JSX.Element {
 
   const onTimelineHover = (e: MouseEvent<HTMLDivElement>): void => {
     if (scrubbingRef.current) return
-    const ratio = ratioFromEvent(e, e.currentTarget)
-    const mediaDur =
-      torrentPriorityDuration(videoRef.current, 0) || totalDurationSeconds || 0
-    const t = ratio * mediaDur
+    const mediaDur = trueDuration
+    const t = ratioFromEvent(e, e.currentTarget) * mediaDur
     setScrub({ x: e.clientX - e.currentTarget.getBoundingClientRect().left, t, visible: true })
 
     // Torrent streams can't afford a second <video> fighting for range pipes.
@@ -2257,8 +2261,7 @@ export function PlayerPage(): JSX.Element {
   }
 
   const previewTimelineAt = (el: HTMLElement, clientX: number): number => {
-    const mediaDur =
-      torrentPriorityDuration(videoRef.current, 0) || totalDurationSeconds || 0
+    const mediaDur = trueDuration
     const t = ratioFromEvent({ clientX }, el) * mediaDur
     const rect = el.getBoundingClientRect()
     setScrub({
@@ -2292,8 +2295,7 @@ export function PlayerPage(): JSX.Element {
     } catch {
       /* ignore */
     }
-    const mediaDur =
-      torrentPriorityDuration(videoRef.current, 0) || totalDurationSeconds || 0
+    const mediaDur = trueDuration
     const t =
       scrubTimeRef.current != null
         ? scrubTimeRef.current
@@ -2315,33 +2317,16 @@ export function PlayerPage(): JSX.Element {
     return '—'
   })()
 
-  const timelineDuration =
-    torrentPriorityDuration(videoRef.current, 0) || totalDurationSeconds || 0
+  const timelineDuration = trueDuration
   const displayTime = scrubTime != null ? scrubTime : currentPlaybackTime
-  const progressPct =
-    timelineDuration > 0
-      ? Math.min(100, (displayTime / timelineDuration) * 100)
-      : 0
-  // Timeline "ready" fill must mirror real HTML5 buffered ranges — never global torrent %.
-  // (Global progress painted from the left after a mid-file seek looks fully streamable but isn't.)
-  const downloadSegments =
-    timelineDuration > 0
-      ? bufferedRanges
-          // Torrents: only paint ranges near the playhead. Distant HTML5 ranges often
-          // outlive rolling-cache pieces and look "ready" when they are not.
-          .filter((r) => {
-            if (session.source.kind !== 'torrent') return true
-            const t = currentPlaybackTime
-            return r.end >= t - 2 && r.start <= t + Math.max(forwardBufferSec, 30) + 5
-          })
-          .map((r) => ({
-            left: Math.max(0, Math.min(100, (r.start / timelineDuration) * 100)),
-            width: Math.max(
-              0,
-              Math.min(100, ((r.end - r.start) / timelineDuration) * 100)
-            )
-          }))
-      : []
+  const bufferedPercent = computeBufferedPercent(
+    timelineDuration,
+    currentPlaybackTime,
+    bufferedRanges,
+    session.source.kind === 'torrent' && dl?.total
+      ? (dl.received || 0) / Math.max(1, dl.total)
+      : dl?.progress ?? null
+  )
   // Prebuffer orbit: once media is attached, HTML5 buffer is often still 0 while the
   // torrent is filling sequential pieces — use the better of HTML5 seconds vs contig bytes.
   const htmlPrebufferPct = Math.min(
@@ -2795,20 +2780,14 @@ export function PlayerPage(): JSX.Element {
           {scrub.visible && (
             <div className="scrub-preview" style={{ left: scrub.x }}>
               <canvas ref={canvasRef} width={160} height={90} />
-              <div className="t">{formatTime(scrub.t)}</div>
+              <div className="t">{formatTimestamp(scrub.t)}</div>
             </div>
           )}
-          <div className="timeline-track">
-            {downloadSegments.map((seg, i) => (
-              <div
-                key={i}
-                className="timeline-download"
-                style={{ left: `${seg.left}%`, width: `${seg.width}%` }}
-              />
-            ))}
-            <div className="timeline-progress" style={{ width: `${progressPct}%` }} />
-            <div className="timeline-thumb" style={{ left: `${progressPct}%` }} />
-          </div>
+          <PlayerProgressBar
+            trueDuration={timelineDuration}
+            currentTime={displayTime}
+            bufferedPercent={bufferedPercent}
+          />
         </div>
         <div className="controls-row">
           <Tooltip content="Rewind 10 seconds" shortcut="J / ←">
@@ -2868,9 +2847,10 @@ export function PlayerPage(): JSX.Element {
             </button>
           </Tooltip>
           <span className="player-time">
-            {formatTime(displayTime)} / {formatTime(timelineDuration)}
+            {formatTimestamp(displayTime)} / {formatTimestamp(timelineDuration)}
             <span className="player-time-remain">
-              · −{formatTime(Math.max(0, timelineDuration - currentPlaybackTime))}
+              {' '}
+              (−{formatTimestamp(Math.max(0, timelineDuration - displayTime))})
             </span>
           </span>
           <Tooltip content={muted ? 'Unmute' : 'Mute'} shortcut="M">
