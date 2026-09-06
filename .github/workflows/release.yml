@@ -28,11 +28,13 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
 
       - name: Install
-        run: npm ci
+        # Skip postinstall rebuild — CI runners lack VS Build Tools for bufferutil/utp-native.
+        # package.json build.npmRebuild is already false; prebuilds ship with the packages.
+        run: npm ci --ignore-scripts
 
       - name: Build & publish Windows installer
         env:
