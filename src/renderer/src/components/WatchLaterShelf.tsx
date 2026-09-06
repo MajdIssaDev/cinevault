@@ -1,7 +1,6 @@
 import { useNavigate } from 'react-router-dom'
-import { BookmarkPlus, ChevronLeft, ChevronRight, Clock, X } from 'lucide-react'
-import { AnimatePresence, motion } from 'framer-motion'
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { BookmarkPlus, Clock } from 'lucide-react'
+import { useState } from 'react'
 import { useWatchLater } from '../hooks/useWatchLater'
 import {
   fromWatchLaterType,
@@ -10,8 +9,10 @@ import {
 } from '../services/watchLaterService'
 import { PosterRatingBadge } from './PosterRatingBadge'
 import { resolveGenre } from '../lib/genres'
+import { HoverScrollTitle } from './HoverScrollTitle'
+import { HScrollRail } from './HScrollRail'
+import { detailPathForItem } from '../lib/detailPath'
 
-const SCROLL_STEP = 160
 const PLACEHOLDER_SLOTS = 4
 
 function WatchLaterCard({
@@ -23,6 +24,7 @@ function WatchLaterCard({
   onRemove: (id: string | number) => void
   onOpen: () => void
 }): JSX.Element {
+  const [isHovered, setIsHovered] = useState(false)
   const year = item.releaseYear || '—'
   const subLabel = resolveGenre({
     genre: item.genre,
@@ -30,7 +32,11 @@ function WatchLaterCard({
   })
 
   return (
-    <article className="watch-later-card">
+    <article
+      className="watch-later-card group"
+      onMouseEnter={() => setIsHovered(true)}
+      onMouseLeave={() => setIsHovered(false)}
+    >
       <button type="button" className="watch-later-card-main" onClick={onOpen}>
         <div className="watch-later-card-media">
           {item.posterPath ? (
@@ -38,13 +44,14 @@ function WatchLaterCard({
           ) : (
             <div className="watch-later-card-empty">{item.title}</div>
           )}
-          <PosterRatingBadge rating={item.voteAverage} />
           <div className="watch-later-card-scrim" />
         </div>
         <div className="watch-later-card-meta">
-          <div className="watch-later-card-title" title={item.title}>
-            {item.title}
-          </div>
+          <HoverScrollTitle
+            title={item.title}
+            className="watch-later-card-title"
+            active={isHovered}
+          />
           <div className="watch-later-card-sub">
             <span>{year}</span>
             {subLabel ? (
@@ -58,19 +65,7 @@ function WatchLaterCard({
           </div>
         </div>
       </button>
-      <button
-        type="button"
-        className="watch-later-remove"
-        title="Remove from list"
-        aria-label="Remove item"
-        onClick={(e) => {
-          e.preventDefault()
-          e.stopPropagation()
-          onRemove(item.id)
-        }}
-      >
-        <X size={14} strokeWidth={2.5} />
-      </button>
+      <PosterRatingBadge rating={item.voteAverage} onDismiss={() => onRemove(item.id)} />
     </article>
   )
 }
@@ -89,6 +84,17 @@ function WatchLaterPlaceholder({ onActivate }: { onActivate: () => void }): JSX.
   )
 }
 
+function watchLaterDetailPath(item: WatchLaterItem): string {
+  const appType = fromWatchLaterType(item.mediaType)
+  const raw = String(item.id)
+  const externalId = Number(raw.replace(/^(tmdb-)?(movie|series|anime)-/, ''))
+  return detailPathForItem({
+    mediaType: appType,
+    externalId: Number.isFinite(externalId) ? externalId : 0,
+    provider: item.provider === 'tmdb' ? 'tmdb' : undefined
+  })
+}
+
 export function WatchLaterShelf({
   mediaType
 }: {
@@ -96,38 +102,6 @@ export function WatchLaterShelf({
 }): JSX.Element | null {
   const navigate = useNavigate()
   const { watchLaterItems, remove } = useWatchLater(mediaType)
-  const trackRef = useRef<HTMLDivElement>(null)
-  const [canLeft, setCanLeft] = useState(false)
-  const [canRight, setCanRight] = useState(false)
-
-  const updateEdges = useCallback((): void => {
-    const el = trackRef.current
-    if (!el) {
-      setCanLeft(false)
-      setCanRight(false)
-      return
-    }
-    const { scrollLeft, clientWidth, scrollWidth } = el
-    setCanLeft(scrollLeft > 8)
-    setCanRight(scrollLeft < scrollWidth - clientWidth - 8)
-  }, [])
-
-  useEffect(() => {
-    const el = trackRef.current
-    if (!el) return
-    updateEdges()
-    el.addEventListener('scroll', updateEdges, { passive: true })
-    const ro = new ResizeObserver(updateEdges)
-    ro.observe(el)
-    return () => {
-      el.removeEventListener('scroll', updateEdges)
-      ro.disconnect()
-    }
-  }, [updateEdges, watchLaterItems.length])
-
-  const scrollBy = (dir: -1 | 1): void => {
-    trackRef.current?.scrollBy({ left: dir * SCROLL_STEP, behavior: 'smooth' })
-  }
 
   const focusCatalog = (): void => {
     document.querySelector<HTMLElement>('.catalog-toolbar .catalog-search')?.focus()
@@ -137,114 +111,40 @@ export function WatchLaterShelf({
   const sparse = watchLaterItems.length > 0 && watchLaterItems.length < PLACEHOLDER_SLOTS
   const placeholderCount = sparse ? Math.max(0, PLACEHOLDER_SLOTS - watchLaterItems.length) : 0
 
-  return (
-    <AnimatePresence initial={false}>
-      {watchLaterItems.length > 0 && (
-        <motion.section
-          key="watch-later-shelf"
-          className="watch-later-shelf catalog-shelf watch-later-shelf-anim"
-          aria-label="Watch Later"
-          initial={{ opacity: 0, height: 0, marginBottom: 0 }}
-          animate={{ opacity: 1, height: 'auto', marginBottom: 0 }}
-          exit={{
-            opacity: 0,
-            height: 0,
-            marginBottom: 0,
-            transition: { duration: 0.3, ease: 'easeInOut' }
-          }}
-          style={{ overflow: 'hidden' }}
-        >
-          <div className="catalog-shelf-head watch-later-head">
-            <div className="catalog-shelf-title-row">
-              <Clock
-                size={14}
-                strokeWidth={1.75}
-                className="watch-later-title-icon"
-                aria-hidden
-              />
-              <h2 className="catalog-shelf-title">Watch Later</h2>
-              <span className="watch-later-count">{watchLaterItems.length}</span>
-            </div>
-            <div className="watch-later-chevrons">
-              <button
-                type="button"
-                className="watch-later-chevron"
-                aria-label="Scroll left"
-                disabled={!canLeft}
-                onClick={() => scrollBy(-1)}
-              >
-                <ChevronLeft size={16} strokeWidth={1.75} />
-              </button>
-              <button
-                type="button"
-                className="watch-later-chevron"
-                aria-label="Scroll right"
-                disabled={!canRight}
-                onClick={() => scrollBy(1)}
-              >
-                <ChevronRight size={16} strokeWidth={1.75} />
-              </button>
-            </div>
-          </div>
+  return watchLaterItems.length > 0 ? (
+    <section className="watch-later-shelf catalog-shelf" aria-label="Watch Later">
+      <div className="catalog-shelf-head">
+        <div className="catalog-shelf-title-row">
+          <Clock
+            size={14}
+            strokeWidth={1.75}
+            className="watch-later-title-icon"
+            aria-hidden
+          />
+          <h2 className="catalog-shelf-title">Watch Later</h2>
+          <span className="watch-later-count">{watchLaterItems.length}</span>
+        </div>
+      </div>
 
-          <div className="watch-later-track-wrap">
-            <div ref={trackRef} className="watch-later-track catalog-shelf-track">
-              <AnimatePresence mode="popLayout" initial={false}>
-                {watchLaterItems.map((item) => {
-                  const appType = fromWatchLaterType(item.mediaType)
-                  const externalId = String(item.id).replace(/^(movie|series|anime)-/, '')
-                  return (
-                    <motion.div
-                      key={String(item.id)}
-                      layout
-                      initial={{ opacity: 0, width: 0, scale: 0.9 }}
-                      animate={{
-                        opacity: 1,
-                        width: 'auto',
-                        scale: 1,
-                        transition: {
-                          width: { duration: 0.25, ease: 'easeOut' },
-                          opacity: { duration: 0.2, delay: 0.1 },
-                          scale: { duration: 0.25 }
-                        }
-                      }}
-                      exit={{
-                        opacity: 0,
-                        width: 0,
-                        scale: 0.85,
-                        transition: {
-                          opacity: { duration: 0.15 },
-                          width: { duration: 0.25, delay: 0.1, ease: 'easeInOut' },
-                          scale: { duration: 0.2 }
-                        }
-                      }}
-                      className="watch-later-card-motion"
-                    >
-                      <WatchLaterCard
-                        item={item}
-                        onRemove={remove}
-                        onOpen={() => navigate(`/detail/${appType}/${externalId}`)}
-                      />
-                    </motion.div>
-                  )
-                })}
-                {Array.from({ length: placeholderCount }).map((_, i) => (
-                  <motion.div
-                    key={`placeholder-${i}`}
-                    layout
-                    initial={{ opacity: 0, scale: 0.95 }}
-                    animate={{ opacity: 1, scale: 1 }}
-                    exit={{ opacity: 0, scale: 0.95 }}
-                    className="watch-later-card-motion watch-later-placeholder-motion"
-                  >
-                    <WatchLaterPlaceholder onActivate={focusCatalog} />
-                  </motion.div>
-                ))}
-              </AnimatePresence>
-            </div>
+      <HScrollRail trackClassName="catalog-shelf-track watch-later-track">
+        {watchLaterItems.map((item) => (
+          <div key={String(item.id)} className="shelf-card-slot watch-later-card-motion">
+            <WatchLaterCard
+              item={item}
+              onRemove={remove}
+              onOpen={() => navigate(watchLaterDetailPath(item))}
+            />
           </div>
-        </motion.section>
-      )}
-    </AnimatePresence>
-  )
+        ))}
+        {Array.from({ length: placeholderCount }).map((_, i) => (
+          <div
+            key={`placeholder-${i}`}
+            className="shelf-card-slot watch-later-card-motion watch-later-placeholder-motion"
+          >
+            <WatchLaterPlaceholder onActivate={focusCatalog} />
+          </div>
+        ))}
+      </HScrollRail>
+    </section>
+  ) : null
 }

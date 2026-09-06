@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import Hls from 'hls.js'
 import type { PlaybackSession } from '../types'
+import { Tooltip } from '../components/ui/Tooltip'
 
 export function PipPage(): JSX.Element {
   const videoRef = useRef<HTMLVideoElement>(null)
@@ -47,28 +48,29 @@ export function PipPage(): JSX.Element {
         >
           ▶/❚❚
         </button>
-        <button
-          className="icon-btn"
-          type="button"
-          title="Return to app"
-          onClick={() => {
-            const v = videoRef.current
-            if (session && v) {
-              localStorage.setItem(
-                'cinevault-pip',
-                JSON.stringify({ ...session, resumeSeconds: v.currentTime })
-              )
-              // Persist for main window resume chip via storage event
-              localStorage.setItem(
-                'cinevault-resume',
-                JSON.stringify({ ...session, resumeSeconds: v.currentTime })
-              )
-            }
-            void window.cinevault?.pip.close()
-          }}
-        >
-          ↗ App
-        </button>
+        <Tooltip content="Return to app">
+          <button
+            className="icon-btn"
+            type="button"
+            onClick={() => {
+              const v = videoRef.current
+              if (session && v) {
+                localStorage.setItem(
+                  'cinevault-pip',
+                  JSON.stringify({ ...session, resumeSeconds: v.currentTime })
+                )
+                // Persist for main window resume chip via storage event
+                localStorage.setItem(
+                  'cinevault-resume',
+                  JSON.stringify({ ...session, resumeSeconds: v.currentTime })
+                )
+              }
+              void window.cinevault?.pip.close()
+            }}
+          >
+            ↗ App
+          </button>
+        </Tooltip>
         <button className="icon-btn" type="button" onClick={() => void window.cinevault?.pip.close()}>
           ×
         </button>

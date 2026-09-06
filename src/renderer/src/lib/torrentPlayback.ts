@@ -107,49 +107,121 @@ export async function startTorrentPlayback(opts: {
   preferredQuality?: Quality
   /** When set, keep only this title's new torrent and wipe prior downloads for it. */
   mediaId?: string
+  /** Cancel metadata fetch / start; stops the torrent and rejects with AbortError. */
+  signal?: AbortSignal
 }): Promise<StreamSource> {
   if (!window.cinevault?.torrent) {
     throw new Error('Torrent playback requires the desktop app')
   }
+
+  const abortError = (): Error => {
+    const err = new Error('Aborted')
+    err.name = 'AbortError'
+    return err
+  }
+
+  const throwIfAborted = (): void => {
+    if (opts.signal?.aborted) throw abortError()
+  }
+
+  const cleanupStarted = async (): Promise<void> => {
+    try {
+      await window.cinevault?.torrent?.stop(opts.cacheId, { destroyStore: true })
+    } catch {
+      /* best-effort */
+    }
+  }
+
+  throwIfAborted()
+
   const startPromise = window.cinevault.torrent.start({
     id: opts.cacheId,
     magnetUri: opts.magnetUri
   })
-  // Renderer-side guard so the Play button can't stick forever if IPC hangs.
-  const started = await Promise.race([
-    startPromise,
-    new Promise<never>((_, reject) => {
-      window.setTimeout(
-        () => reject(new Error('Torrent start timed out — try another source')),
-        35_000
+
+  try {
+    // Race start against timeout + user abort so Play can't stick forever.
+    const started = await new Promise<{
+      streamUrl: string
+      fileName: string
+      size: number
+    }>((resolve, reject) => {
+      let settled = false
+      const finish = (fn: () => void): void => {
+        if (settled) return
+        settled = true
+        fn()
+      }
+
+      const timer = window.setTimeout(() => {
+        finish(() => reject(new Error('Torrent start timed out — try another source')))
+      }, 35_000)
+
+      const onAbort = (): void => {
+        window.clearTimeout(timer)
+        finish(() => reject(abortError()))
+      }
+
+      if (opts.signal) {
+        if (opts.signal.aborted) {
+          onAbort()
+          return
+        }
+        opts.signal.addEventListener('abort', onAbort, { once: true })
+      }
+
+      startPromise.then(
+        (value) => {
+          window.clearTimeout(timer)
+          opts.signal?.removeEventListener('abort', onAbort)
+          finish(() => resolve(value))
+        },
+        (err) => {
+          window.clearTimeout(timer)
+          opts.signal?.removeEventListener('abort', onAbort)
+          finish(() => reject(err instanceof Error ? err : new Error(String(err))))
+        }
       )
     })
-  ])
 
-  // One torrent per title: remove prior downloads only after the new stream is ready.
-  if (opts.mediaId && window.cinevault.cache?.removeByMedia) {
-    await window.cinevault.cache.removeByMedia(opts.mediaId, { keepId: opts.cacheId })
-  }
+    throwIfAborted()
 
-  const hashMatch = opts.magnetUri.match(/xt=urn:btih:([a-fA-F0-9]{40}|[a-zA-Z2-7]{32})/i)
-  const infoHash = hashMatch?.[1]?.toLowerCase() || ''
-  if (opts.mediaId && infoHash && window.cinevault.torrent.prepareStream) {
-    await window.cinevault.torrent.prepareStream({
-      mediaId: opts.mediaId,
-      infoHash,
-      cacheId: opts.cacheId
-    })
-  }
+    // One torrent per title: remove prior downloads only after the new stream is ready.
+    if (opts.mediaId && window.cinevault.cache?.removeByMedia) {
+      await window.cinevault.cache.removeByMedia(opts.mediaId, { keepId: opts.cacheId })
+      throwIfAborted()
+    }
 
-  const quality = guessQualityFromName(opts.label)
-  return {
-    id: opts.cacheId,
-    label: opts.label || started.fileName,
-    quality: quality === 'unknown' ? opts.preferredQuality || 'unknown' : quality,
-    url: started.streamUrl,
-    kind: 'torrent',
-    hdr: /hdr|dv|dolby.?vision/i.test(opts.label),
-    spatialAudio: /atmos|truehd|dts.?x/i.test(opts.label),
-    needsAudioRemux: needsAudioRemux(opts.label || started.fileName || '')
+    const hashMatch = opts.magnetUri.match(/xt=urn:btih:([a-fA-F0-9]{40}|[a-zA-Z2-7]{32})/i)
+    const infoHash = hashMatch?.[1]?.toLowerCase() || ''
+    if (opts.mediaId && infoHash && window.cinevault.torrent.prepareStream) {
+      await window.cinevault.torrent.prepareStream({
+        mediaId: opts.mediaId,
+        infoHash,
+        cacheId: opts.cacheId
+      })
+      throwIfAborted()
+    }
+
+    const quality = guessQualityFromName(opts.label)
+    return {
+      id: opts.cacheId,
+      label: opts.label || started.fileName,
+      quality: quality === 'unknown' ? opts.preferredQuality || 'unknown' : quality,
+      url: started.streamUrl,
+      kind: 'torrent',
+      hdr: /hdr|dv|dolby.?vision/i.test(opts.label),
+      spatialAudio: /atmos|truehd|dts.?x/i.test(opts.label),
+      needsAudioRemux: needsAudioRemux(opts.label || started.fileName || '')
+    }
+  } catch (e) {
+    const aborted =
+      opts.signal?.aborted ||
+      (e instanceof Error && (e.name === 'AbortError' || e.message === 'Aborted'))
+    if (aborted) {
+      await cleanupStarted()
+      throw abortError()
+    }
+    throw e
   }
 }

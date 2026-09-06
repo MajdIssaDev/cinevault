@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom'
 import { Clapperboard, ExternalLink, X } from 'lucide-react'
 import type { TrailerInfo } from '../api/tmdb'
 import { openExternal } from '../lib/openExternal'
+import { Tooltip } from './ui/Tooltip'
 
 export function TrailerModal({
   trailer,
@@ -65,23 +66,26 @@ export function TrailerModal({
             <span>{trailer.name}</span>
           </div>
           <div className="trailer-modal-actions">
-            <button
-              type="button"
-              className="trailer-modal-btn"
-              onClick={() => void openExternal(trailer.youtubeUrl)}
-              title="Open in browser"
-            >
-              <ExternalLink size={15} strokeWidth={2} />
-              Open in Browser
-            </button>
-            <button
-              type="button"
-              className="trailer-modal-icon"
-              onClick={onClose}
-              aria-label="Close trailer"
-            >
-              <X size={18} strokeWidth={2} />
-            </button>
+            <Tooltip content="Open in browser">
+              <button
+                type="button"
+                className="trailer-modal-btn"
+                onClick={() => void openExternal(trailer.youtubeUrl)}
+              >
+                <ExternalLink size={15} strokeWidth={2} />
+                Open in Browser
+              </button>
+            </Tooltip>
+            <Tooltip content="Close">
+              <button
+                type="button"
+                className="trailer-modal-icon"
+                onClick={onClose}
+                aria-label="Close trailer"
+              >
+                <X size={18} strokeWidth={2} />
+              </button>
+            </Tooltip>
           </div>
         </header>
 

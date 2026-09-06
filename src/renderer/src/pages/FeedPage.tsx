@@ -10,9 +10,11 @@ import {
   sortTorrentResults,
   startTorrentPlayback
 } from '../lib/torrentPlayback'
+import { filterValidStreams } from '../lib/streamScorer'
 import { useAppStore } from '../store'
 import type { Quality } from '../types'
 import { ThemedSelect } from '../components/ThemedSelect'
+import { Tooltip } from '../components/ui/Tooltip'
 
 async function copyText(text: string): Promise<void> {
   if (navigator.clipboard?.writeText) {
@@ -67,7 +69,12 @@ export function FeedPage(): JSX.Element {
     setCopiedKey(null)
     setQualityFilter('all')
     try {
-      setResults(sortTorrentResults(await searchPublicIndexers(q), qualityPref))
+      setResults(
+        sortTorrentResults(
+          filterValidStreams(await searchPublicIndexers(q), { isMovieLike: true }),
+          qualityPref
+        )
+      )
     } catch (err) {
       setResults([])
       setError(err instanceof Error ? err.message : 'Search failed')
@@ -211,8 +218,10 @@ export function FeedPage(): JSX.Element {
                     const q = guessQualityFromName(item.name)
                     return (
                       <tr key={item.id}>
-                        <td className="title-cell" title={item.name}>
-                          {item.name}
+                        <td className="title-cell">
+                          <Tooltip content={item.name} className="mono-tooltip--fill">
+                            <span className="title-cell-text">{item.name}</span>
+                          </Tooltip>
                         </td>
                         <td className="quality-cell">
                           <span
@@ -229,14 +238,15 @@ export function FeedPage(): JSX.Element {
                         </td>
                         <td className="num">{formatFileSize(item.sizeBytes)}</td>
                         <td className="num">
-                          <span
-                            className="peer-badge"
-                            title={`${item.seeders} seeders · ${item.leechers} leechers`}
+                          <Tooltip
+                            content={`${item.seeders} seeders · ${item.leechers} leechers`}
                           >
-                            <span className="seed">{item.seeders}</span>
-                            <span className="sep">/</span>
-                            <span className="leech">{item.leechers}</span>
-                          </span>
+                            <span className="peer-badge">
+                              <span className="seed">{item.seeders}</span>
+                              <span className="sep">/</span>
+                              <span className="leech">{item.leechers}</span>
+                            </span>
+                          </Tooltip>
                         </td>
                         <td className="source-cell">
                           <span className="source-badge">{item.source}</span>

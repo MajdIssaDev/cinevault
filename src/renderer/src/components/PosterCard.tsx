@@ -9,10 +9,13 @@ import {
   subscribePlaybackHistory,
   type PlaybackProgress
 } from '../services/playbackHistoryService'
-import { useWatchLater } from '../hooks/useWatchLater'
+import { useWatchLaterFlag } from '../hooks/useWatchLaterFlag'
 import { catalogToWatchLaterItem } from '../services/watchLaterService'
+import { detailPathForItem } from '../lib/detailPath'
 import { PosterRatingBadge } from './PosterRatingBadge'
 import { resolveGenre } from '../lib/genres'
+import { HoverScrollTitle } from './HoverScrollTitle'
+import { Tooltip } from './ui/Tooltip'
 
 function looksLikeLandscapeArt(url: string | null): boolean {
   if (!url) return false
@@ -25,9 +28,9 @@ function PosterCardInner({ item }: { item: CatalogItem }): JSX.Element {
   const fav = useAppStore((s) =>
     s.favorites.some((f) => f.mediaType === item.mediaType && f.externalId === item.externalId)
   )
-  const { isSaved, toggle: toggleWatchLater } = useWatchLater()
-  const inWatchLater = isSaved(item.id)
+  const { saved: inWatchLater, toggle: toggleWatchLater } = useWatchLaterFlag(item.id)
   const [bump, setBump] = useState(false)
+  const [isHovered, setIsHovered] = useState(false)
   const [usePlaceholder, setUsePlaceholder] = useState(
     !item.posterUrl || looksLikeLandscapeArt(item.posterUrl)
   )
@@ -40,7 +43,19 @@ function PosterCardInner({ item }: { item: CatalogItem }): JSX.Element {
   }, [item.id, item.posterUrl])
 
   useEffect(() => {
-    const refresh = (): void => setProgress(getLatestProgressForTitle(item.id))
+    const refresh = (): void => {
+      const next = getLatestProgressForTitle(item.id)
+      setProgress((prev) => {
+        if (
+          prev?.percentage === next?.percentage &&
+          prev?.updatedAt === next?.updatedAt &&
+          prev?.currentTime === next?.currentTime
+        ) {
+          return prev
+        }
+        return next
+      })
+    }
     refresh()
     return subscribePlaybackHistory(refresh)
   }, [item.id])
@@ -50,11 +65,17 @@ function PosterCardInner({ item }: { item: CatalogItem }): JSX.Element {
   const pct = progress ? Math.min(100, Math.max(0, progress.percentage)) : 0
 
   const goDetail = (): void => {
-    navigate(`/detail/${item.mediaType}/${item.externalId}`)
+    const path = detailPathForItem(item)
+    navigate(path)
   }
 
   return (
-    <article className="poster-card" onClick={goDetail}>
+    <article
+      className="poster-card group"
+      onClick={goDetail}
+      onMouseEnter={() => setIsHovered(true)}
+      onMouseLeave={() => setIsHovered(false)}
+    >
       <div className="poster-card-media">
         {!usePlaceholder && item.posterUrl ? (
           <img
@@ -106,58 +127,62 @@ function PosterCardInner({ item }: { item: CatalogItem }): JSX.Element {
             </button>
           </>
         )}
-        <button
-          type="button"
-          className={`poster-watch-later${inWatchLater ? ' on' : ''}`}
-          title="Watch Later"
-          aria-pressed={inWatchLater}
-          onMouseDown={(e) => {
-            e.preventDefault()
-            e.stopPropagation()
-          }}
-          onClick={(e) => {
-            e.preventDefault()
-            e.stopPropagation()
-            toggleWatchLater(catalogToWatchLaterItem(item))
-          }}
-        >
-          <Clock size={15} strokeWidth={1.75} />
-        </button>
-        <button
-          type="button"
-          className={`fav${fav ? ' on' : ''}${bump ? ' bump' : ''}`}
-          title={fav ? 'Unfavorite' : 'Favorite'}
-          aria-pressed={fav}
-          onMouseDown={(e) => {
-            e.preventDefault()
-            e.stopPropagation()
-          }}
-          onClick={(e) => {
-            e.preventDefault()
-            e.stopPropagation()
-            setBump(true)
-            window.setTimeout(() => setBump(false), 280)
-            toggleFavorite({
-              id: item.id,
-              mediaType: item.mediaType,
-              externalId: item.externalId,
-              title: item.title,
-              posterUrl: item.posterUrl,
-              releaseDate: item.releaseDate
-            })
-          }}
-        >
-          {fav ? (
-            <Heart size={16} fill="currentColor" strokeWidth={0} />
-          ) : (
-            <Heart size={16} strokeWidth={1.75} />
-          )}
-        </button>
+        <Tooltip content={inWatchLater ? 'In Watch Later' : 'Watch Later'} className="poster-action-tip poster-action-tip-wl">
+          <button
+            type="button"
+            className={`poster-watch-later${inWatchLater ? ' on' : ''}`}
+            aria-pressed={inWatchLater}
+            onMouseDown={(e) => {
+              e.preventDefault()
+              e.stopPropagation()
+            }}
+            onClick={(e) => {
+              e.preventDefault()
+              e.stopPropagation()
+              toggleWatchLater(catalogToWatchLaterItem(item))
+            }}
+          >
+            <Clock size={15} strokeWidth={1.75} />
+          </button>
+        </Tooltip>
+        <Tooltip content={fav ? 'Unfavorite' : 'Favorite'} className="poster-action-tip poster-action-tip-fav">
+          <button
+            type="button"
+            className={`fav${fav ? ' on' : ''}${bump ? ' bump' : ''}`}
+            aria-pressed={fav}
+            onMouseDown={(e) => {
+              e.preventDefault()
+              e.stopPropagation()
+            }}
+            onClick={(e) => {
+              e.preventDefault()
+              e.stopPropagation()
+              setBump(true)
+              window.setTimeout(() => setBump(false), 280)
+              toggleFavorite({
+                id: item.id,
+                mediaType: item.mediaType,
+                externalId: item.externalId,
+                title: item.title,
+                posterUrl: item.posterUrl,
+                releaseDate: item.releaseDate
+              })
+            }}
+          >
+            {fav ? (
+              <Heart size={16} fill="currentColor" strokeWidth={0} />
+            ) : (
+              <Heart size={16} strokeWidth={1.75} />
+            )}
+          </button>
+        </Tooltip>
       </div>
       <div className="poster-card-meta">
-        <div className="poster-card-title" title={item.title}>
-          {item.title}
-        </div>
+        <HoverScrollTitle
+          title={item.title}
+          className="poster-card-title"
+          active={isHovered}
+        />
         <div className="poster-card-sub">
           <span className="poster-card-year">{year}</span>
           {subLabel ? (

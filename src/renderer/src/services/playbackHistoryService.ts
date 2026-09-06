@@ -15,6 +15,8 @@ export interface PlaybackProgress {
   mediaId: string
   mediaType: MediaType
   externalId: number
+  /** Catalog provider used when progress was saved — needed for TMDB detail routes. */
+  provider?: 'yts' | 'tvmaze' | 'anilist' | 'tmdb'
   title: string
   posterPath?: string
   backdropPath?: string

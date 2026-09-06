@@ -27,7 +27,8 @@ import {
   resolveSubtitleTrack,
   type UnifiedSubtitle
 } from '../services/subtitleService'
-import { ThemedSelect } from '../components/ThemedSelect'
+import { SelectMenu } from '../components/ui/SelectMenu'
+import { Tooltip } from '../components/ui/Tooltip'
 import {
   COMPLETE_AT,
   flushProgress,
@@ -36,6 +37,11 @@ import {
   saveProgress,
   type PlaybackProgress
 } from '../services/playbackHistoryService'
+import {
+  LocalAffinityEngine,
+  genreNamesToIds,
+  toAffinityType
+} from '../services/recommendationEngine'
 import { resolveNextEpisode, type NextEpisodeTarget } from '../lib/nextEpisode'
 import {
   buildCatalogSearchQuery,
@@ -44,7 +50,7 @@ import {
 } from '../lib/torrentPlayback'
 import { useAniSkip, isInSkipWindow } from '../hooks/useAniSkip'
 import { useAudioEnhancer } from '../hooks/useAudioEnhancer'
-import { getBestStream } from '../lib/streamScorer'
+import { filterValidStreams, getBestStream } from '../lib/streamScorer'
 import { searchPublicIndexers } from '../services/publicSearchService'
 import { isBrowserPreferredVideo, parseTorrentVideo } from '../lib/torrentParser'
 import { buildAudioRemuxUrl, needsAudioRemux } from '../lib/audioRemux'
@@ -116,7 +122,7 @@ function SeekGlyph({ dir }: { dir: 'back' | 'forward' }): JSX.Element {
   const Icon = dir === 'back' ? RotateCcw : RotateCw
   return (
     <span className="seek-glyph" aria-hidden>
-      <Icon {...ICON} />
+      <Icon size={28} strokeWidth={1.75} />
       <span className="seek-glyph-num">10</span>
     </span>
   )
@@ -192,23 +198,76 @@ function calculateForwardBuffer(
 
 function isReadyToPlay(
   video: HTMLVideoElement | null,
-  streamStats: { contiguousForwardBytes?: number; done?: boolean } | null
+  streamStats: { contiguousForwardBytes?: number; done?: boolean; total?: number } | null,
+  durationHint = 0
 ): boolean {
   if (streamStats?.done) return true
+  const t = video?.currentTime || 0
+  const vd = video?.duration
+  const dur =
+    typeof vd === 'number' && Number.isFinite(vd) && vd > 1 && vd !== Number.POSITIVE_INFINITY
+      ? vd
+      : durationHint > 1
+        ? durationHint
+        : 0
+  const remaining = dur > 1 ? Math.max(0, dur - t) : Number.POSITIVE_INFINITY
+  // Near EOF we cannot wait for a full 10s / 35MB window.
+  const needSec = Number.isFinite(remaining)
+    ? Math.min(PREBUFFER_SECONDS, Math.max(0.25, remaining * 0.85))
+    : PREBUFFER_SECONDS
+
   if (video) {
     try {
       for (let i = 0; i < video.buffered.length; i++) {
         const start = video.buffered.start(i)
         const end = video.buffered.end(i)
-        if (video.currentTime >= start && video.currentTime <= end) {
-          if (end - video.currentTime >= PREBUFFER_SECONDS) return true
+        if (t >= start && t <= end) {
+          if (end - t >= needSec) return true
         }
       }
     } catch {
       /* ignore */
     }
   }
-  return (streamStats?.contiguousForwardBytes || 0) >= PREBUFFER_BYTES
+
+  const contig = streamStats?.contiguousForwardBytes || 0
+  if (Number.isFinite(remaining) && remaining <= PREBUFFER_SECONDS + 1) {
+    const total = streamStats?.total || 0
+    const needBytes =
+      total > 0 && dur > 1
+        ? Math.min(
+            PREBUFFER_BYTES,
+            Math.max(32 * 1024, Math.ceil((remaining / dur) * total) + 64 * 1024)
+          )
+        : Math.min(PREBUFFER_BYTES, 2 * 1024 * 1024)
+    if (contig >= needBytes) return true
+    if (remaining < 1.25 && contig > 0) return true
+  }
+  return contig >= PREBUFFER_BYTES
+}
+
+/** Duration for torrent byte↔time mapping — never use inflated catalog runtimes. */
+function torrentPriorityDuration(video: HTMLVideoElement | null, fallback = 0): number {
+  const vd = video?.duration
+  if (typeof vd === 'number' && Number.isFinite(vd) && vd > 1 && vd !== Number.POSITIVE_INFINITY) {
+    return vd
+  }
+  return fallback > 1 ? fallback : 0
+}
+
+type BufferRange = { start: number; end: number }
+
+function readBufferedRanges(video: HTMLVideoElement | null): BufferRange[] {
+  if (!video) return []
+  const ranges: BufferRange[] = []
+  try {
+    for (let i = 0; i < video.buffered.length; i++) {
+      ranges.push({ start: video.buffered.start(i), end: video.buffered.end(i) })
+    }
+  } catch {
+    /* ignore */
+  }
+  return ranges
 }
 
 function isHevcRelease(label: string): boolean {
@@ -250,6 +309,8 @@ export function PlayerPage(): JSX.Element {
     Map<string, { delay?: ReturnType<typeof setTimeout>; interval?: ReturnType<typeof setInterval> }>
   >(new Map())
   const durationRef = useRef(0)
+  const currentRef = useRef(0)
+  const bufferUiRef = useRef({ pct: 0, fwdPct: 0, fwdSec: 0, rangesKey: '' })
   const seekFlashTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const subToastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const subOffsetMsRef = useRef(0)
@@ -280,6 +341,10 @@ export function PlayerPage(): JSX.Element {
     t: 0,
     visible: false
   })
+  /** While dragging the timeline, show this time without committing a network seek. */
+  const [scrubTime, setScrubTime] = useState<number | null>(null)
+  const scrubbingRef = useRef(false)
+  const scrubTimeRef = useRef<number | null>(null)
   const [dl, setDl] = useState<{
     speed: number
     received: number
@@ -290,6 +355,7 @@ export function PlayerPage(): JSX.Element {
     contiguousForwardBytes?: number
   } | null>(null)
   const [bufferPct, setBufferPct] = useState(0)
+  const [bufferedRanges, setBufferedRanges] = useState<BufferRange[]>([])
   const [videoWidth, setVideoWidth] = useState(0)
   const [videoHeight, setVideoHeight] = useState(0)
   const [fullscreen, setFullscreen] = useState(false)
@@ -507,7 +573,7 @@ export function PlayerPage(): JSX.Element {
     if (
       session.source.kind === 'torrent' &&
       needsContiguousBufferRef.current &&
-      !isReadyToPlay(video, dl)
+      !isReadyToPlay(video, dl, durationRef.current)
     ) {
       setBuffering(true)
       return
@@ -552,8 +618,8 @@ export function PlayerPage(): JSX.Element {
     setProxyOffset(origin)
 
     video.src = playUrl
-    // Scrub preview uses the raw stream when possible (byte-range friendly).
-    if (scrubVideoRef.current) scrubVideoRef.current.src = src
+    // Scrub preview binds lazily on first timeline hover — a second <video> on the
+    // same torrent URL probes mid/end ranges and used to yank piece priority.
     setMediaAttached(true)
 
     const onMeta = (): void => {
@@ -566,6 +632,14 @@ export function PlayerPage(): JSX.Element {
     video.addEventListener('canplay', resumeIfWanted)
     video.addEventListener('canplaythrough', resumeIfWanted)
     video.addEventListener('loadeddata', () => tryStartPlayback(), { once: true })
+
+    if (session.source.kind === 'torrent') {
+      void window.cinevault?.torrent.prioritize({
+        id: session.cacheId,
+        currentTime: remuxing ? 0 : Math.max(0, resumeAt),
+        duration: torrentPriorityDuration(video)
+      })
+    }
   }
 
   /** Re-pipe FFmpeg from a new absolute timestamp (fragmented remux has no byte-range seek). */
@@ -600,7 +674,8 @@ export function PlayerPage(): JSX.Element {
       void window.cinevault?.torrent.prioritize({
         id: session.cacheId,
         currentTime: target,
-        duration: Math.max(durationRef.current, metadataDuration, totalDurationSeconds) || 0
+        duration: torrentPriorityDuration(video, durationRef.current),
+        invalidate: true
       })
     }
     bumpChrome()
@@ -673,7 +748,7 @@ export function PlayerPage(): JSX.Element {
     setForwardBufferPct(fwd.pct)
     setForwardBufferSec(fwd.forwardSec)
 
-    if (isReadyToPlay(video, dl)) {
+    if (isReadyToPlay(video, dl, durationRef.current)) {
       tryStartPlayback()
     } else {
       setBuffering(true)
@@ -895,14 +970,28 @@ export function PlayerPage(): JSX.Element {
       if (isTorrent) {
         void window.cinevault?.torrent.status(id).then((s) => {
           if (!s) return
-          setDl({
-            speed: s.downloadSpeed,
-            received: s.downloaded,
-            total: s.total,
-            done: s.done,
-            peers: s.peers,
-            progress: s.progress,
-            contiguousForwardBytes: s.contiguousForwardBytes
+          setDl((prev) => {
+            const next = {
+              speed: s.downloadSpeed,
+              received: s.downloaded,
+              total: s.total,
+              done: s.done,
+              peers: s.peers,
+              progress: s.progress,
+              contiguousForwardBytes: s.contiguousForwardBytes
+            }
+            if (
+              prev &&
+              prev.done === next.done &&
+              prev.peers === next.peers &&
+              Math.abs((prev.progress || 0) - (next.progress || 0)) < 0.004 &&
+              Math.abs((prev.speed || 0) - (next.speed || 0)) < 2048 &&
+              Math.abs((prev.contiguousForwardBytes || 0) - (next.contiguousForwardBytes || 0)) <
+                256 * 1024
+            ) {
+              return prev
+            }
+            return next
           })
         })
       } else {
@@ -919,7 +1008,7 @@ export function PlayerPage(): JSX.Element {
       }
     }
     pull()
-    const t = setInterval(pull, 500)
+    const t = setInterval(pull, 1000)
     return () => clearInterval(t)
   }, [session.cacheId, session.source.kind])
 
@@ -928,26 +1017,35 @@ export function PlayerPage(): JSX.Element {
     const video = videoRef.current
     if (!video) return
 
-    const refreshBuffer = (): void => {
+    const refreshBuffer = (force = false): void => {
       const fwd = calculateForwardBuffer(video)
+      const mediaDur = torrentPriorityDuration(video, duration || durationRef.current || 0)
+      const ranges = readBufferedRanges(video)
+      let end = video.currentTime
+      for (const r of ranges) {
+        if (video.currentTime >= r.start && video.currentTime <= r.end) {
+          end = r.end
+          break
+        }
+      }
+      // Legacy single % is only used as a non-torrent fallback fill.
+      const pct = mediaDur > 0 ? Math.min(100, (end / mediaDur) * 100) : 0
+      const rangesKey = ranges.map((r) => `${r.start.toFixed(2)}-${r.end.toFixed(2)}`).join('|')
+      const prev = bufferUiRef.current
+      if (
+        !force &&
+        Math.abs(prev.pct - pct) < 0.4 &&
+        Math.abs(prev.fwdPct - fwd.pct) < 0.5 &&
+        Math.abs(prev.fwdSec - fwd.forwardSec) < 0.25 &&
+        prev.rangesKey === rangesKey
+      ) {
+        return
+      }
+      bufferUiRef.current = { pct, fwdPct: fwd.pct, fwdSec: fwd.forwardSec, rangesKey }
       setForwardBufferPct(fwd.pct)
       setForwardBufferSec(fwd.forwardSec)
-      const dur = video.duration || duration || 0
-      // Timeline fill: end of the buffered range that contains the playhead
-      let end = video.currentTime
-      try {
-        for (let i = 0; i < video.buffered.length; i++) {
-          const start = video.buffered.start(i)
-          const rangeEnd = video.buffered.end(i)
-          if (video.currentTime >= start && video.currentTime <= rangeEnd) {
-            end = rangeEnd
-            break
-          }
-        }
-      } catch {
-        end = bufferedEnd(video)
-      }
-      setBufferPct(dur > 0 ? Math.min(100, (end / dur) * 100) : 0)
+      setBufferPct(pct)
+      setBufferedRanges(ranges)
     }
 
     const syncTorrentWindow = (): void => {
@@ -957,17 +1055,24 @@ export function PlayerPage(): JSX.Element {
         void window.cinevault?.torrent.prioritize({
           id: session.cacheId,
           currentTime: wallClockTime(video.currentTime),
-          duration: durationRef.current || video.duration || 0
+          duration: torrentPriorityDuration(video, durationRef.current)
         })
       }, 180)
     }
 
     const onTime = (): void => {
       const t = wallClockTime(video.currentTime)
-      setCurrent(t)
+      // Throttle React commits — timeupdate fires ~4–10Hz otherwise
+      const prevQ = Math.floor((currentRef.current || 0) * 4)
+      const nextQ = Math.floor(t * 4)
+      if (nextQ !== prevQ || Math.abs(t - (currentRef.current || 0)) >= 0.35) {
+        setCurrent(t)
+      }
+      currentRef.current = t
       const cue = findActiveCue(cuesRef.current, t, subOffsetMsRef.current)
-      setSubText(cue?.text || '')
-      refreshBuffer()
+      const text = cue?.text || ''
+      setSubText((prevText) => (prevText === text ? prevText : text))
+      refreshBuffer(false)
     }
     const onSeeked = (): void => {
       const t = wallClockTime(video.currentTime)
@@ -1129,7 +1234,7 @@ export function PlayerPage(): JSX.Element {
             void window.cinevault?.torrent.prioritize({
               id: session.cacheId,
               currentTime: video.currentTime,
-              duration: video.duration || durationRef.current || 0
+              duration: torrentPriorityDuration(video, durationRef.current)
             })
           }
         }
@@ -1162,6 +1267,7 @@ export function PlayerPage(): JSX.Element {
         mediaId,
         mediaType: session.mediaType,
         externalId: session.externalId,
+        provider: session.provider,
         title: showTitle,
         posterPath: session.posterUrl || undefined,
         backdropPath: session.backdropUrl || undefined,
@@ -1181,7 +1287,27 @@ export function PlayerPage(): JSX.Element {
         dur > 0 ||
         (Number.isFinite(video.duration) && video.duration > 0 && video.duration !== Infinity)
       if (!hasDur) return
-      saveProgress(buildEntry(), { immediate })
+      const entry = buildEntry()
+      saveProgress(entry, { immediate })
+
+      const affinityType = toAffinityType(session.mediaType)
+      const isFavorite = useAppStore
+        .getState()
+        .favorites.some(
+          (f) => f.mediaType === session.mediaType && f.externalId === session.externalId
+        )
+      const genreIds =
+        session.genreIds?.length
+          ? session.genreIds
+          : genreNamesToIds(session.genres || [], affinityType)
+      LocalAffinityEngine.recordSession({
+        id: session.externalId,
+        type: affinityType,
+        genreIds,
+        watchedSeconds: entry.currentTime,
+        totalSeconds: entry.duration,
+        isFavorite
+      })
     }
 
     const persistCache = (): void => {
@@ -1309,7 +1435,10 @@ export function PlayerPage(): JSX.Element {
         episode: target.episode
       })
       const raw = await searchPublicIndexers(query)
-      const sorted = sortTorrentResults(raw, qualityPref)
+      const sorted = sortTorrentResults(
+        filterValidStreams(raw, { isMovieLike: false }),
+        qualityPref
+      )
       const pick = getBestStream(sorted, 'Auto', { isMovieLike: false })
       const candidates = [
         pick.bestStream,
@@ -1427,7 +1556,10 @@ export function PlayerPage(): JSX.Element {
         episode: session.episode
       })
       const raw = await searchPublicIndexers(query)
-      const sorted = sortTorrentResults(raw, qualityPref)
+      const sorted = sortTorrentResults(
+        filterValidStreams(raw, { isMovieLike: session.mediaType === 'movie' }),
+        qualityPref
+      )
       const pick = getBestStream(sorted, '1080p', {
         isMovieLike: session.mediaType === 'movie'
       })
@@ -1494,7 +1626,10 @@ export function PlayerPage(): JSX.Element {
         episode: session.episode
       })
       const raw = await searchPublicIndexers(query)
-      const sorted = sortTorrentResults(raw, qualityPref)
+      const sorted = sortTorrentResults(
+        filterValidStreams(raw, { isMovieLike: session.mediaType === 'movie' }),
+        qualityPref
+      )
       const target =
         session.resolution === '2160p' || session.resolution === '1440p'
           ? ('4K' as const)
@@ -1664,18 +1799,11 @@ export function PlayerPage(): JSX.Element {
   const skipBy = (deltaSec: number): void => {
     const video = videoRef.current
     if (!video) return
-    const dur = totalDurationSeconds || durationRef.current || 0
+    const mediaDur = torrentPriorityDuration(video, durationRef.current || totalDurationSeconds || 0)
     const now = useAudioRemux ? wallClockTime(video.currentTime) : video.currentTime || 0
-    const target = Math.max(0, Math.min(now + deltaSec, dur || now + deltaSec))
-    if (useAudioRemux) {
-      reattachRemuxAt(target)
-      flashSeek(deltaSec)
-      return
-    }
-    video.currentTime = target
-    setCurrent(target)
-    const cue = findActiveCue(cuesRef.current, target, subOffsetMsRef.current)
-    setSubText(cue?.text || '')
+    const maxT = mediaDur > 1 ? Math.max(0, mediaDur - 0.35) : now + deltaSec
+    const target = Math.max(0, Math.min(now + deltaSec, maxT))
+    seekTo(target)
     flashSeek(deltaSec)
   }
 
@@ -1903,8 +2031,9 @@ export function PlayerPage(): JSX.Element {
     const video = videoRef.current
     if (!video) return
     const fwd = calculateForwardBuffer(video)
-    const dur = totalDurationSeconds || durationRef.current || duration || 0
-    const target = Math.max(0, Math.min(t, dur || t))
+    const mediaDur = torrentPriorityDuration(video, durationRef.current || duration || 0)
+    const maxT = mediaDur > 1 ? Math.max(0, mediaDur - 0.35) : t
+    const target = Math.max(0, Math.min(t, maxT))
 
     if (useAudioRemux) {
       reattachRemuxAt(target)
@@ -1913,18 +2042,25 @@ export function PlayerPage(): JSX.Element {
       return
     }
 
-    const outsideBuffer = fwd.forwardSec < 1.5 || target < video.currentTime - 1 || target > video.currentTime + fwd.forwardSec + 0.5
-    if (session.source.kind === 'torrent' && outsideBuffer) {
+    const outsideBuffer =
+      fwd.forwardSec < 1.5 ||
+      target < video.currentTime - 1 ||
+      target > video.currentTime + fwd.forwardSec + 0.5
+    // HTML5 can still report buffered ranges after rolling torrent cache purged those
+    // bytes — jumps ≥15s must re-anchor torrent priority even if fwdSec looks fine.
+    const farSeek = Math.abs(target - video.currentTime) >= 15
+    if (session.source.kind === 'torrent' && (outsideBuffer || farSeek)) {
       setBuffering(true)
       waitingSinceRef.current = Date.now()
       needsContiguousBufferRef.current = true
       setForwardBufferPct(0)
       setForwardBufferSec(0)
+      setBufferedRanges([])
       if (!video.paused) video.pause()
       void window.cinevault?.torrent.prioritize({
         id: session.cacheId,
         currentTime: target,
-        duration: dur,
+        duration: torrentPriorityDuration(video, mediaDur),
         invalidate: true
       })
     }
@@ -1932,11 +2068,11 @@ export function PlayerPage(): JSX.Element {
     setCurrent(target)
     const cue = findActiveCue(cuesRef.current, target, subOffsetMsRef.current)
     setSubText(cue?.text || '')
-    if (session.source.kind === 'torrent' && !outsideBuffer) {
+    if (session.source.kind === 'torrent' && !(outsideBuffer || farSeek)) {
       void window.cinevault?.torrent.prioritize({
         id: session.cacheId,
         currentTime: target,
-        duration: dur
+        duration: torrentPriorityDuration(video, mediaDur)
       })
     }
     bumpChrome()
@@ -1965,6 +2101,7 @@ export function PlayerPage(): JSX.Element {
           mediaId,
           mediaType: session.mediaType,
           externalId: session.externalId,
+          provider: session.provider,
           title: session.showTitle || session.title.split(' · ')[0],
           posterPath: session.posterUrl || undefined,
           backdropPath: session.backdropUrl || undefined,
@@ -2007,6 +2144,7 @@ export function PlayerPage(): JSX.Element {
           mediaId,
           mediaType: session.mediaType,
           externalId: session.externalId,
+          provider: session.provider,
           title: session.showTitle || session.title.split(' · ')[0],
           posterPath: session.posterUrl || undefined,
           backdropPath: session.backdropUrl || undefined,
@@ -2083,13 +2221,27 @@ export function PlayerPage(): JSX.Element {
   }
 
   const onTimelineHover = (e: MouseEvent<HTMLDivElement>): void => {
+    if (scrubbingRef.current) return
     const ratio = ratioFromEvent(e, e.currentTarget)
-    const t = ratio * (totalDurationSeconds || 0)
+    const mediaDur =
+      torrentPriorityDuration(videoRef.current, 0) || totalDurationSeconds || 0
+    const t = ratio * mediaDur
     setScrub({ x: e.clientX - e.currentTarget.getBoundingClientRect().left, t, visible: true })
+
+    // Torrent streams can't afford a second <video> fighting for range pipes.
+    if (session.source.kind === 'torrent') return
 
     const sv = scrubVideoRef.current
     const canvas = canvasRef.current
-    if (sv && canvas && totalDurationSeconds) {
+    const mainSrc = session.source.url
+    if (sv && canvas && mediaDur > 0 && mainSrc) {
+      if (!sv.src) {
+        try {
+          sv.src = mainSrc
+        } catch {
+          /* ignore */
+        }
+      }
       const draw = (): void => {
         const ctx = canvas.getContext('2d')
         if (!ctx) return
@@ -2100,19 +2252,55 @@ export function PlayerPage(): JSX.Element {
         draw()
       }
       sv.addEventListener('seeked', seek)
-      sv.currentTime = t
+      sv.currentTime = Math.min(t, Math.max(0, mediaDur - 0.35))
     }
+  }
+
+  const previewTimelineAt = (el: HTMLElement, clientX: number): number => {
+    const mediaDur =
+      torrentPriorityDuration(videoRef.current, 0) || totalDurationSeconds || 0
+    const t = ratioFromEvent({ clientX }, el) * mediaDur
+    const rect = el.getBoundingClientRect()
+    setScrub({
+      x: Math.min(Math.max(0, clientX - rect.left), rect.width),
+      t,
+      visible: true
+    })
+    scrubTimeRef.current = t
+    setScrubTime(t)
+    return t
   }
 
   const onTimelinePointer = (e: ReactPointerEvent<HTMLDivElement>): void => {
     e.preventDefault()
+    scrubbingRef.current = true
     e.currentTarget.setPointerCapture(e.pointerId)
-    seekTo(ratioFromEvent(e, e.currentTarget) * (totalDurationSeconds || 0))
+    // Visual scrub only — commit on pointer up to avoid a burst of range requests.
+    previewTimelineAt(e.currentTarget, e.clientX)
   }
 
   const onTimelinePointerMove = (e: ReactPointerEvent<HTMLDivElement>): void => {
     if (!e.currentTarget.hasPointerCapture(e.pointerId)) return
-    seekTo(ratioFromEvent(e, e.currentTarget) * (totalDurationSeconds || 0))
+    previewTimelineAt(e.currentTarget, e.clientX)
+  }
+
+  const onTimelinePointerUp = (e: ReactPointerEvent<HTMLDivElement>): void => {
+    if (!scrubbingRef.current) return
+    scrubbingRef.current = false
+    try {
+      e.currentTarget.releasePointerCapture(e.pointerId)
+    } catch {
+      /* ignore */
+    }
+    const mediaDur =
+      torrentPriorityDuration(videoRef.current, 0) || totalDurationSeconds || 0
+    const t =
+      scrubTimeRef.current != null
+        ? scrubTimeRef.current
+        : ratioFromEvent(e, e.currentTarget) * mediaDur
+    scrubTimeRef.current = null
+    setScrubTime(null)
+    seekTo(t)
   }
 
   const detectedRes = (() => {
@@ -2127,13 +2315,44 @@ export function PlayerPage(): JSX.Element {
     return '—'
   })()
 
+  const timelineDuration =
+    torrentPriorityDuration(videoRef.current, 0) || totalDurationSeconds || 0
+  const displayTime = scrubTime != null ? scrubTime : currentPlaybackTime
   const progressPct =
-    totalDurationSeconds > 0
-      ? Math.min(100, (currentPlaybackTime / totalDurationSeconds) * 100)
+    timelineDuration > 0
+      ? Math.min(100, (displayTime / timelineDuration) * 100)
       : 0
-  const torrentPct = dl?.progress != null ? Math.min(100, dl.progress * 100) : 0
-  // Show the farther of HTML5 buffer vs torrent completion so the light track is visible
-  const downloadedPct = Math.max(bufferPct, torrentPct)
+  // Timeline "ready" fill must mirror real HTML5 buffered ranges — never global torrent %.
+  // (Global progress painted from the left after a mid-file seek looks fully streamable but isn't.)
+  const downloadSegments =
+    timelineDuration > 0
+      ? bufferedRanges
+          // Torrents: only paint ranges near the playhead. Distant HTML5 ranges often
+          // outlive rolling-cache pieces and look "ready" when they are not.
+          .filter((r) => {
+            if (session.source.kind !== 'torrent') return true
+            const t = currentPlaybackTime
+            return r.end >= t - 2 && r.start <= t + Math.max(forwardBufferSec, 30) + 5
+          })
+          .map((r) => ({
+            left: Math.max(0, Math.min(100, (r.start / timelineDuration) * 100)),
+            width: Math.max(
+              0,
+              Math.min(100, ((r.end - r.start) / timelineDuration) * 100)
+            )
+          }))
+      : []
+  // Prebuffer orbit: once media is attached, HTML5 buffer is often still 0 while the
+  // torrent is filling sequential pieces — use the better of HTML5 seconds vs contig bytes.
+  const htmlPrebufferPct = Math.min(
+    100,
+    Math.round((forwardBufferSec / PREBUFFER_SECONDS) * 100)
+  )
+  const contigPrebufferPct = Math.min(
+    100,
+    Math.round(((dl?.contiguousForwardBytes || 0) / PREBUFFER_BYTES) * 100)
+  )
+  const orbitPrebufferPct = Math.max(htmlPrebufferPct, contigPrebufferPct)
 
   return (
     <div
@@ -2142,14 +2361,15 @@ export function PlayerPage(): JSX.Element {
       onPointerDown={bumpChrome}
     >
       <div className="player-top">
-        <button
-          className="player-ctrl player-no-drag"
-          type="button"
-          title="Back to library"
-          onClick={backToLibrary}
-        >
-          <ArrowLeft {...ICON} />
-        </button>
+        <Tooltip content="Back to library" side="bottom">
+          <button
+            className="player-ctrl player-no-drag"
+            type="button"
+            onClick={backToLibrary}
+          >
+            <ArrowLeft {...ICON} />
+          </button>
+        </Tooltip>
         <div className="player-title-block">
           <h1>{session.title}</h1>
           <div className="muted" style={{ color: '#9aa5b5', fontSize: 12 }}>
@@ -2273,20 +2493,19 @@ export function PlayerPage(): JSX.Element {
                     ))}
                   </div>
                   <div className="orbit-core">
-                    <div className="orbit-pct">
-                      {mediaAttached
-                        ? `${Math.min(100, Math.round((forwardBufferSec / PREBUFFER_SECONDS) * 100))}%`
-                        : dl?.contiguousForwardBytes != null
-                          ? `${Math.min(100, Math.round((dl.contiguousForwardBytes / PREBUFFER_BYTES) * 100))}%`
-                          : '—'}
-                    </div>
+                    <div className="orbit-pct">{`${orbitPrebufferPct}%`}</div>
                     <div className="orbit-speed">{dl ? formatSpeed(dl.speed) : '…'}</div>
                   </div>
                 </div>
                 <p className="orbit-note">
-                  {mediaAttached && forwardBufferSec > 0
+                  {htmlPrebufferPct > 0
                     ? `Buffering ${Math.min(PREBUFFER_SECONDS, Math.floor(forwardBufferSec))}s / ${PREBUFFER_SECONDS}s`
-                    : 'Pre-buffering stream...'}
+                    : contigPrebufferPct > 0
+                      ? `Pre-buffering ${(
+                          (dl?.contiguousForwardBytes || 0) /
+                          (1024 * 1024)
+                        ).toFixed(0)} MB / ${PREBUFFER_BYTES / (1024 * 1024)} MB`
+                      : 'Pre-buffering stream...'}
                 </p>
               </>
             )}
@@ -2377,7 +2596,7 @@ export function PlayerPage(): JSX.Element {
             <strong>Subtitles</strong>
             <div className="sub-panel-field">
               <span>Language</span>
-              <ThemedSelect
+              <SelectMenu
                 aria-label="Subtitle language"
                 value={subLang}
                 onChange={changeSubLang}
@@ -2391,17 +2610,11 @@ export function PlayerPage(): JSX.Element {
             </div>
             <div className="sub-panel-field">
               <span>Track</span>
-              <ThemedSelect
+              <SelectMenu
+                className="sub-panel-track-select"
                 aria-label="Subtitle track"
                 value={activeSubId}
                 onChange={(v) => void applySubtitleTrack(v)}
-                title={
-                  availableSubs.find((s) => s.id === activeSubId)
-                    ? formatSubtitleMenuLabel(
-                        availableSubs.find((s) => s.id === activeSubId)!
-                      )
-                    : undefined
-                }
                 menuMinWidth={300}
                 options={[
                   { value: '', label: 'Off' },
@@ -2463,35 +2676,37 @@ export function PlayerPage(): JSX.Element {
                 aria-label="Subtitle delay"
               />
               <div className="sub-panel-offset">
-                <button
-                  className="player-ctrl"
-                  type="button"
-                  title="Show earlier (Z / [)"
-                  onPointerDown={(e) => {
-                    e.preventDefault()
-                    startHold('btn-sub-earlier', () => nudgeSubs(-100), 70, 320)
-                  }}
-                  onPointerUp={() => clearHold('btn-sub-earlier')}
-                  onPointerLeave={() => clearHold('btn-sub-earlier')}
-                  onPointerCancel={() => clearHold('btn-sub-earlier')}
-                >
-                  <Minus {...ICON} />
-                </button>
+                <Tooltip content="Show earlier" shortcut="Z / [">
+                  <button
+                    className="player-ctrl"
+                    type="button"
+                    onPointerDown={(e) => {
+                      e.preventDefault()
+                      startHold('btn-sub-earlier', () => nudgeSubs(-100), 70, 320)
+                    }}
+                    onPointerUp={() => clearHold('btn-sub-earlier')}
+                    onPointerLeave={() => clearHold('btn-sub-earlier')}
+                    onPointerCancel={() => clearHold('btn-sub-earlier')}
+                  >
+                    <Minus {...ICON} />
+                  </button>
+                </Tooltip>
                 <span className="player-time">{subtitleOffsetMs} ms</span>
-                <button
-                  className="player-ctrl"
-                  type="button"
-                  title="Show later (X / ])"
-                  onPointerDown={(e) => {
-                    e.preventDefault()
-                    startHold('btn-sub-later', () => nudgeSubs(100), 70, 320)
-                  }}
-                  onPointerUp={() => clearHold('btn-sub-later')}
-                  onPointerLeave={() => clearHold('btn-sub-later')}
-                  onPointerCancel={() => clearHold('btn-sub-later')}
-                >
-                  <Plus {...ICON} />
-                </button>
+                <Tooltip content="Show later" shortcut="X / ]">
+                  <button
+                    className="player-ctrl"
+                    type="button"
+                    onPointerDown={(e) => {
+                      e.preventDefault()
+                      startHold('btn-sub-later', () => nudgeSubs(100), 70, 320)
+                    }}
+                    onPointerUp={() => clearHold('btn-sub-later')}
+                    onPointerLeave={() => clearHold('btn-sub-later')}
+                    onPointerCancel={() => clearHold('btn-sub-later')}
+                  >
+                    <Plus {...ICON} />
+                  </button>
+                </Tooltip>
               </div>
               <div className="sub-panel-status">Z / [ earlier · X / ] later · 100 ms</div>
             </div>
@@ -2564,13 +2779,17 @@ export function PlayerPage(): JSX.Element {
           className="timeline-wrap"
           ref={trackRef}
           onMouseMove={onTimelineHover}
-          onMouseLeave={() => setScrub((s) => ({ ...s, visible: false }))}
+          onMouseLeave={() => {
+            if (!scrubbingRef.current) setScrub((s) => ({ ...s, visible: false }))
+          }}
           onPointerDown={onTimelinePointer}
           onPointerMove={onTimelinePointerMove}
+          onPointerUp={onTimelinePointerUp}
+          onPointerCancel={onTimelinePointerUp}
           role="slider"
           aria-valuemin={0}
-          aria-valuemax={totalDurationSeconds || 0}
-          aria-valuenow={currentPlaybackTime}
+          aria-valuemax={timelineDuration || 0}
+          aria-valuenow={displayTime}
           tabIndex={0}
         >
           {scrub.visible && (
@@ -2580,165 +2799,182 @@ export function PlayerPage(): JSX.Element {
             </div>
           )}
           <div className="timeline-track">
-            <div className="timeline-download" style={{ width: `${downloadedPct}%` }} />
+            {downloadSegments.map((seg, i) => (
+              <div
+                key={i}
+                className="timeline-download"
+                style={{ left: `${seg.left}%`, width: `${seg.width}%` }}
+              />
+            ))}
             <div className="timeline-progress" style={{ width: `${progressPct}%` }} />
             <div className="timeline-thumb" style={{ left: `${progressPct}%` }} />
           </div>
         </div>
         <div className="controls-row">
-          <button
-            className="player-ctrl"
-            type="button"
-            title="Rewind 10 seconds (J / ←)"
-            aria-label="Rewind 10 seconds"
-            onPointerDown={(e) => {
-              e.preventDefault()
-              startHold('btn-seek-left', () => skipBy(-10))
-            }}
-            onPointerUp={() => clearHold('btn-seek-left')}
-            onPointerLeave={() => clearHold('btn-seek-left')}
-            onPointerCancel={() => clearHold('btn-seek-left')}
-          >
-            <SeekGlyph dir="back" />
-          </button>
-          <button
-            className="player-ctrl"
-            type="button"
-            onClick={togglePlay}
-            title={playing ? 'Pause (Space)' : 'Play (Space)'}
-            aria-label={playing ? 'Pause' : 'Play'}
-          >
-            {playing ? (
-              <Pause size={20} fill="currentColor" strokeWidth={0} />
-            ) : (
-              <Play size={20} fill="currentColor" strokeWidth={0} />
-            )}
-          </button>
-          <button
-            className="player-ctrl"
-            type="button"
-            title="Forward 10 seconds (L / →)"
-            aria-label="Forward 10 seconds"
-            onPointerDown={(e) => {
-              e.preventDefault()
-              startHold('btn-seek-right', () => skipBy(10))
-            }}
-            onPointerUp={() => clearHold('btn-seek-right')}
-            onPointerLeave={() => clearHold('btn-seek-right')}
-            onPointerCancel={() => clearHold('btn-seek-right')}
-          >
-            <SeekGlyph dir="forward" />
-          </button>
-          <button
-            className="player-ctrl"
-            type="button"
-            onClick={() => void stop()}
-            title="Stop"
-            aria-label="Stop"
-          >
-            <Square size={18} fill="currentColor" strokeWidth={0} />
-          </button>
+          <Tooltip content="Rewind 10 seconds" shortcut="J / ←">
+            <button
+              className="player-ctrl"
+              type="button"
+              aria-label="Rewind 10 seconds"
+              onPointerDown={(e) => {
+                e.preventDefault()
+                startHold('btn-seek-left', () => skipBy(-10))
+              }}
+              onPointerUp={() => clearHold('btn-seek-left')}
+              onPointerLeave={() => clearHold('btn-seek-left')}
+              onPointerCancel={() => clearHold('btn-seek-left')}
+            >
+              <SeekGlyph dir="back" />
+            </button>
+          </Tooltip>
+          <Tooltip content={playing ? 'Pause' : 'Play'} shortcut="Space">
+            <button
+              className="player-ctrl"
+              type="button"
+              onClick={togglePlay}
+              aria-label={playing ? 'Pause' : 'Play'}
+            >
+              {playing ? (
+                <Pause size={20} fill="currentColor" strokeWidth={0} />
+              ) : (
+                <Play size={20} fill="currentColor" strokeWidth={0} />
+              )}
+            </button>
+          </Tooltip>
+          <Tooltip content="Forward 10 seconds" shortcut="L / →">
+            <button
+              className="player-ctrl"
+              type="button"
+              aria-label="Forward 10 seconds"
+              onPointerDown={(e) => {
+                e.preventDefault()
+                startHold('btn-seek-right', () => skipBy(10))
+              }}
+              onPointerUp={() => clearHold('btn-seek-right')}
+              onPointerLeave={() => clearHold('btn-seek-right')}
+              onPointerCancel={() => clearHold('btn-seek-right')}
+            >
+              <SeekGlyph dir="forward" />
+            </button>
+          </Tooltip>
+          <Tooltip content="Stop">
+            <button
+              className="player-ctrl"
+              type="button"
+              onClick={() => void stop()}
+              aria-label="Stop"
+            >
+              <Square size={18} fill="currentColor" strokeWidth={0} />
+            </button>
+          </Tooltip>
           <span className="player-time">
-            {formatTime(currentPlaybackTime)} / {formatTime(totalDurationSeconds)}
+            {formatTime(displayTime)} / {formatTime(timelineDuration)}
             <span className="player-time-remain">
-              · −{formatTime(Math.max(0, totalDurationSeconds - currentPlaybackTime))}
+              · −{formatTime(Math.max(0, timelineDuration - currentPlaybackTime))}
             </span>
           </span>
-          <button
-            className="player-ctrl"
-            type="button"
-            title={muted ? 'Unmute (M)' : 'Mute (M)'}
-            aria-label={muted ? 'Unmute' : 'Mute'}
-            onClick={() => {
-              setMuted((prev) => {
-                const next = !prev
-                if (videoRef.current) videoRef.current.muted = next
-                return next
-              })
-              bumpChrome()
-            }}
-          >
-            {muted || volume === 0 ? <VolumeX {...ICON} /> : <Volume2 {...ICON} />}
-          </button>
-          <input
-            className="volume"
-            type="range"
-            min={0}
-            max={1}
-            step={0.01}
-            value={muted ? 0 : volume}
-            style={{ ['--vol' as string]: `${(muted ? 0 : volume) * 100}%` } as CSSProperties}
-            title="Volume"
-            aria-label="Volume"
-            onChange={(e) => {
-              const v = Number(e.target.value)
-              setVolume(v)
-              setMuted(false)
-              if (videoRef.current) {
-                videoRef.current.volume = v
-                videoRef.current.muted = false
-              }
-              bumpChrome()
-            }}
-          />
+          <Tooltip content={muted ? 'Unmute' : 'Mute'} shortcut="M">
+            <button
+              className="player-ctrl"
+              type="button"
+              aria-label={muted ? 'Unmute' : 'Mute'}
+              onClick={() => {
+                setMuted((prev) => {
+                  const next = !prev
+                  if (videoRef.current) videoRef.current.muted = next
+                  return next
+                })
+                bumpChrome()
+              }}
+            >
+              {muted || volume === 0 ? <VolumeX {...ICON} /> : <Volume2 {...ICON} />}
+            </button>
+          </Tooltip>
+          <Tooltip content="Volume">
+            <input
+              className="volume"
+              type="range"
+              min={0}
+              max={1}
+              step={0.01}
+              value={muted ? 0 : volume}
+              style={{ ['--vol' as string]: `${(muted ? 0 : volume) * 100}%` } as CSSProperties}
+              aria-label="Volume"
+              onChange={(e) => {
+                const v = Number(e.target.value)
+                setVolume(v)
+                setMuted(false)
+                if (videoRef.current) {
+                  videoRef.current.volume = v
+                  videoRef.current.muted = false
+                }
+                bumpChrome()
+              }}
+            />
+          </Tooltip>
           <div className="spacer" />
-          <button
-            className={`player-ctrl${showShortcuts ? ' is-active' : ''}`}
-            type="button"
-            title="Keyboard shortcuts (?)"
-            aria-label="Keyboard shortcuts"
-            aria-pressed={showShortcuts}
-            onClick={() => {
-              setShowShortcuts((v) => !v)
-              bumpChrome()
-            }}
-          >
-            <Keyboard {...ICON} />
-          </button>
-          <button
-            className={`player-ctrl${showStats ? ' is-active' : ''}`}
-            type="button"
-            title="Stats for nerds"
-            aria-label="Stats for nerds"
-            aria-pressed={showStats}
-            onClick={() => {
-              setShowStats((v) => !v)
-              bumpChrome()
-            }}
-          >
-            <Info {...ICON} />
-          </button>
-          <button
-            className={`player-ctrl${nativePip ? ' is-active' : ''}`}
-            type="button"
-            title="Picture in picture"
-            aria-label="Picture in picture"
-            onClick={() => void toggleNativePip()}
-          >
-            <PictureInPicture2 {...ICON} />
-          </button>
-          <button
-            className="player-ctrl"
-            type="button"
-            title={fullscreen ? 'Exit fullscreen (F)' : 'Fullscreen (F)'}
-            aria-label={fullscreen ? 'Exit fullscreen' : 'Fullscreen'}
-            onClick={toggleFullscreen}
-          >
-            {fullscreen ? <Minimize2 {...ICON} /> : <Maximize2 {...ICON} />}
-          </button>
-          <button
-            className={`player-ctrl player-ctrl-captions${showSubs ? ' is-on' : ''}`}
-            type="button"
-            title="Captions"
-            aria-label="Captions"
-            aria-pressed={showSubs}
-            onClick={() => {
-              setShowSubs((v) => !v)
-              bumpChrome()
-            }}
-          >
-            <Captions {...ICON} />
-          </button>
+          <Tooltip content="Keyboard shortcuts" shortcut="?">
+            <button
+              className={`player-ctrl${showShortcuts ? ' is-active' : ''}`}
+              type="button"
+              aria-label="Keyboard shortcuts"
+              aria-pressed={showShortcuts}
+              onClick={() => {
+                setShowShortcuts((v) => !v)
+                bumpChrome()
+              }}
+            >
+              <Keyboard {...ICON} />
+            </button>
+          </Tooltip>
+          <Tooltip content="Stats for nerds">
+            <button
+              className={`player-ctrl${showStats ? ' is-active' : ''}`}
+              type="button"
+              aria-label="Stats for nerds"
+              aria-pressed={showStats}
+              onClick={() => {
+                setShowStats((v) => !v)
+                bumpChrome()
+              }}
+            >
+              <Info {...ICON} />
+            </button>
+          </Tooltip>
+          <Tooltip content="Picture in picture" shortcut="P">
+            <button
+              className={`player-ctrl${nativePip ? ' is-active' : ''}`}
+              type="button"
+              aria-label="Picture in picture"
+              onClick={() => void toggleNativePip()}
+            >
+              <PictureInPicture2 {...ICON} />
+            </button>
+          </Tooltip>
+          <Tooltip content={fullscreen ? 'Exit fullscreen' : 'Fullscreen'} shortcut="F">
+            <button
+              className="player-ctrl"
+              type="button"
+              aria-label={fullscreen ? 'Exit fullscreen' : 'Fullscreen'}
+              onClick={() => toggleFullscreen()}
+            >
+              {fullscreen ? <Minimize2 {...ICON} /> : <Maximize2 {...ICON} />}
+            </button>
+          </Tooltip>
+          <Tooltip content="Captions">
+            <button
+              className={`player-ctrl player-ctrl-captions${showSubs ? ' is-on' : ''}`}
+              type="button"
+              aria-label="Captions"
+              aria-pressed={showSubs}
+              onClick={() => {
+                setShowSubs((v) => !v)
+                bumpChrome()
+              }}
+            >
+              <Captions {...ICON} />
+            </button>
+          </Tooltip>
         </div>
       </div>
 

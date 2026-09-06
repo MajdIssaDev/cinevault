@@ -1,8 +1,14 @@
-import { ipcMain } from 'electron'
+import { dialog, ipcMain } from 'electron'
 import { existsSync, mkdirSync, rmSync } from 'fs'
 import { join } from 'path'
-import type { Server } from 'http'
+import http, { type IncomingMessage, type Server, type ServerResponse } from 'http'
+import type { Readable } from 'stream'
 import WebTorrent from 'webtorrent'
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const Piece = require('torrent-piece') as new (length: number) => {
+  length: number
+  missing: number
+}
 import { getDefaultCacheDir, loadSettings } from './settings'
 import {
   BUFFER_AHEAD_PIECES,
@@ -51,8 +57,86 @@ interface ActiveTorrent {
 
 let client: WebTorrent.Instance | null = null
 const active = new Map<string, ActiveTorrent>()
+let webtorrentGuardsInstalled = false
+
+function isWebtorrentPieceRace(err: unknown): boolean {
+  if (!(err instanceof Error)) return false
+  const msg = err.message || ''
+  const stack = err.stack || ''
+  return (
+    (/reading ['"]missing['"]/i.test(msg) || /Cannot read propert(?:y|ies) of null/i.test(msg)) &&
+    (/webtorrent/i.test(stack) ||
+      /trySelectWire/i.test(stack) ||
+      /speedRanker/i.test(stack) ||
+      /_updateWire/i.test(stack))
+  )
+}
+
+/**
+ * WebTorrent can throw TypeError on pieces[i].missing when a piece slot is already
+ * null (verified / mid-destroy) while peer wires still update. Patch hot paths and
+ * swallow the known race so Electron doesn't show a fatal main-process dialog.
+ */
+function installWebtorrentGuards(): void {
+  if (webtorrentGuardsInstalled) return
+  webtorrentGuardsInstalled = true
+
+  try {
+    // CJS path used by Electron main (webtorrent's package entry).
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const Torrent = require('webtorrent/lib/torrent.js') as {
+      prototype: Record<string, unknown>
+    }
+    const proto = Torrent.prototype
+    for (const method of ['_update', '_updateWireWrapper', '_updateWire']) {
+      const orig = proto[method]
+      if (typeof orig !== 'function') continue
+      proto[method] = function patchedWebtorrentUpdate(
+        this: unknown,
+        ...args: unknown[]
+      ): unknown {
+        try {
+          return (orig as (...a: unknown[]) => unknown).apply(this, args)
+        } catch (err) {
+          if (isWebtorrentPieceRace(err)) {
+            console.warn('[torrent] ignored webtorrent piece race in', method)
+            return undefined
+          }
+          throw err
+        }
+      }
+    }
+  } catch (err) {
+    console.warn('[torrent] could not patch webtorrent update paths:', err)
+  }
+
+  process.on('uncaughtException', (err) => {
+    if (isWebtorrentPieceRace(err)) {
+      console.warn('[torrent] ignored uncaught webtorrent piece race:', err.message)
+      return
+    }
+    console.error('[main] uncaughtException:', err)
+    try {
+      dialog.showErrorBox(
+        'A JavaScript error occurred in the main process',
+        err.stack || err.message || String(err)
+      )
+    } catch {
+      /* ignore */
+    }
+  })
+
+  process.on('unhandledRejection', (reason) => {
+    if (isWebtorrentPieceRace(reason)) {
+      console.warn('[torrent] ignored webtorrent piece race rejection')
+      return
+    }
+    console.error('[main] unhandledRejection:', reason)
+  })
+}
 
 function getClient(): WebTorrent.Instance {
+  installWebtorrentGuards()
   if (!client) client = new WebTorrent()
   return client
 }
@@ -116,20 +200,38 @@ function toStatus(entry: ActiveTorrent): TorrentStatus {
   const pieceLength = Math.max(1, t.pieceLength || 16_384)
   const startPiece = file?._startPiece ?? 0
   const currentPiece = startPiece + Math.floor(bytePos / pieceLength)
-  return {
-    progress: t.progress,
-    downloadSpeed: t.downloadSpeed,
-    uploadSpeed: t.uploadSpeed,
-    peers: t.numPeers,
-    downloaded: t.downloaded,
-    total: entry.total || t.length,
-    ready: entry.ready,
-    done: Boolean(t.done),
-    error: entry.error,
-    streamUrl: entry.streamUrl,
-    fileName: entry.fileName,
-    contiguousForwardBytes: contig,
-    currentPiece
+  try {
+    return {
+      progress: t.progress,
+      downloadSpeed: t.downloadSpeed,
+      uploadSpeed: t.uploadSpeed,
+      peers: t.numPeers,
+      downloaded: t.downloaded,
+      total: entry.total || t.length,
+      ready: entry.ready,
+      done: Boolean(t.done),
+      error: entry.error,
+      streamUrl: entry.streamUrl,
+      fileName: entry.fileName,
+      contiguousForwardBytes: contig,
+      currentPiece
+    }
+  } catch {
+    return {
+      progress: 0,
+      downloadSpeed: 0,
+      uploadSpeed: 0,
+      peers: 0,
+      downloaded: 0,
+      total: entry.total || 0,
+      ready: entry.ready,
+      done: false,
+      error: entry.error,
+      streamUrl: entry.streamUrl,
+      fileName: entry.fileName,
+      contiguousForwardBytes: contig,
+      currentPiece
+    }
   }
 }
 
@@ -187,7 +289,9 @@ function resolveRollingStore(torrent: WebTorrent.Torrent): RollingStoreInstance 
 
 function clearBitfieldPieces(torrent: WebTorrent.Torrent, indices: number[]): void {
   const bitfield = (torrent as unknown as { bitfield?: BitfieldLike }).bitfield
-  const pieces = (torrent as unknown as { pieces?: unknown[] }).pieces
+  const pieces = (torrent as unknown as { pieces?: Array<unknown> }).pieces
+  const pieceLength = Math.max(1, torrent.pieceLength || 16_384)
+  const lastPieceLength = Math.max(1, torrent.lastPieceLength || pieceLength)
   for (const index of indices) {
     try {
       bitfield?.set?.(index, false)
@@ -195,8 +299,12 @@ function clearBitfieldPieces(torrent: WebTorrent.Torrent, indices: number[]): vo
       /* ignore */
     }
     try {
+      // WebTorrent's downloaded/progress getters crash if bitfield is false and
+      // pieces[i] is null. Recreate an empty Piece stub so status polling stays safe
+      // while rolling cache marks the slot as missing for re-download.
       if (pieces && index >= 0 && index < pieces.length) {
-        pieces[index] = null
+        const len = index === pieces.length - 1 ? lastPieceLength : pieceLength
+        pieces[index] = new Piece(len)
       }
     } catch {
       /* ignore */
@@ -291,8 +399,7 @@ async function ensureStream(opts: {
     /* ignore */
   }
 
-  const server = opts.torrent.createServer() as Server
-  attachRangePrioritizer(server, opts.torrent, index)
+  const server = createTorrentFileServer(opts.torrent, index)
   const port = await listenServer(server)
   const streamUrl = `http://127.0.0.1:${port}/${index}`
 
@@ -499,6 +606,27 @@ async function destroyTorrentInstance(
   torrent: WebTorrent.Torrent,
   destroyStore: boolean
 ): Promise<void> {
+  // Quiesce peer update loops before destroy to reduce pieces[i].missing races.
+  try {
+    const t = torrent as WebTorrent.Torrent & {
+      pause?: () => void
+      _selections?: unknown[]
+      wires?: Array<{ destroy?: () => void }>
+    }
+    t.pause?.()
+    if (Array.isArray(t._selections)) t._selections.length = 0
+    const wires = [...(t.wires || [])]
+    for (const wire of wires) {
+      try {
+        wire.destroy?.()
+      } catch {
+        /* ignore */
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+
   await new Promise<void>((resolve) => {
     try {
       torrent.destroy({ destroyStore }, () => resolve())
@@ -604,12 +732,12 @@ export async function destroyTorrentData(opts: {
   return removed
 }
 
-/** Jump torrent priority to the HTTP Range byte offset (seek). */
+/** Jump torrent priority to the HTTP Range / seek byte offset. */
 function prioritizePiecesAtByte(
   torrent: WebTorrent.Torrent,
   file: TorrentFilePieces,
   byteOffset: number,
-  opts?: { invalidate?: boolean }
+  opts?: { invalidate?: boolean; soft?: boolean; endByte?: number }
 ): void {
   const startPiece = file._startPiece ?? 0
   const endPiece = file._endPiece ?? startPiece
@@ -619,13 +747,28 @@ function prioritizePiecesAtByte(
     endPiece,
     Math.max(startPiece, startPiece + Math.floor(rel / pieceLength))
   )
-  const critEnd = Math.min(endPiece, pieceIndex + Math.min(24, BUFFER_AHEAD_PIECES))
-  const aheadEnd = Math.min(endPiece, pieceIndex + BUFFER_AHEAD_PIECES)
+  // Instant decode head: 4 critical pieces; keep a forward buffer behind them.
+  const critSpan = opts?.soft ? Math.min(24, BUFFER_AHEAD_PIECES) : 3
+  const critEnd = Math.min(endPiece, pieceIndex + critSpan)
+  const aheadFromEnd =
+    opts?.endByte != null
+      ? startPiece + Math.floor(Math.max(0, opts.endByte) / pieceLength)
+      : pieceIndex
+  const aheadEnd = Math.min(
+    endPiece,
+    Math.max(critEnd, Math.min(Math.max(pieceIndex + 15, aheadFromEnd), pieceIndex + BUFFER_AHEAD_PIECES))
+  )
   const behindStart = startPiece
   const behindEnd = Math.max(startPiece - 1, pieceIndex - RETAIN_BEHIND_PIECES - 1)
   try {
+    if (opts?.soft) {
+      // Advisory only (e.g. moov probes) — never starve the playhead window.
+      torrent.critical(pieceIndex, critEnd)
+      torrent.select(pieceIndex, aheadEnd, 1)
+      return
+    }
     if (opts?.invalidate) {
-      // Cancel interest in everything outside the new sliding window.
+      // Hard seek: drop interest outside the new zero-point window.
       if (pieceIndex - 1 >= startPiece) {
         torrent.deselect(startPiece, pieceIndex - 1, 0)
       }
@@ -642,26 +785,152 @@ function prioritizePiecesAtByte(
   }
 }
 
-function attachRangePrioritizer(
-  server: Server,
-  torrent: WebTorrent.Torrent,
-  fileIndex: number
-): void {
-  server.on('request', (req) => {
+function guessVideoMime(fileName: string): string {
+  const n = (fileName || '').toLowerCase()
+  if (n.endsWith('.mp4') || n.endsWith('.m4v') || n.endsWith('.mov')) return 'video/mp4'
+  if (n.endsWith('.webm')) return 'video/webm'
+  if (n.endsWith('.mkv')) return 'video/x-matroska'
+  if (n.endsWith('.avi')) return 'video/x-msvideo'
+  if (n.endsWith('.ts') || n.endsWith('.m2ts')) return 'video/mp2t'
+  return 'application/octet-stream'
+}
+
+/**
+ * Local HTTP range server for a single torrent file.
+ * Destroys abandoned createReadStream pipes on seek/abort so WebTorrent's
+ * piece pipeline is not blocked by stale range consumers.
+ */
+function createTorrentFileServer(torrent: WebTorrent.Torrent, fileIndex: number): Server {
+  const openStreams = new Set<Readable>()
+  let lastRangeStart = -1
+  let lastRangeEnd = -1
+
+  const destroyStream = (stream: Readable | null): void => {
+    if (!stream) return
+    openStreams.delete(stream)
     try {
-      const range = req.headers.range
-      if (!range || typeof range !== 'string') return
-      const m = /bytes=(\d+)/i.exec(range)
-      if (!m) return
-      const byteOffset = Number.parseInt(m[1], 10)
-      if (!Number.isFinite(byteOffset) || byteOffset < 0) return
-      const file = torrent.files[fileIndex] as TorrentFilePieces | undefined
-      if (!file) return
-      prioritizePiecesAtByte(torrent, file, byteOffset)
+      stream.destroy()
     } catch {
       /* ignore */
     }
+  }
+
+  const destroyAllStreams = (): void => {
+    for (const s of [...openStreams]) destroyStream(s)
+  }
+
+  const server = http.createServer((req: IncomingMessage, res: ServerResponse) => {
+    try {
+      const urlPath = (req.url || '/').split('?')[0]
+      const index = Number(urlPath.replace(/^\//, '').split('/')[0])
+      if (!Number.isFinite(index) || index !== fileIndex) {
+        res.statusCode = 404
+        res.end('Not Found')
+        return
+      }
+
+      const file = torrent.files[fileIndex] as TorrentFilePieces | undefined
+      if (!file) {
+        res.statusCode = 404
+        res.end('Not Found')
+        return
+      }
+
+      res.setHeader('Accept-Ranges', 'bytes')
+      res.setHeader('Content-Type', guessVideoMime(file.name))
+      res.setHeader('Connection', 'keep-alive')
+      res.setHeader('Cache-Control', 'no-store')
+
+      const total = file.length || 0
+      const rangeHeader = req.headers.range
+      let start = 0
+      let end = Math.max(0, total - 1)
+
+      if (typeof rangeHeader === 'string' && rangeHeader) {
+        const m = /bytes=(\d*)-(\d*)/i.exec(rangeHeader)
+        if (!m) {
+          res.statusCode = 416
+          res.setHeader('Content-Range', `bytes */${total}`)
+          res.end()
+          return
+        }
+        if (m[1]) start = Number.parseInt(m[1], 10)
+        if (m[2]) end = Number.parseInt(m[2], 10)
+        if (!Number.isFinite(start) || start < 0) start = 0
+        if (!Number.isFinite(end) || end >= total) end = total - 1
+        if (start > end || start >= total) {
+          res.statusCode = 416
+          res.setHeader('Content-Range', `bytes */${total}`)
+          res.end()
+          return
+        }
+        res.statusCode = 206
+        res.setHeader('Content-Range', `bytes ${start}-${end}/${total}`)
+        res.setHeader('Content-Length', end - start + 1)
+      } else {
+        res.statusCode = 200
+        res.setHeader('Content-Length', total)
+      }
+
+      const pieceLength = Math.max(1, torrent.pieceLength || 16_384)
+      // Contiguous follow-on ranges stay soft; real seeks jump the zero-point window.
+      const contiguous =
+        lastRangeEnd >= 0 &&
+        start >= lastRangeStart - pieceLength &&
+        start <= lastRangeEnd + pieceLength * 2
+      const jump = lastRangeStart < 0 || !contiguous
+      prioritizePiecesAtByte(torrent, file, start, {
+        invalidate: jump,
+        soft: !jump,
+        endByte: end
+      })
+      lastRangeStart = start
+      lastRangeEnd = end
+
+      if (req.method === 'HEAD') {
+        res.end()
+        return
+      }
+
+      const stream = file.createReadStream({ start, end }) as unknown as Readable
+      openStreams.add(stream)
+
+      // CRUCIAL: free the WebTorrent pipe when the client aborts (seek / drop).
+      let cleaned = false
+      const onAbort = (): void => {
+        if (cleaned) return
+        cleaned = true
+        destroyStream(stream)
+      }
+      req.on('close', onAbort)
+      res.on('close', onAbort)
+      stream.on('error', () => {
+        try {
+          if (!res.writableEnded) res.destroy()
+        } catch {
+          /* ignore */
+        }
+        onAbort()
+      })
+      stream.on('end', () => {
+        openStreams.delete(stream)
+      })
+      stream.pipe(res)
+    } catch {
+      try {
+        res.statusCode = 500
+        res.end('Stream error')
+      } catch {
+        /* ignore */
+      }
+    }
   })
+
+  server.on('close', () => {
+    destroyAllStreams()
+  })
+
+  return server
 }
 
 /** Sliding download window around the playhead (critical + high priority). */
@@ -682,10 +951,31 @@ function prioritizePlaybackWindow(opts: {
   const fileLength = file.length || entry.total || 0
   if (fileLength <= 0 || endPiece < startPiece) return false
 
-  const duration = opts.duration > 1 ? opts.duration : entry.lastDurationSec || 0
-  const currentTime = Math.max(0, opts.currentTime || 0)
+  // Prefer verified media duration over inflated catalog runtimes for byte mapping.
+  if (opts.duration > 1) {
+    const prev = entry.lastDurationSec || 0
+    // Accept first value, any shorter duration (real container), or small bumps.
+    // Reject sudden jumps to a much longer catalog runtime (e.g. TMDB 173m vs file 86m).
+    if (!prev || opts.duration <= prev * 1.15 || opts.duration < prev) {
+      entry.lastDurationSec = opts.duration
+    }
+  }
+  const duration = entry.lastDurationSec || (opts.duration > 1 ? opts.duration : 0)
+  let currentTime = Math.max(0, opts.currentTime || 0)
+  if (duration > 1) currentTime = Math.min(currentTime, duration)
+
+  // Soft metadata probes sometimes report EOF while playhead is still 0 — ignore those only.
+  const prevTime = entry.lastPlayheadSec || 0
+  if (
+    !opts.invalidate &&
+    prevTime < 1 &&
+    duration > 1 &&
+    currentTime >= duration - 1
+  ) {
+    currentTime = prevTime
+  }
+
   entry.lastPlayheadSec = currentTime
-  if (duration > 1) entry.lastDurationSec = duration
 
   const bytePos =
     duration > 1 ? Math.min(fileLength - 1, Math.floor((currentTime / duration) * fileLength)) : 0
@@ -695,7 +985,10 @@ function prioritizePlaybackWindow(opts: {
     endPiece,
     Math.max(startPiece, startPiece + Math.floor(bytePos / pieceLength))
   )
-  purgeRollingWindow(entry, pieceAt)
+  // Only purge disk on explicit seeks — soft playhead sync must not wipe the start buffer.
+  if (opts.invalidate) {
+    purgeRollingWindow(entry, pieceAt)
+  }
   return true
 }
 
@@ -743,6 +1036,7 @@ function nudgeTorrent(id: string): boolean {
 }
 
 export function registerTorrentHandlers(): void {
+  installWebtorrentGuards()
   ipcMain.handle(
     'torrent:start',
     async (_e, opts: { id: string; magnetUri: string; fileName?: string }) => {

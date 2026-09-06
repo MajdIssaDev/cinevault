@@ -1,4 +1,4 @@
-import { useEffect } from 'react'
+import { useEffect, useState } from 'react'
 import { Navigate, Route, Routes, useLocation } from 'react-router-dom'
 import { useAppStore } from './store'
 import { Shell } from './components/Shell'
@@ -15,12 +15,41 @@ import { initMobileOta } from './lib/mobileOta'
 import { lockCatalogOrientation, lockPlayerOrientation } from './lib/mobileOrientation'
 import { isMobileShell } from './lib/platform'
 import { TitleBar } from './components/TitleBar'
+import type { MediaType } from './types'
+
+const CATALOG_TABS: MediaType[] = ['movie', 'series', 'anime']
+
+function catalogMediaFromPath(pathname: string): MediaType | null {
+  if (pathname === '/movies') return 'movie'
+  if (pathname === '/series') return 'series'
+  if (pathname === '/anime') return 'anime'
+  return null
+}
 
 export default function App(): JSX.Element {
   const loadSettings = useAppStore((s) => s.loadSettings)
   const settings = useAppStore((s) => s.settings)
   const session = useAppStore((s) => s.session)
   const location = useLocation()
+  const routeCatalog = catalogMediaFromPath(location.pathname)
+  const onDetail = location.pathname.startsWith('/detail/')
+  const [keptCatalog, setKeptCatalog] = useState<MediaType>('movie')
+  const [visitedTabs, setVisitedTabs] = useState<MediaType[]>(() =>
+    routeCatalog ? [routeCatalog] : ['movie']
+  )
+
+  // Register the tab during render so the panel exists on the same commit (no blank frame).
+  if (routeCatalog && !visitedTabs.includes(routeCatalog)) {
+    setVisitedTabs([...visitedTabs, routeCatalog])
+  }
+
+  useEffect(() => {
+    if (routeCatalog) setKeptCatalog(routeCatalog)
+  }, [routeCatalog])
+
+  const catalogType = routeCatalog ?? keptCatalog
+  const catalogVisible = routeCatalog != null
+  const catalogMounted = catalogVisible || onDetail
 
   useEffect(() => {
     void loadSettings()
@@ -42,7 +71,6 @@ export default function App(): JSX.Element {
     return () => document.documentElement.classList.remove('player-open')
   }, [session])
 
-  // Catalog = portrait · Player = landscape (native only)
   useEffect(() => {
     if (!isMobileShell()) return
     if (session) void lockPlayerOrientation()
@@ -69,11 +97,26 @@ export default function App(): JSX.Element {
     <>
       <TitleBar />
       <Shell>
+        {catalogMounted && (
+          <div className="catalog-keepalive" hidden={!catalogVisible} aria-hidden={!catalogVisible}>
+            {CATALOG_TABS.map((type) =>
+              visitedTabs.includes(type) ? (
+                <div
+                  key={type}
+                  className={`catalog-tab-panel${catalogType === type ? ' is-active' : ' is-inactive'}`}
+                  aria-hidden={catalogType !== type}
+                >
+                  <CatalogPage mediaType={type} active={catalogType === type && catalogVisible} />
+                </div>
+              ) : null
+            )}
+          </div>
+        )}
         <Routes>
           <Route path="/" element={<Navigate to="/movies" replace />} />
-          <Route path="/movies" element={<CatalogPage mediaType="movie" />} />
-          <Route path="/series" element={<CatalogPage mediaType="series" />} />
-          <Route path="/anime" element={<CatalogPage mediaType="anime" />} />
+          <Route path="/movies" element={null} />
+          <Route path="/series" element={null} />
+          <Route path="/anime" element={null} />
           <Route path="/favorites" element={<FavoritesPage />} />
           <Route path="/library" element={<LibraryPage />} />
           <Route path="/feeds" element={<FeedPage />} />

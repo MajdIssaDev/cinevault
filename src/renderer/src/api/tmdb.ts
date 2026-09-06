@@ -1,7 +1,133 @@
 import type { CatalogItem, CastMember, EpisodeInfo, MediaExtras, SeasonInfo } from '../types'
 import { GENRE_MOVIE, GENRE_TV } from '../types'
+import { filterNarrativeCatalogItems } from '../lib/catalogContentFilter'
 
 const IMG = 'https://image.tmdb.org/t/p'
+
+const STILL_LIMIT = 24
+const MAIN_CAST_LIMIT = 10
+
+/**
+ * Built-in TMDB v3 key so cast / stills / logos work without a Settings step.
+ * A user key in Settings (or VITE_TMDB_API_KEY) overrides this.
+ */
+const BUILTIN_TMDB_API_KEY = '8265bd1679663a7ea12ac168da84d2e8'
+
+/** Prefer Settings → Vite env → built-in app key. */
+export function resolveTmdbApiKey(settingsKey?: string | null): string {
+  const fromSettings = settingsKey?.trim() || ''
+  if (fromSettings) return fromSettings
+  try {
+    const fromEnv = String(
+      (import.meta as ImportMeta & { env?: { VITE_TMDB_API_KEY?: string } }).env
+        ?.VITE_TMDB_API_KEY || ''
+    ).trim()
+    if (fromEnv) return fromEnv
+  } catch {
+    /* non-Vite */
+  }
+  return BUILTIN_TMDB_API_KEY
+}
+
+type TmdbCastCredit = {
+  id?: number
+  order?: number
+  name: string
+  character: string
+  profile_path: string | null
+}
+type TmdbCrewCredit = {
+  id?: number
+  job: string
+  name: string
+  profile_path: string | null
+}
+type TmdbBackdrop = {
+  file_path: string
+  vote_average?: number
+  vote_count?: number
+  iso_639_1?: string | null
+  width?: number
+  height?: number
+  aspect_ratio?: number
+}
+
+/** Top-billed cast + a few key crew (director, writer, composer, DoP). */
+function pickCastAndCrew(credits?: {
+  cast?: TmdbCastCredit[]
+  crew?: TmdbCrewCredit[]
+}): CastMember[] {
+  const out: CastMember[] = []
+  const seen = new Set<string>()
+
+  const push = (member: CastMember): void => {
+    const key = `${member.tmdbPersonId ?? member.name}|${member.role}|${member.character ?? ''}`
+    if (seen.has(key)) return
+    seen.add(key)
+    out.push(member)
+  }
+
+  const castSorted = [...(credits?.cast || [])].sort(
+    (a, b) => (a.order ?? 9999) - (b.order ?? 9999)
+  )
+  for (const c of castSorted.slice(0, MAIN_CAST_LIMIT)) {
+    push({
+      name: c.name,
+      character: c.character || null,
+      photoUrl: c.profile_path ? `${IMG}/w185${c.profile_path}` : null,
+      role: 'cast',
+      tmdbPersonId: c.id ?? null
+    })
+  }
+
+  const crewJobs: { job: string; label: string; role: CastMember['role'] }[] = [
+    { job: 'Director', label: 'Director', role: 'director' },
+    { job: 'Series Director', label: 'Director', role: 'director' },
+    { job: 'Screenplay', label: 'Screenplay', role: 'crew' },
+    { job: 'Writer', label: 'Writer', role: 'crew' },
+    { job: 'Story', label: 'Story', role: 'crew' },
+    { job: 'Original Music Composer', label: 'Composer', role: 'crew' },
+    { job: 'Director of Photography', label: 'Cinematography', role: 'crew' },
+    { job: 'Producer', label: 'Producer', role: 'crew' }
+  ]
+
+  const crew = credits?.crew || []
+  let crewAdded = 0
+  for (const { job, label, role } of crewJobs) {
+    if (crewAdded >= 5) break
+    const person = crew.find((c) => c.job === job)
+    if (!person) continue
+    if (role === 'director' && out.some((m) => m.role === 'director')) continue
+    push({
+      name: person.name,
+      character: label,
+      photoUrl: person.profile_path ? `${IMG}/w185${person.profile_path}` : null,
+      role,
+      tmdbPersonId: person.id ?? null
+    })
+    crewAdded++
+  }
+
+  return out
+}
+
+/** Prefer highly voted official backdrops; include untagged language images. */
+function mapOfficialStills(backdrops: TmdbBackdrop[] | undefined, limit = STILL_LIMIT): string[] {
+  const ranked = [...(backdrops || [])].sort((a, b) => {
+    const score = (x: TmdbBackdrop): number =>
+      (x.vote_average || 0) * 10 + (x.vote_count || 0) * 0.01
+    return score(b) - score(a)
+  })
+  const urls: string[] = []
+  const seen = new Set<string>()
+  for (const b of ranked) {
+    if (!b.file_path || seen.has(b.file_path)) continue
+    seen.add(b.file_path)
+    urls.push(`${IMG}/original${b.file_path}`)
+    if (urls.length >= limit) break
+  }
+  return urls
+}
 
 function key(apiKey: string): string {
   if (!apiKey) throw new Error('Add your TMDB API key in Settings.')
@@ -37,7 +163,8 @@ function mapMovie(m: {
     backdropUrl: m.backdrop_path ? `${IMG}/original${m.backdrop_path}` : null,
     releaseDate: m.release_date || null,
     rating: m.vote_average,
-    genres: (m.genre_ids || []).map((id) => GENRE_MOVIE[id]).filter(Boolean)
+    genres: (m.genre_ids || []).map((id) => GENRE_MOVIE[id]).filter(Boolean),
+    genreIds: m.genre_ids || []
   }
 }
 
@@ -61,7 +188,8 @@ function mapTv(m: {
     backdropUrl: m.backdrop_path ? `${IMG}/original${m.backdrop_path}` : null,
     releaseDate: m.first_air_date || null,
     rating: m.vote_average,
-    genres: (m.genre_ids || []).map((id) => GENRE_TV[id]).filter(Boolean)
+    genres: (m.genre_ids || []).map((id) => GENRE_TV[id]).filter(Boolean),
+    genreIds: m.genre_ids || []
   }
 }
 
@@ -131,16 +259,87 @@ export async function fetchNewAndPopularSeries(apiKey: string): Promise<CatalogI
 
 export async function searchMovies(apiKey: string, query: string): Promise<CatalogItem[]> {
   const data = await tmdb<{ results: Parameters<typeof mapMovie>[0][] }>(apiKey, '/search/movie', {
-    query
+    query,
+    include_adult: 'false'
   })
-  return data.results.map(mapMovie)
+  return filterNarrativeCatalogItems(
+    data.results.map((row) => ({ ...mapMovie(row), provider: 'tmdb' as const }))
+  )
 }
 
 export async function searchSeries(apiKey: string, query: string): Promise<CatalogItem[]> {
   const data = await tmdb<{ results: Parameters<typeof mapTv>[0][] }>(apiKey, '/search/tv', {
-    query
+    query,
+    include_adult: 'false'
   })
-  return data.results.map(mapTv)
+  return filterNarrativeCatalogItems(
+    data.results.map((row) => ({ ...mapTv(row), provider: 'tmdb' as const }))
+  )
+}
+
+type TmdbMultiRow = {
+  id: number
+  media_type: 'movie' | 'tv' | 'person'
+  title?: string
+  name?: string
+  overview?: string
+  poster_path?: string | null
+  backdrop_path?: string | null
+  release_date?: string
+  first_air_date?: string
+  vote_average?: number
+  genre_ids?: number[]
+}
+
+/**
+ * Literal multi-search. Do not pass year / vote_count filters — relevance order only.
+ * Drops `person` results.
+ */
+export async function searchMulti(
+  apiKey: string,
+  query: string,
+  page = 1
+): Promise<CatalogItem[]> {
+  const data = await tmdb<{ results: TmdbMultiRow[] }>(apiKey, '/search/multi', {
+    query,
+    include_adult: 'false',
+    page: String(page)
+  })
+
+  const out: CatalogItem[] = []
+  for (const row of data.results || []) {
+    if (row.media_type === 'person') continue
+    if (row.media_type === 'movie') {
+      out.push({
+        ...mapMovie({
+          id: row.id,
+          title: row.title || row.name || 'Untitled',
+          overview: row.overview || '',
+          poster_path: row.poster_path ?? null,
+          backdrop_path: row.backdrop_path ?? null,
+          release_date: row.release_date,
+          vote_average: row.vote_average || 0,
+          genre_ids: row.genre_ids
+        }),
+        provider: 'tmdb'
+      })
+    } else if (row.media_type === 'tv') {
+      out.push({
+        ...mapTv({
+          id: row.id,
+          name: row.name || row.title || 'Untitled',
+          overview: row.overview || '',
+          poster_path: row.poster_path ?? null,
+          backdrop_path: row.backdrop_path ?? null,
+          first_air_date: row.first_air_date,
+          vote_average: row.vote_average || 0,
+          genre_ids: row.genre_ids
+        }),
+        provider: 'tmdb'
+      })
+    }
+  }
+  return filterNarrativeCatalogItems(out)
 }
 
 export async function fetchMovieDetails(apiKey: string, id: number): Promise<CatalogItem & { imdbId: string | null }> {
@@ -268,6 +467,102 @@ export async function discoverByGenre(
     : (data.results as Parameters<typeof mapTv>[0][]).map(mapTv)
 }
 
+/**
+ * Personalized / fallback shelf rows.
+ * - With genres: discover sorted by popularity, vote_average ≥ 6.5
+ * - Without: weekly trending
+ * Anime uses TV discover with Animation + ja (or trending TV filtered to anime).
+ */
+export async function fetchForYouRecommendations(
+  apiKey: string,
+  catalogType: 'movie' | 'series' | 'anime',
+  genreIds: number[],
+  excludeIds: Set<number>,
+  page = 1
+): Promise<CatalogItem[]> {
+  const api = key(apiKey)
+  if (!api) return []
+
+  const mapResults = (
+    results: Array<Parameters<typeof mapMovie>[0] | Parameters<typeof mapTv>[0]>,
+    asAnime: boolean
+  ): CatalogItem[] => {
+    const out: CatalogItem[] = []
+    for (const row of results) {
+      if (excludeIds.has(row.id)) continue
+      if (asAnime) {
+        const gids = row.genre_ids || []
+        const lang = 'original_language' in row ? (row as { original_language?: string }).original_language : undefined
+        // Prefer anime signature; keep Animation-heavy rows if language missing on discover
+        if (lang != null && lang !== 'ja') continue
+        if (!gids.includes(16) && lang !== 'ja') continue
+        const mapped = mapTv(row as Parameters<typeof mapTv>[0])
+        out.push({ ...mapped, id: `anime-${row.id}`, mediaType: 'anime', provider: 'tmdb' })
+      } else if (catalogType === 'movie') {
+        out.push({ ...mapMovie(row as Parameters<typeof mapMovie>[0]), provider: 'tmdb' })
+      } else {
+        out.push({ ...mapTv(row as Parameters<typeof mapTv>[0]), provider: 'tmdb' })
+      }
+      if (out.length >= 24) break
+    }
+    return filterNarrativeCatalogItems(out)
+  }
+
+  if (catalogType === 'anime') {
+    const params: Record<string, string> = {
+      page: String(page),
+      sort_by: 'popularity.desc',
+      with_genres: genreIds.length ? [...new Set([16, ...genreIds])].join(',') : '16',
+      with_original_language: 'ja',
+      'vote_average.gte': '6.5'
+    }
+    try {
+      const data = await tmdb<{
+        results: Array<Parameters<typeof mapTv>[0] & { original_language?: string }>
+      }>(api, '/discover/tv', params)
+      const mapped = mapResults(data.results, true)
+      if (mapped.length) return mapped
+    } catch {
+      /* fall through to trending */
+    }
+    const trend = await tmdb<{
+      results: Array<Parameters<typeof mapTv>[0] & { original_language?: string }>
+    }>(api, '/trending/tv/week', { page: String(page) })
+    return mapResults(trend.results, true)
+  }
+
+  const tmdbType = catalogType === 'movie' ? 'movie' : 'tv'
+  if (genreIds.length > 0) {
+    const data = await tmdb<{
+      results: Array<(Parameters<typeof mapMovie>[0] | Parameters<typeof mapTv>[0]) & { original_language?: string }>
+    }>(api, `/discover/${tmdbType}`, {
+      with_genres: genreIds.join(','),
+      page: String(page),
+      sort_by: 'popularity.desc',
+      'vote_average.gte': '6.5'
+    })
+    // Movies/TV shelves exclude anime signature
+    const filtered = data.results.filter((row) => {
+      const gids = row.genre_ids || []
+      const lang = row.original_language
+      if (gids.includes(16) && lang === 'ja') return false
+      return true
+    })
+    return mapResults(filtered, false)
+  }
+
+  const trend = await tmdb<{
+    results: Array<(Parameters<typeof mapMovie>[0] | Parameters<typeof mapTv>[0]) & { original_language?: string }>
+  }>(api, `/trending/${tmdbType}/week`, { page: String(page) })
+  const filtered = trend.results.filter((row) => {
+    const gids = row.genre_ids || []
+    const lang = row.original_language
+    if (gids.includes(16) && lang === 'ja') return false
+    return true
+  })
+  return mapResults(filtered, false)
+}
+
 /** Enrich by IMDb id — original backdrop, tagline, cert, cast, stills, trailer. */
 export async function enrichFromImdb(
   apiKey: string,
@@ -295,36 +590,20 @@ export async function enrichFromImdb(
       episode_run_time?: number[]
       backdrop_path: string | null
       credits?: {
-        crew: { id?: number; job: string; name: string; profile_path: string | null }[]
-        cast: { id?: number; name: string; character: string; profile_path: string | null }[]
+        crew: TmdbCrewCredit[]
+        cast: TmdbCastCredit[]
       }
-      images?: { backdrops: { file_path: string }[] }
+      images?: { backdrops: TmdbBackdrop[] }
       videos?: { results: { site: string; type: string; key: string; name?: string; official?: boolean }[] }
       content_ratings?: { results: { iso_3166_1: string; rating: string }[] }
     }>(apiKey, `/tv/${tmdbId}`, {
-      append_to_response: 'credits,images,videos,content_ratings'
+      append_to_response: 'credits,images,videos,content_ratings',
+      // en + null so untagged official stills are included (otherwise often ~3)
+      include_image_language: 'en,null'
     })
-    const director = m.credits?.crew.find((c) => c.job === 'Director' || c.job === 'Series Director')
-    const cast: CastMember[] = []
-    if (director) {
-      cast.push({
-        name: director.name,
-        character: 'Director',
-        photoUrl: director.profile_path ? `${IMG}/w185${director.profile_path}` : null,
-        role: 'director',
-        tmdbPersonId: director.id ?? null
-      })
-    }
-    for (const c of (m.credits?.cast || []).slice(0, 4)) {
-      cast.push({
-        name: c.name,
-        character: c.character,
-        photoUrl: c.profile_path ? `${IMG}/w185${c.profile_path}` : null,
-        role: 'cast',
-        tmdbPersonId: c.id ?? null
-      })
-    }
-    const trailer = pickBestTrailer(m.videos?.results)
+    const cast = pickCastAndCrew(m.credits)
+    const stills = mapOfficialStills(m.images?.backdrops)
+        const trailer = pickBestTrailer(m.videos?.results)
     const us = m.content_ratings?.results.find((r) => r.iso_3166_1 === 'US')
     return {
       backdropUrl: m.backdrop_path ? `${IMG}/original${m.backdrop_path}` : null,
@@ -334,7 +613,7 @@ export async function enrichFromImdb(
         runtimeMinutes: m.episode_run_time?.[0] || null,
         ageRating: us?.rating || null,
         trailerYoutubeId: trailer?.key || null,
-        stills: (m.images?.backdrops || []).slice(0, 12).map((b) => `${IMG}/original${b.file_path}`),
+        stills,
         cast
       }
     }
@@ -346,38 +625,21 @@ export async function enrichFromImdb(
     runtime?: number
     backdrop_path: string | null
     credits?: {
-      crew: { id?: number; job: string; name: string; profile_path: string | null }[]
-      cast: { id?: number; name: string; character: string; profile_path: string | null }[]
+      crew: TmdbCrewCredit[]
+      cast: TmdbCastCredit[]
     }
-    images?: { backdrops: { file_path: string }[] }
+    images?: { backdrops: TmdbBackdrop[] }
     videos?: { results: { site: string; type: string; key: string; name?: string; official?: boolean }[] }
     release_dates?: {
       results: { iso_3166_1: string; release_dates: { certification: string }[] }[]
     }
   }>(apiKey, `/movie/${tmdbId}`, {
-    append_to_response: 'credits,images,videos,release_dates'
+    append_to_response: 'credits,images,videos,release_dates',
+    include_image_language: 'en,null'
   })
 
-  const director = m.credits?.crew.find((c) => c.job === 'Director')
-  const cast: CastMember[] = []
-  if (director) {
-    cast.push({
-      name: director.name,
-      character: 'Director',
-      photoUrl: director.profile_path ? `${IMG}/w185${director.profile_path}` : null,
-      role: 'director',
-      tmdbPersonId: director.id ?? null
-    })
-  }
-  for (const c of (m.credits?.cast || []).slice(0, 4)) {
-    cast.push({
-      name: c.name,
-      character: c.character,
-      photoUrl: c.profile_path ? `${IMG}/w185${c.profile_path}` : null,
-      role: 'cast',
-      tmdbPersonId: c.id ?? null
-    })
-  }
+  const cast = pickCastAndCrew(m.credits)
+  const stills = mapOfficialStills(m.images?.backdrops)
   const trailer = pickBestTrailer(m.videos?.results)
   const us = m.release_dates?.results.find((r) => r.iso_3166_1 === 'US')
   const cert = us?.release_dates.find((r) => r.certification)?.certification || null
@@ -390,7 +652,7 @@ export async function enrichFromImdb(
       runtimeMinutes: m.runtime || null,
       ageRating: cert || null,
       trailerYoutubeId: trailer?.key || null,
-      stills: (m.images?.backdrops || []).slice(0, 12).map((b) => `${IMG}/original${b.file_path}`),
+      stills,
       cast
     }
   }
@@ -402,7 +664,8 @@ export function mergeExtras(base: MediaExtras, enrich: MediaExtras): MediaExtras
     runtimeMinutes: enrich.runtimeMinutes || base.runtimeMinutes || null,
     ageRating: enrich.ageRating || base.ageRating || null,
     trailerYoutubeId: enrich.trailerYoutubeId || base.trailerYoutubeId || null,
-    stills: [...new Set([...(enrich.stills || []), ...(base.stills || [])])].slice(0, 16),
+    stills: [...new Set([...(enrich.stills || []), ...(base.stills || [])])].slice(0, STILL_LIMIT),
+    // Prefer TMDB top-billed + crew over YTS bit-part lists
     cast: enrich.cast?.length ? enrich.cast : base.cast || []
   }
 }
@@ -513,6 +776,97 @@ export async function fetchTitleLogoUrl(
     return `${IMG}/original${pick.file_path}`
   } catch {
     return null
+  }
+}
+
+async function resolveTmdbIdForMedia(
+  apiKey: string,
+  opts: {
+    imdbId?: string | null
+    tmdbId?: number | null
+    mediaType: 'movie' | 'series' | 'anime'
+    provider?: CatalogItem['provider']
+    externalId?: number
+  }
+): Promise<{ kind: 'movie' | 'tv'; tmdbId: number } | null> {
+  const kind: 'movie' | 'tv' =
+    opts.mediaType === 'series' || opts.mediaType === 'anime' ? 'tv' : 'movie'
+
+  if (opts.provider === 'tmdb' && opts.externalId) {
+    return { kind, tmdbId: opts.externalId }
+  }
+  if (opts.tmdbId) return { kind, tmdbId: opts.tmdbId }
+
+  if (opts.imdbId) {
+    try {
+      const find = await tmdb<{
+        movie_results: { id: number }[]
+        tv_results: { id: number }[]
+      }>(apiKey, `/find/${encodeURIComponent(opts.imdbId)}`, { external_source: 'imdb_id' })
+      const id =
+        kind === 'tv'
+          ? find.tv_results[0]?.id || null
+          : find.movie_results[0]?.id || find.tv_results[0]?.id || null
+      if (id) return { kind, tmdbId: id }
+    } catch {
+      return null
+    }
+  }
+  return null
+}
+
+/** Full backdrop set for hero selection (`include_image_language=en,null`). */
+export async function fetchTitleBackdrops(
+  apiKey: string,
+  opts: {
+    imdbId?: string | null
+    tmdbId?: number | null
+    mediaType: 'movie' | 'series' | 'anime'
+    provider?: CatalogItem['provider']
+    externalId?: number
+  }
+): Promise<{
+  backdrops: Array<{
+    file_path: string
+    width: number
+    height: number
+    aspect_ratio: number
+    vote_average: number
+    vote_count: number
+    iso_639_1: string | null
+  }>
+  fallbackPath: string | null
+}> {
+  if (!apiKey) return { backdrops: [], fallbackPath: null }
+  const resolved = await resolveTmdbIdForMedia(apiKey, opts)
+  if (!resolved) return { backdrops: [], fallbackPath: null }
+
+  try {
+    const data = await tmdb<{
+      backdrops?: TmdbBackdrop[]
+    }>(apiKey, `/${resolved.kind}/${resolved.tmdbId}/images`, {
+      include_image_language: 'en,null'
+    })
+
+    const backdrops = (data.backdrops || [])
+      .filter((b) => Boolean(b.file_path))
+      .map((b) => ({
+        file_path: b.file_path,
+        width: b.width || 0,
+        height: b.height || 0,
+        aspect_ratio:
+          b.aspect_ratio || (b.width && b.height ? b.width / b.height : 1.778),
+        vote_average: b.vote_average || 0,
+        vote_count: b.vote_count || 0,
+        iso_639_1: b.iso_639_1 ?? null
+      }))
+
+    return {
+      backdrops,
+      fallbackPath: backdrops[0]?.file_path || null
+    }
+  } catch {
+    return { backdrops: [], fallbackPath: null }
   }
 }
 

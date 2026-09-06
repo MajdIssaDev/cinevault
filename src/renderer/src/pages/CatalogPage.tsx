@@ -1,19 +1,21 @@
-import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { AnimatePresence, motion } from 'framer-motion'
+import { startTransition, useCallback, useEffect, useMemo, useRef, useState, memo } from 'react'
 import { Search, X } from 'lucide-react'
 import type { CatalogItem, MediaType } from '../types'
 import { useAppStore } from '../store'
 import { PosterCard } from '../components/PosterCard'
-import { CatalogHero } from '../components/CatalogHero'
+import { FeaturedHero } from '../components/FeaturedHero'
 import { ContinueWatchingRow } from '../components/ContinueWatchingRow'
+import { ForYouShelf } from '../components/ForYouShelf'
 import { WatchLaterShelf } from '../components/WatchLaterShelf'
 import { GenreChips } from '../components/GenreChips'
 import { ThemedSelect } from '../components/ThemedSelect'
+import { Tooltip } from '../components/ui/Tooltip'
 import {
   SearchCorrectionNotice,
   type SearchCorrection
 } from '../components/SearchCorrectionNotice'
 import { getSpellingSuggestion } from '../services/searchSuggestionService'
+import { buildSearchQuery, searchCatalog } from '../services/searchService'
 import {
   YTS_GENRES,
   fetchMoviesByGenre,
@@ -27,8 +29,9 @@ import {
   searchSeries
 } from '../api/tvmaze'
 import { fetchAnimeByGenre, fetchPopularAnime, searchAnime } from '../api/anilist'
+import { resolveTmdbApiKey } from '../api/tmdb'
 import { catalogCacheKey, getCatalogCache, setCatalogCache } from '../lib/catalogCache'
-
+import { pickFeaturedCandidates } from '../lib/featuredDeck'
 const ANIME_GENRES = [
   'Action',
   'Adventure',
@@ -45,26 +48,6 @@ const ANIME_GENRES = [
   'Supernatural'
 ]
 
-const EASE_OUT_EXPO: [number, number, number, number] = [0.16, 1, 0.3, 1]
-
-const gridVariants = {
-  hidden: { opacity: 0 },
-  visible: {
-    opacity: 1,
-    transition: { staggerChildren: 0.04, delayChildren: 0.05 }
-  }
-}
-
-const cardVariants = {
-  hidden: { opacity: 0, scale: 0.94, y: 12 },
-  visible: {
-    opacity: 1,
-    scale: 1,
-    y: 0,
-    transition: { duration: 0.25, ease: 'easeOut' as const }
-  }
-}
-
 function genresFor(mediaType: MediaType): string[] {
   if (mediaType === 'movie') return YTS_GENRES
   if (mediaType === 'series') return TVMAZE_GENRES
@@ -75,22 +58,42 @@ async function loadCatalogPage(
   mediaType: MediaType,
   searchQuery: string,
   genreFilter: string,
-  page: number
+  page: number,
+  tmdbApiKey?: string | null
 ): Promise<CatalogItem[]> {
-  const q = searchQuery.trim()
+  const q = buildSearchQuery(searchQuery)
+  if (q) {
+    // Text search: TMDB multi relevance order — never year-param hijack or client re-sort.
+    try {
+      const tmdbHits = await searchCatalog(tmdbApiKey, q, mediaType, page)
+      if (tmdbHits.length) return tmdbHits
+    } catch {
+      /* fall through to provider search */
+    }
+    if (mediaType === 'anime') return searchAnime(q, page)
+    if (mediaType === 'movie') return searchMovies(q, page)
+    return searchSeries(q, page)
+  }
   if (mediaType === 'anime') {
-    if (q) return searchAnime(q, page)
     if (genreFilter !== 'all') return fetchAnimeByGenre(genreFilter, page)
     return fetchPopularAnime(page)
   }
   if (mediaType === 'movie') {
-    if (q) return searchMovies(q, page)
     if (genreFilter !== 'all') return fetchMoviesByGenre(genreFilter, page)
     return fetchNewAndPopularMovies(page)
   }
-  if (q) return searchSeries(q, page)
   if (genreFilter !== 'all') return fetchSeriesByGenre(genreFilter, page)
   return fetchNewAndPopularSeries(page)
+}
+
+function presentCatalogItems(
+  list: CatalogItem[],
+  sortBy: CatalogSort,
+  isSearch: boolean
+): CatalogItem[] {
+  // Preserve TMDB / provider search relevance — do not bury matches under rating/date sorts.
+  if (isSearch) return list
+  return sortCatalogItems(list, sortBy)
 }
 
 function mergeUnique(existing: CatalogItem[], next: CatalogItem[]): CatalogItem[] {
@@ -104,19 +107,80 @@ function mergeUnique(existing: CatalogItem[], next: CatalogItem[]): CatalogItem[
   return out
 }
 
+type CatalogSort = 'popularity' | 'rating' | 'date' | 'title'
+
+function sortCatalogItems(list: CatalogItem[], mode: CatalogSort): CatalogItem[] {
+  if (mode === 'popularity' || list.length <= 1) return list
+  const copy = [...list]
+  switch (mode) {
+    case 'rating':
+      return copy.sort((a, b) => b.rating - a.rating)
+    case 'date':
+      return copy.sort((a, b) => (b.releaseDate || '').localeCompare(a.releaseDate || ''))
+    case 'title':
+      return copy.sort((a, b) => a.title.localeCompare(b.title))
+    default:
+      return copy
+  }
+}
+
+/** Append only — never reorders existing rows (avoids grid reshuffle on infinite scroll). */
+function appendDisplayItems(prev: CatalogItem[], merged: CatalogItem[]): CatalogItem[] {
+  const seen = new Set(prev.map((i) => i.id))
+  const added = merged.filter((i) => !seen.has(i.id))
+  return added.length ? [...prev, ...added] : prev
+}
+
 function prefetchPosters(items: CatalogItem[]): void {
-  for (const item of items.slice(0, 24)) {
-    if (!item.posterUrl) continue
-    const img = new Image()
-    img.decoding = 'async'
-    img.src = item.posterUrl
+  // Small, idle-friendly warm — avoid decoding a full page that is also mounting in the DOM
+  const warm = items.slice(0, 8)
+  const run = (): void => {
+    for (const item of warm) {
+      if (!item.posterUrl) continue
+      const img = new Image()
+      img.decoding = 'async'
+      img.src = item.posterUrl
+    }
+  }
+  if (typeof requestIdleCallback === 'function') {
+    requestIdleCallback(() => run(), { timeout: 1200 })
+  } else {
+    window.setTimeout(run, 120)
+  }
+}
+
+const SIBLING_TYPES: MediaType[] = ['movie', 'series', 'anime']
+
+/** Warm page-1 of other tabs into the in-memory catalog cache (no React mount). */
+function warmSiblingCatalogCaches(
+  current: MediaType,
+  searchQuery: string,
+  genreFilter: string,
+  tmdbApiKey?: string | null
+): void {
+  const run = (): void => {
+    for (const type of SIBLING_TYPES) {
+      if (type === current) continue
+      const key = catalogCacheKey(type, searchQuery, genreFilter)
+      if (getCatalogCache(key)?.items.length) continue
+      void loadCatalogPage(type, searchQuery, genreFilter, 1, tmdbApiKey)
+        .then((list) => {
+          if (list.length) setCatalogCache(key, list, 1)
+        })
+        .catch(() => {})
+    }
+  }
+  if (typeof requestIdleCallback === 'function') {
+    requestIdleCallback(() => run(), { timeout: 2500 })
+  } else {
+    window.setTimeout(run, 600)
   }
 }
 
 function sentinelNeedsMore(
   root: Element | null,
   target: Element | null,
-  rootMarginPx = 1400
+  rootMarginPx = 600
 ): boolean {
   if (!root || !target) return false
   const rootRect = root.getBoundingClientRect()
@@ -124,18 +188,49 @@ function sentinelNeedsMore(
   return targetRect.top <= rootRect.bottom + rootMarginPx
 }
 
-export function CatalogPage({ mediaType }: { mediaType: MediaType }): JSX.Element {
+/** Isolated so loadingMore / correction updates do not re-render every poster. */
+const CatalogPosterGrid = memo(function CatalogPosterGrid({
+  items
+}: {
+  items: CatalogItem[]
+}): JSX.Element {
+  return (
+    <div className="poster-grid">
+      {items.map((item) => (
+        <div key={item.id} className="poster-grid-item">
+          <PosterCard item={item} />
+        </div>
+      ))}
+    </div>
+  )
+})
+
+export function CatalogPage({
+  mediaType,
+  active = true
+}: {
+  mediaType: MediaType
+  /** False while another catalog tab is showing — pause IO / background growth. */
+  active?: boolean
+}): JSX.Element {
   const searchQuery = useAppStore((s) => s.searchQuery)
   const setSearchQuery = useAppStore((s) => s.setSearchQuery)
   const genreFilter = useAppStore((s) => s.genreFilter)
   const setGenreFilter = useAppStore((s) => s.setGenreFilter)
   const sortBy = useAppStore((s) => s.sortBy)
   const setSortBy = useAppStore((s) => s.setSortBy)
+  const tmdbApiKey = useAppStore((s) => s.settings?.tmdbApiKey)
 
   const cacheKey = catalogCacheKey(mediaType, searchQuery, genreFilter)
   const cached = getCatalogCache(cacheKey)
+  const isSearchQuery = buildSearchQuery(searchQuery).length > 0
 
   const [items, setItems] = useState<CatalogItem[]>(cached?.items ?? [])
+  const [displayItems, setDisplayItems] = useState<CatalogItem[]>(() => {
+    const mode = (useAppStore.getState().sortBy || 'popularity') as CatalogSort
+    const q = buildSearchQuery(useAppStore.getState().searchQuery || '')
+    return presentCatalogItems(cached?.items ?? [], mode, q.length > 0)
+  })
   const [page, setPage] = useState(cached?.lastPage ?? 1)
   const [hasMore, setHasMore] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -154,6 +249,11 @@ export function CatalogPage({ mediaType }: { mediaType: MediaType }): JSX.Elemen
   const pendingOriginalRef = useRef<string | null>(null)
   const autoCorrectingRef = useRef(false)
 
+  const activeRef = useRef(active)
+  useEffect(() => {
+    activeRef.current = active
+  }, [active])
+
   useEffect(() => {
     hasMoreRef.current = hasMore
   }, [hasMore])
@@ -163,6 +263,7 @@ export function CatalogPage({ mediaType }: { mediaType: MediaType }): JSX.Elemen
   useEffect(() => {
     itemsRef.current = items
   }, [items])
+
   useEffect(() => {
     loadingRef.current = loading
   }, [loading])
@@ -174,13 +275,27 @@ export function CatalogPage({ mediaType }: { mediaType: MediaType }): JSX.Elemen
   useEffect(() => {
     const pane = paneRef.current || document.querySelector('.main-pane')
     if (pane) pane.scrollTop = 0
-  }, [mediaType, genreFilter])
+  }, [genreFilter])
+
+  const scrollTopByTabRef = useRef(0)
+  useEffect(() => {
+    const pane = (paneRef.current || document.querySelector('.main-pane')) as HTMLElement | null
+    if (!pane) return
+    if (!active) {
+      scrollTopByTabRef.current = pane.scrollTop
+      return
+    }
+    pane.scrollTop = scrollTopByTabRef.current
+  }, [active])
 
   const loadMore = useCallback(async (): Promise<void> => {
+    if (!activeRef.current) return
     if (loadingMoreRef.current || !hasMoreRef.current || loadingRef.current) return
     loadingMoreRef.current = true
-    setLoadingMore(true)
+    // Only show spinner if the fetch is slow — avoids a full catalog paint on fast pages
+    const spinnerTimer = window.setTimeout(() => setLoadingMore(true), 220)
     const key = catalogCacheKey(mediaType, searchQuery, genreFilter)
+    const apiKey = resolveTmdbApiKey(useAppStore.getState().settings?.tmdbApiKey)
 
     try {
       // One page per trigger — keeps scroll smooth; chain once after paint if still short
@@ -190,7 +305,7 @@ export function CatalogPage({ mediaType }: { mediaType: MediaType }): JSX.Elemen
       for (let attempt = 0; attempt < 8; attempt++) {
         let list: CatalogItem[] = []
         try {
-          list = await loadCatalogPage(mediaType, searchQuery, genreFilter, nextPage)
+          list = await loadCatalogPage(mediaType, searchQuery, genreFilter, nextPage, apiKey)
         } catch {
           break
         }
@@ -206,22 +321,28 @@ export function CatalogPage({ mediaType }: { mediaType: MediaType }): JSX.Elemen
           break
         }
 
-        prefetchPosters(list)
         const prev = itemsRef.current
         const merged = mergeUnique(prev, list)
         if (merged.length > prev.length) {
           itemsRef.current = merged
           pageRef.current = nextPage
           setCatalogCache(key, merged, nextPage)
+          // Low-priority append; append-only display order (no re-sort on fetch).
           startTransition(() => {
             setItems(merged)
+            setDisplayItems((prevDisplay) => appendDisplayItems(prevDisplay, merged))
             setPage(nextPage)
           })
           appended = true
-          hasMoreRef.current = true
-          setHasMore(true)
-          void loadCatalogPage(mediaType, searchQuery, genreFilter, nextPage + 1).then((warm) => {
-            if (warm.length) prefetchPosters(warm)
+          if (!hasMoreRef.current) {
+            hasMoreRef.current = true
+            setHasMore(true)
+          } else {
+            hasMoreRef.current = true
+          }
+          // Prefetch next page quietly — do not decode the page we just mounted (DOM will)
+          void loadCatalogPage(mediaType, searchQuery, genreFilter, nextPage + 1, apiKey).then((warm) => {
+            if (warm.length) prefetchPosters(warm.slice(0, 8))
           })
           break
         }
@@ -229,17 +350,20 @@ export function CatalogPage({ mediaType }: { mediaType: MediaType }): JSX.Elemen
       }
 
       if (appended) {
-        requestAnimationFrame(() => {
+        // Cooldown so scroll + decode can settle before another page mounts
+        window.setTimeout(() => {
           if (
+            activeRef.current &&
             hasMoreRef.current &&
             !loadingMoreRef.current &&
-            sentinelNeedsMore(paneRef.current, sentinelRef.current)
+            sentinelNeedsMore(paneRef.current, sentinelRef.current, 280)
           ) {
             void loadMore()
           }
-        })
+        }, 700)
       }
     } finally {
+      window.clearTimeout(spinnerTimer)
       loadingMoreRef.current = false
       setLoadingMore(false)
     }
@@ -248,7 +372,7 @@ export function CatalogPage({ mediaType }: { mediaType: MediaType }): JSX.Elemen
   useEffect(() => {
     let cancelled = false
     const key = catalogCacheKey(mediaType, searchQuery, genreFilter)
-    const rawQuery = searchQuery.trim()
+    const rawQuery = buildSearchQuery(searchQuery)
     const hit = getCatalogCache(key)
 
     const applySuggestionLogic = async (list: CatalogItem[]): Promise<void> => {
@@ -313,6 +437,7 @@ export function CatalogPage({ mediaType }: { mediaType: MediaType }): JSX.Elemen
 
     if (hit?.items.length) {
       setItems(hit.items)
+      setDisplayItems(presentCatalogItems(hit.items, sortBy as CatalogSort, Boolean(rawQuery)))
       setPage(hit.lastPage)
       pageRef.current = hit.lastPage
       itemsRef.current = hit.items
@@ -322,8 +447,9 @@ export function CatalogPage({ mediaType }: { mediaType: MediaType }): JSX.Elemen
       setLoading(false)
       loadingRef.current = false
       void applySuggestionLogic(hit.items)
+      warmSiblingCatalogCaches(mediaType, searchQuery, genreFilter, tmdbApiKey)
       queueMicrotask(() => {
-        if (!cancelled) void loadMore()
+        if (!cancelled && activeRef.current) void loadMore()
       })
       return () => {
         cancelled = true
@@ -331,6 +457,7 @@ export function CatalogPage({ mediaType }: { mediaType: MediaType }): JSX.Elemen
     }
 
     setItems([])
+    setDisplayItems([])
     setPage(1)
     pageRef.current = 1
     itemsRef.current = []
@@ -346,16 +473,18 @@ export function CatalogPage({ mediaType }: { mediaType: MediaType }): JSX.Elemen
 
     const run = async (): Promise<void> => {
       try {
-        const list = await loadCatalogPage(mediaType, searchQuery, genreFilter, 1)
+        const list = await loadCatalogPage(mediaType, searchQuery, genreFilter, 1, tmdbApiKey)
         if (cancelled) return
         setCatalogCache(key, list, 1)
         setItems(list)
+        setDisplayItems(presentCatalogItems(list, sortBy as CatalogSort, Boolean(rawQuery)))
         itemsRef.current = list
         setPage(1)
         pageRef.current = 1
         setHasMore(list.length > 0)
         hasMoreRef.current = list.length > 0
         prefetchPosters(list)
+        warmSiblingCatalogCaches(mediaType, searchQuery, genreFilter, tmdbApiKey)
         await applySuggestionLogic(list)
       } catch (e) {
         if (!cancelled) setError(e instanceof Error ? e.message : 'Failed to load catalog')
@@ -363,7 +492,7 @@ export function CatalogPage({ mediaType }: { mediaType: MediaType }): JSX.Elemen
         if (!cancelled) {
           setLoading(false)
           loadingRef.current = false
-          void loadMore()
+          if (activeRef.current) void loadMore()
         }
       }
     }
@@ -374,7 +503,13 @@ export function CatalogPage({ mediaType }: { mediaType: MediaType }): JSX.Elemen
       cancelled = true
       clearTimeout(t)
     }
-  }, [mediaType, searchQuery, genreFilter, loadMore, setSearchQuery])
+  }, [mediaType, searchQuery, genreFilter, loadMore, setSearchQuery, tmdbApiKey])
+
+  // Browse-only: apply catalog sort when the user changes it. Search keeps relevance order.
+  useEffect(() => {
+    if (buildSearchQuery(searchQuery)) return
+    setDisplayItems(sortCatalogItems(itemsRef.current, sortBy as CatalogSort))
+  }, [sortBy, searchQuery])
 
   const onSearchInputChange = (value: string): void => {
     pendingOriginalRef.current = null
@@ -400,6 +535,7 @@ export function CatalogPage({ mediaType }: { mediaType: MediaType }): JSX.Elemen
   }
 
   useEffect(() => {
+    if (!active) return
     const root = document.querySelector('.main-pane')
     const target = sentinelRef.current
     if (!root || !target) return
@@ -407,43 +543,36 @@ export function CatalogPage({ mediaType }: { mediaType: MediaType }): JSX.Elemen
 
     const io = new IntersectionObserver(
       (entries) => {
+        if (!activeRef.current) return
         if (entries.some((e) => e.isIntersecting)) void loadMore()
       },
-      { root, rootMargin: '1200px 0px', threshold: 0 }
+      // Smaller margin: fetch nearer the end so the mount hitch isn't mid-scroll
+      { root, rootMargin: '280px 0px', threshold: 0 }
     )
     io.observe(target)
     return () => io.disconnect()
-  }, [loadMore])
+  }, [loadMore, active])
 
-  const sorted = useMemo(() => {
-    // Keep API order for popularity so newly fetched pages stay at the bottom
-    if (sortBy === 'popularity') return items
-    const copy = [...items]
-    switch (sortBy) {
-      case 'rating':
-        return copy.sort((a, b) => b.rating - a.rating)
-      case 'date':
-        return copy.sort((a, b) => (b.releaseDate || '').localeCompare(a.releaseDate || ''))
-      case 'title':
-        return copy.sort((a, b) => a.title.localeCompare(b.title))
-      default:
-        return copy
-    }
-  }, [items, sortBy])
+  const onSortChange = (value: string): void => {
+    const mode = value as CatalogSort
+    setSortBy(mode)
+    // Never reshuffle active text-search results (TMDB relevance order).
+    if (buildSearchQuery(searchQuery)) return
+    setDisplayItems(sortCatalogItems(itemsRef.current, mode))
+  }
 
-  const browseFeaturedRef = useRef<CatalogItem | null>(null)
+  const browseFeaturedRef = useRef<CatalogItem[]>([])
 
-  const featured = useMemo(() => {
+  const featuredDeck = useMemo(() => {
     if (searchQuery.trim()) return browseFeaturedRef.current
-    // Prefer titles that actually have a landscape backdrop
-    const next = sorted.find((i) => i.backdropUrl) || null
-    browseFeaturedRef.current = next
+    const next = pickFeaturedCandidates(displayItems)
+    if (next.length) browseFeaturedRef.current = next
     return next
-  }, [sorted, searchQuery])
+  }, [displayItems, searchQuery])
 
   const genres = genresFor(mediaType)
   const title = mediaType === 'movie' ? 'Movies' : mediaType === 'series' ? 'Series' : 'Anime'
-  const isSearching = searchQuery.trim().length > 0
+  const isSearching = isSearchQuery
 
   const clearSearch = (): void => {
     onSearchInputChange('')
@@ -451,69 +580,28 @@ export function CatalogPage({ mediaType }: { mediaType: MediaType }): JSX.Elemen
 
   return (
     <div className={`catalog-page${isSearching ? ' is-searching' : ''}`}>
-      <AnimatePresence initial={false}>
-        {!isSearching && featured && (
-          <motion.div
-            key="catalog-hero"
-            className="catalog-browse-hero"
-            initial={{ opacity: 0, height: 0 }}
-            animate={{
-              opacity: 1,
-              height: 'auto',
-              transition: { duration: 0.35, ease: 'easeInOut' }
-            }}
-            exit={{
-              opacity: 0,
-              height: 0,
-              marginBottom: 0,
-              transition: { duration: 0.3, ease: 'easeInOut' }
-            }}
-            style={{ overflow: 'hidden' }}
-          >
-            <CatalogHero item={featured} />
-          </motion.div>
-        )}
-      </AnimatePresence>
+      {!isSearching && featuredDeck.length > 0 ? (
+        <div className="catalog-browse-hero">
+          <FeaturedHero items={featuredDeck} />
+        </div>
+      ) : null}
 
       <div className="catalog-body">
-        <AnimatePresence initial={false}>
-          {!isSearching && (
-            <motion.div
-              key="catalog-shelves"
-              className="catalog-browse-shelves"
-              initial={{ opacity: 0, height: 0 }}
-              animate={{
-                opacity: 1,
-                height: 'auto',
-                transition: { duration: 0.35, ease: 'easeInOut' }
-              }}
-              exit={{
-                opacity: 0,
-                height: 0,
-                marginBottom: 0,
-                transition: { duration: 0.3, ease: 'easeInOut' }
-              }}
-              style={{ overflow: 'hidden' }}
-            >
-              <ContinueWatchingRow mediaType={mediaType} />
-              <WatchLaterShelf mediaType={mediaType === 'series' ? 'tv' : mediaType} />
-            </motion.div>
-          )}
-        </AnimatePresence>
+        {!isSearching ? (
+          <div className="catalog-browse-shelves">
+            <ContinueWatchingRow mediaType={mediaType} />
+            <ForYouShelf mediaType={mediaType} />
+            <WatchLaterShelf mediaType={mediaType === 'series' ? 'tv' : mediaType} />
+          </div>
+        ) : null}
 
-        <motion.div
-          layout
-          className="catalog-toolbar"
-          transition={{ duration: 0.3, ease: 'easeOut' }}
-        >
+        <div className="catalog-toolbar">
           <div className="catalog-heading">
             <h1 className="catalog-section-title">{isSearching ? `Search · ${title}` : title}</h1>
           </div>
           <div className="catalog-tools">
-            <motion.label
-              layout
+            <label
               className={`catalog-search-wrap${isSearching ? ' is-searching' : ''}`}
-              transition={{ duration: 0.3, ease: 'easeOut' }}
             >
               <span className="catalog-search-icon" aria-hidden>
                 <Search size={16} strokeWidth={2} />
@@ -525,31 +613,25 @@ export function CatalogPage({ mediaType }: { mediaType: MediaType }): JSX.Elemen
                 onChange={(e) => onSearchInputChange(e.target.value)}
                 aria-label={`Search ${title.toLowerCase()}`}
               />
-              <AnimatePresence initial={false}>
-                {isSearching && (
-                  <motion.button
-                    key="search-clear"
+              {isSearching ? (
+                <Tooltip content="Clear search">
+                  <button
                     type="button"
                     className="catalog-search-clear"
-                    title="Clear search"
                     aria-label="Clear search"
-                    initial={{ opacity: 0 }}
-                    animate={{ opacity: 1 }}
-                    exit={{ opacity: 0 }}
-                    transition={{ duration: 0.18 }}
                     onClick={clearSearch}
                   >
                     <X size={14} strokeWidth={2.5} />
-                  </motion.button>
-                )}
-              </AnimatePresence>
-            </motion.label>
+                  </button>
+                </Tooltip>
+              ) : null}
+            </label>
             <ThemedSelect
               variant="catalog"
               className="catalog-sort-select"
               aria-label="Sort catalog"
               value={sortBy}
-              onChange={(v) => setSortBy(v as typeof sortBy)}
+              onChange={onSortChange}
               menuMinWidth={152}
               options={[
                 { value: 'popularity', label: 'Popularity' },
@@ -559,7 +641,7 @@ export function CatalogPage({ mediaType }: { mediaType: MediaType }): JSX.Elemen
               ]}
             />
           </div>
-        </motion.div>
+        </div>
 
         <GenreChips aria-label="Genres">
           <button
@@ -597,37 +679,14 @@ export function CatalogPage({ mediaType }: { mediaType: MediaType }): JSX.Elemen
             {error}
           </div>
         )}
-        {!loading && !error && sorted.length === 0 && (
+        {!loading && !error && displayItems.length === 0 && (
           <div className="empty">No titles found. Try another search or genre.</div>
         )}
 
-        <AnimatePresence mode="wait" initial={false}>
-          <motion.div
-            key={isSearching ? 'search-results' : 'catalog-browse-grid'}
-            className="poster-grid"
-            variants={gridVariants}
-            initial="hidden"
-            animate="visible"
-            exit={{
-              opacity: 0,
-              y: 10,
-              transition: { duration: 0.22, ease: EASE_OUT_EXPO }
-            }}
-            transition={{ duration: 0.3, ease: EASE_OUT_EXPO }}
-          >
-            {sorted.map((item) => (
-              <motion.div key={item.id} className="poster-grid-item" variants={cardVariants}>
-                <PosterCard item={item} />
-              </motion.div>
-            ))}
-          </motion.div>
-        </AnimatePresence>
-        <div ref={sentinelRef} data-catalog-sentinel style={{ height: 1 }} aria-hidden />
-        {loadingMore && (
-          <div className="muted" style={{ padding: '16px 0' }}>
-            Loading more…
-          </div>
-        )}
+        <CatalogPosterGrid items={displayItems} />
+        <div ref={sentinelRef} data-catalog-sentinel className="catalog-load-sentinel">
+          {loadingMore ? <div className="catalog-load-spinner" aria-label="Loading more" /> : null}
+        </div>
       </div>
     </div>
   )

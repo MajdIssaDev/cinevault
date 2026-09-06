@@ -1,14 +1,25 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { Link, useNavigate, useParams } from 'react-router-dom'
-import { ArrowLeft, ChevronDown, Clapperboard, Clock, Heart, Play, RotateCcw, Star } from 'lucide-react'
+import { ArrowLeft, Clapperboard, Clock, Heart, Play, RotateCcw, Star, X } from 'lucide-react'
 import { useAppStore } from '../store'
 import type { CatalogItem, EpisodeInfo, MediaExtras, Quality, SeasonInfo, StreamSource } from '../types'
-import { fetchMovieDetails } from '../api/ytsCatalog'
-import { episodesForSeason, fetchSeriesDetails } from '../api/tvmaze'
-import { fetchAnimeDetails } from '../api/anilist'
-import { enrichFromImdb, getPersonImdbId, mergeExtras } from '../api/tmdb'
+import { fetchMovieDetails, findMovieByImdb } from '../api/ytsCatalog'
+import { episodesForSeason, fetchSeriesDetails, lookupSeriesByImdb } from '../api/tvmaze'
+import { fetchAnimeDetails, searchAnime } from '../api/anilist'
+import {
+  enrichFromImdb,
+  fetchMovieDetails as fetchTmdbMovieDetails,
+  fetchSeasonEpisodes,
+  fetchSeriesDetails as fetchTmdbSeriesDetails,
+  getPersonImdbId,
+  mergeExtras,
+  resolveTmdbApiKey
+} from '../api/tmdb'
+import { parseDetailIdParam } from '../lib/detailPath'
 import { GalleryLightbox } from '../components/GalleryLightbox'
+import { Tooltip } from '../components/ui/Tooltip'
+import { SelectMenu } from '../components/ui/SelectMenu'
 import {
   formatFileSize,
   searchPublicIndexers,
@@ -24,6 +35,7 @@ import {
 import {
   defaultTargetFromQuality,
   getBestStream,
+  filterValidStreams,
   type TargetRes
 } from '../lib/streamScorer'
 import {
@@ -48,7 +60,6 @@ import {
   type UnifiedSubtitle
 } from '../services/subtitleService'
 import { HScrollRail } from '../components/HScrollRail'
-import { ThemedSelect } from '../components/ThemedSelect'
 import { TrailerModal } from '../components/TrailerModal'
 
 type UiError = {
@@ -106,7 +117,7 @@ function qualityTone(q: Quality | 'unknown'): string {
 
 export function DetailPage(): JSX.Element {
   const { mediaType = 'movie', id = '0' } = useParams()
-  const externalId = Number(id)
+  const { externalId, fromTmdb } = parseDetailIdParam(id)
   const navigate = useNavigate()
   const settings = useAppStore((s) => s.settings)
   const qualityPref = useAppStore((s) => s.qualityPref)
@@ -142,6 +153,9 @@ export function DetailPage(): JSX.Element {
   const [torrentLoading, setTorrentLoading] = useState(false)
   const [torrentError, setTorrentError] = useState<string | null>(null)
   const [startingId, setStartingId] = useState<string | null>(null)
+  const [streamState, setStreamState] = useState<'idle' | 'connecting' | 'buffering'>('idle')
+  const streamAbortRef = useRef<AbortController | null>(null)
+  const startingCacheIdRef = useRef<string | null>(null)
   const [qualityFilter, setQualityFilter] = useState<'all' | Quality | 'unknown'>('all')
   const [selectedRes, setSelectedRes] = useState<TargetRes>(() =>
     defaultTargetFromQuality(qualityPref)
@@ -158,13 +172,167 @@ export function DetailPage(): JSX.Element {
   }, [qualityPref, item?.id])
 
   useEffect(() => {
+    return () => {
+      streamAbortRef.current?.abort()
+    }
+  }, [])
+
+  useEffect(() => {
     let cancelled = false
     const run = async (): Promise<void> => {
       setError(null)
       setExtras({})
       setLightboxIndex(null)
       setTrailer(null)
+      setItem(null)
       try {
+        if (!Number.isFinite(externalId) || externalId <= 0) {
+          throw new Error('Invalid title id')
+        }
+        const tmdbKey = resolveTmdbApiKey(settings?.tmdbApiKey)
+
+        if (fromTmdb) {
+          if (!tmdbKey) throw new Error('TMDB key required for this title')
+
+          if (mediaType === 'movie') {
+            const tmdbItem = await fetchTmdbMovieDetails(tmdbKey, externalId)
+            if (cancelled) return
+            let nextItem: CatalogItem = { ...tmdbItem, provider: 'tmdb', genreIds: tmdbItem.genreIds }
+            let nextExtras: MediaExtras = {}
+            if (tmdbItem.imdbId) {
+              try {
+                const yts = await findMovieByImdb(tmdbItem.imdbId)
+                if (yts?.item?.title) {
+                  nextItem = {
+                    ...yts.item,
+                    overview: tmdbItem.overview || yts.item.overview,
+                    backdropUrl: tmdbItem.backdropUrl || yts.item.backdropUrl,
+                    posterUrl: yts.item.posterUrl || tmdbItem.posterUrl,
+                    genres: tmdbItem.genres?.length ? tmdbItem.genres : yts.item.genres,
+                    genreIds: tmdbItem.genreIds,
+                    imdbId: tmdbItem.imdbId || yts.item.imdbId,
+                    provider: 'yts'
+                  }
+                  nextExtras = yts.extras
+                }
+              } catch {
+                /* keep TMDB metadata */
+              }
+              try {
+                const enrich = await enrichFromImdb(tmdbKey, tmdbItem.imdbId, 'movie')
+                if (enrich) {
+                  if (enrich.backdropUrl) nextItem = { ...nextItem, backdropUrl: enrich.backdropUrl }
+                  if (enrich.overview && enrich.overview.length > (nextItem.overview?.length || 0)) {
+                    nextItem = { ...nextItem, overview: enrich.overview }
+                  }
+                  nextExtras = mergeExtras(nextExtras, enrich.extras)
+                }
+              } catch {
+                /* ok */
+              }
+            }
+            if (cancelled) return
+            setItem(nextItem)
+            setExtras(nextExtras)
+            setImdbId(nextItem.imdbId || tmdbItem.imdbId)
+            return
+          }
+
+          if (mediaType === 'series' || mediaType === 'anime') {
+            const tmdbData = await fetchTmdbSeriesDetails(tmdbKey, externalId)
+            if (cancelled) return
+            let nextItem: CatalogItem = {
+              ...tmdbData.item,
+              mediaType: mediaType as 'series' | 'anime',
+              id: mediaType === 'anime' ? `anime-${externalId}` : tmdbData.item.id,
+              provider: 'tmdb'
+            }
+            let nextExtras: MediaExtras = {}
+            let nextSeasons = tmdbData.seasons
+            let nextEpisodes: EpisodeInfo[] = []
+            let nextImdb = tmdbData.imdbId
+
+            if (mediaType === 'series' && tmdbData.imdbId) {
+              try {
+                const tvmazeId = await lookupSeriesByImdb(tmdbData.imdbId)
+                if (tvmazeId) {
+                  const data = await fetchSeriesDetails(tvmazeId)
+                  nextItem = {
+                    ...data.item,
+                    overview: tmdbData.item.overview || data.item.overview,
+                    backdropUrl: tmdbData.item.backdropUrl || data.item.backdropUrl,
+                    posterUrl: data.item.posterUrl || tmdbData.item.posterUrl,
+                    genres: tmdbData.item.genres?.length ? tmdbData.item.genres : data.item.genres,
+                    provider: 'tvmaze'
+                  }
+                  nextSeasons = data.seasons
+                  nextEpisodes = data.episodes
+                  nextImdb = data.imdbId || tmdbData.imdbId
+                  try {
+                    const enrich = await enrichFromImdb(tmdbKey, nextImdb!, 'tv')
+                    if (enrich) {
+                      if (enrich.backdropUrl) nextItem = { ...nextItem, backdropUrl: enrich.backdropUrl }
+                      if (enrich.overview) nextItem = { ...nextItem, overview: enrich.overview }
+                      nextExtras = enrich.extras
+                    }
+                  } catch {
+                    /* ok */
+                  }
+                }
+              } catch {
+                /* fall through to TMDB seasons */
+              }
+            }
+
+            if (mediaType === 'anime') {
+              try {
+                const hits = await searchAnime(tmdbData.item.title, 1)
+                const hit = hits[0]
+                if (hit) {
+                  const data = await fetchAnimeDetails(hit.externalId)
+                  nextItem = {
+                    ...data.item,
+                    overview: tmdbData.item.overview || data.item.overview,
+                    backdropUrl: tmdbData.item.backdropUrl || data.item.backdropUrl,
+                    posterUrl: data.item.posterUrl || tmdbData.item.posterUrl,
+                    mediaType: 'anime',
+                    provider: 'anilist'
+                  }
+                  nextSeasons = data.seasons
+                  nextEpisodes = data.episodes
+                }
+              } catch {
+                /* TMDB-only fallback */
+              }
+            }
+
+            if (!nextEpisodes.length && nextSeasons[0]) {
+              try {
+                nextEpisodes = await fetchSeasonEpisodes(
+                  tmdbKey,
+                  externalId,
+                  nextSeasons[0].seasonNumber || 1
+                )
+              } catch {
+                /* empty episodes ok */
+              }
+            }
+
+            if (cancelled) return
+            setItem(nextItem)
+            setExtras(nextExtras)
+            setSeasons(nextSeasons)
+            setImdbId(nextImdb)
+            setEpisodes(nextEpisodes)
+            const s = nextSeasons[0]?.seasonNumber || 1
+            setSeason(s)
+            const seasonEps =
+              mediaType === 'series' ? episodesForSeason(nextEpisodes, s) : nextEpisodes
+            setEpisode(seasonEps[0] || null)
+            return
+          }
+        }
+
         if (mediaType === 'anime') {
           const data = await fetchAnimeDetails(externalId)
           if (cancelled) return
@@ -177,7 +345,7 @@ export function DetailPage(): JSX.Element {
           if (cancelled) return
           let nextItem = data.item
           let nextExtras: MediaExtras = {}
-          const key = settings?.tmdbApiKey
+          const key = tmdbKey
           if (key && data.imdbId) {
             try {
               const enrich = await enrichFromImdb(key, data.imdbId, 'tv')
@@ -187,7 +355,7 @@ export function DetailPage(): JSX.Element {
                 nextExtras = enrich.extras
               }
             } catch {
-              /* YTS/TVMaze base is enough */
+              /* TVMaze base is enough */
             }
           }
           if (cancelled) return
@@ -201,29 +369,74 @@ export function DetailPage(): JSX.Element {
           const seasonEps = episodesForSeason(data.episodes, s)
           setEpisode(seasonEps[0] || null)
         } else {
-          const data = await fetchMovieDetails(externalId)
-          if (cancelled) return
-          let nextItem = data.item
-          let nextExtras = data.extras
-          const key = settings?.tmdbApiKey
-          if (key && nextItem.imdbId) {
-            try {
-              const enrich = await enrichFromImdb(key, nextItem.imdbId, 'movie')
-              if (enrich) {
-                if (enrich.backdropUrl) nextItem = { ...nextItem, backdropUrl: enrich.backdropUrl }
-                if (enrich.overview && enrich.overview.length > (nextItem.overview?.length || 0)) {
-                  nextItem = { ...nextItem, overview: enrich.overview }
+          try {
+            const data = await fetchMovieDetails(externalId)
+            if (cancelled) return
+            let nextItem = data.item
+            let nextExtras = data.extras
+            const key = tmdbKey
+            if (key && nextItem.imdbId) {
+              try {
+                const enrich = await enrichFromImdb(key, nextItem.imdbId, 'movie')
+                if (enrich) {
+                  if (enrich.backdropUrl) nextItem = { ...nextItem, backdropUrl: enrich.backdropUrl }
+                  if (enrich.overview && enrich.overview.length > (nextItem.overview?.length || 0)) {
+                    nextItem = { ...nextItem, overview: enrich.overview }
+                  }
+                  nextExtras = mergeExtras(nextExtras, enrich.extras)
                 }
-                nextExtras = mergeExtras(nextExtras, enrich.extras)
+              } catch {
+                /* keep YTS extras */
               }
-            } catch {
-              /* keep YTS extras */
             }
+            if (cancelled) return
+            setItem(nextItem)
+            setExtras(nextExtras)
+            setImdbId(nextItem.imdbId)
+          } catch (ytsErr) {
+            // Legacy continue-watching entries often store a TMDB id without the `tmdb-` prefix.
+            if (!tmdbKey) throw ytsErr
+            const tmdbItem = await fetchTmdbMovieDetails(tmdbKey, externalId)
+            if (cancelled) return
+            let nextItem: CatalogItem = { ...tmdbItem, provider: 'tmdb', genreIds: tmdbItem.genreIds }
+            let nextExtras: MediaExtras = {}
+            if (tmdbItem.imdbId) {
+              try {
+                const yts = await findMovieByImdb(tmdbItem.imdbId)
+                if (yts?.item?.title) {
+                  nextItem = {
+                    ...yts.item,
+                    overview: tmdbItem.overview || yts.item.overview,
+                    backdropUrl: tmdbItem.backdropUrl || yts.item.backdropUrl,
+                    posterUrl: yts.item.posterUrl || tmdbItem.posterUrl,
+                    genres: tmdbItem.genres?.length ? tmdbItem.genres : yts.item.genres,
+                    genreIds: tmdbItem.genreIds,
+                    imdbId: tmdbItem.imdbId || yts.item.imdbId,
+                    provider: 'yts'
+                  }
+                  nextExtras = yts.extras
+                }
+              } catch {
+                /* keep TMDB */
+              }
+              try {
+                const enrich = await enrichFromImdb(tmdbKey, tmdbItem.imdbId, 'movie')
+                if (enrich) {
+                  if (enrich.backdropUrl) nextItem = { ...nextItem, backdropUrl: enrich.backdropUrl }
+                  if (enrich.overview && enrich.overview.length > (nextItem.overview?.length || 0)) {
+                    nextItem = { ...nextItem, overview: enrich.overview }
+                  }
+                  nextExtras = mergeExtras(nextExtras, enrich.extras)
+                }
+              } catch {
+                /* cast/stills optional */
+              }
+            }
+            if (cancelled) return
+            setItem(nextItem)
+            setExtras(nextExtras)
+            setImdbId(nextItem.imdbId || tmdbItem.imdbId)
           }
-          if (cancelled) return
-          setItem(nextItem)
-          setExtras(nextExtras)
-          setImdbId(nextItem.imdbId)
         }
       } catch (e) {
         if (!cancelled) setError(toUiError(e, 'Failed to load'))
@@ -233,7 +446,7 @@ export function DetailPage(): JSX.Element {
     return () => {
       cancelled = true
     }
-  }, [mediaType, externalId, settings?.tmdbApiKey])
+  }, [mediaType, externalId, fromTmdb, settings?.tmdbApiKey])
 
   useEffect(() => {
     if (mediaType !== 'series' || !episodes.length) return
@@ -362,7 +575,8 @@ export function DetailPage(): JSX.Element {
       try {
         const raw = await searchPublicIndexers(searchQuery)
         if (cancelled) return
-        setTorrentResults(sortTorrentResults(raw, qualityPref))
+        const cleaned = filterValidStreams(raw, { isMovieLike: mediaType === 'movie' })
+        setTorrentResults(sortTorrentResults(cleaned, qualityPref))
       } catch (e) {
         if (!cancelled) {
           setTorrentResults([])
@@ -377,7 +591,7 @@ export function DetailPage(): JSX.Element {
       cancelled = true
       window.clearTimeout(t)
     }
-  }, [searchQuery, qualityPref])
+  }, [searchQuery, qualityPref, mediaType])
 
   const filteredTorrents = useMemo(() => {
     if (qualityFilter === 'all') return torrentResults
@@ -476,35 +690,62 @@ export function DetailPage(): JSX.Element {
     }
   }
 
+  const cancelStreaming = async (): Promise<void> => {
+    const cacheId = startingCacheIdRef.current
+    streamAbortRef.current?.abort()
+    streamAbortRef.current = null
+    startingCacheIdRef.current = null
+    setStreamState('idle')
+    setStartingId(null)
+    if (cacheId && window.cinevault?.torrent?.stop) {
+      try {
+        await window.cinevault.torrent.stop(cacheId, { destroyStore: true })
+      } catch {
+        /* best-effort */
+      }
+    }
+  }
+
   const playTorrent = async (
     result: PublicSearchResult,
     opts?: { fromStart?: boolean }
   ): Promise<void> => {
-    if (!item || !result.magnetUri || startingId) return
+    if (!item || !result.magnetUri) return
+    if (streamState !== 'idle' || startingId) return
     const { warnIfCellular } = await import('../lib/mobileNetwork')
     if (!(await warnIfCellular('torrent playback'))) return
+
+    const ac = new AbortController()
+    streamAbortRef.current = ac
     setStartingId(result.id)
+    setStreamState('connecting')
     setError(null)
     const fromStart = opts?.fromStart || forceFromStart
     const resumeAt =
       !fromStart && savedProgress && savedProgress.currentTime > 3
         ? savedProgress.currentTime
         : undefined
+    const cacheId = `${item.id}-${season || 0}-${episode?.episodeNumber || 0}-${Date.now()}`
+    startingCacheIdRef.current = cacheId
+
     try {
-      const cacheId = `${item.id}-${season || 0}-${episode?.episodeNumber || 0}-${Date.now()}`
       const source = await startTorrentPlayback({
         cacheId,
         magnetUri: result.magnetUri,
         label: result.name,
         preferredQuality: qualityPref,
-        mediaId: item.id
+        mediaId: item.id,
+        signal: ac.signal
       })
+      if (ac.signal.aborted) return
+
+      setStreamState('buffering')
 
       // Prefer prefetched tracks; never block playback on a slow subtitle API.
       let bestTrack: UnifiedSubtitle | null =
         rankSubtitlesByRelease(subs, result.name)[0] || null
       const id = imdbId || item.imdbId
-      if (id) {
+      if (id && !ac.signal.aborted) {
         try {
           const ranked = await Promise.race([
             getAvailableSubtitles({
@@ -520,6 +761,7 @@ export function DetailPage(): JSX.Element {
               window.setTimeout(() => resolve([]), 2500)
             })
           ])
+          if (ac.signal.aborted) return
           if (ranked.length) {
             setSubs(ranked)
             bestTrack = ranked[0]
@@ -532,18 +774,30 @@ export function DetailPage(): JSX.Element {
       let subtitlePath: string | null = null
       let subtitleUrl: string | null = null
       let subtitleLabel: string | undefined
-      try {
-        const resolved = await Promise.race([
-          resolveSubtitles(bestTrack),
-          new Promise<{ path: string | null; url: string | null; label?: string }>((resolve) => {
-            window.setTimeout(() => resolve({ path: null, url: null }), 3000)
-          })
-        ])
-        subtitlePath = resolved.path
-        subtitleUrl = resolved.url
-        subtitleLabel = resolved.label
-      } catch {
-        /* player can load subtitles later */
+      if (!ac.signal.aborted) {
+        try {
+          const resolved = await Promise.race([
+            resolveSubtitles(bestTrack),
+            new Promise<{ path: string | null; url: string | null; label?: string }>((resolve) => {
+              window.setTimeout(() => resolve({ path: null, url: null }), 3000)
+            })
+          ])
+          if (ac.signal.aborted) return
+          subtitlePath = resolved.path
+          subtitleUrl = resolved.url
+          subtitleLabel = resolved.label
+        } catch {
+          /* player can load subtitles later */
+        }
+      }
+
+      if (ac.signal.aborted) {
+        try {
+          await window.cinevault?.torrent?.stop(cacheId, { destroyStore: true })
+        } catch {
+          /* ignore */
+        }
+        return
       }
 
       if (window.cinevault) {
@@ -570,6 +824,7 @@ export function DetailPage(): JSX.Element {
             : `${item.title} · S${season}E${episode?.episodeNumber ?? 1}`,
         mediaType: item.mediaType,
         externalId: item.externalId,
+        provider: item.provider,
         season: mediaType !== 'movie' ? season : undefined,
         episode: mediaType !== 'movie' ? episode?.episodeNumber : undefined,
         episodeTitle: mediaType !== 'movie' ? episode?.title : undefined,
@@ -591,13 +846,25 @@ export function DetailPage(): JSX.Element {
             : extras.runtimeMinutes && extras.runtimeMinutes > 0
               ? extras.runtimeMinutes * 60
               : undefined) ||
-          (savedProgress && savedProgress.duration > 60 ? savedProgress.duration : undefined)
+          (savedProgress && savedProgress.duration > 60 ? savedProgress.duration : undefined),
+        genreIds: item.genreIds,
+        genres: item.genres
       })
       setForceFromStart(false)
     } catch (e) {
-      setError(toUiError(e, 'Could not start torrent playback'))
+      const aborted =
+        ac.signal.aborted ||
+        (e instanceof Error && (e.name === 'AbortError' || e.message === 'Aborted'))
+      if (!aborted) {
+        setError(toUiError(e, 'Could not start torrent playback'))
+      }
     } finally {
-      setStartingId(null)
+      if (streamAbortRef.current === ac) {
+        streamAbortRef.current = null
+        startingCacheIdRef.current = null
+        setStartingId(null)
+        setStreamState('idle')
+      }
     }
   }
 
@@ -652,6 +919,7 @@ export function DetailPage(): JSX.Element {
             : `${item.title} · S${season}E${episode?.episodeNumber ?? 1}`,
         mediaType: item.mediaType,
         externalId: item.externalId,
+        provider: item.provider,
         season: mediaType !== 'movie' ? season : undefined,
         episode: mediaType !== 'movie' ? episode?.episodeNumber : undefined,
         episodeTitle: mediaType !== 'movie' ? episode?.title : undefined,
@@ -677,7 +945,9 @@ export function DetailPage(): JSX.Element {
             : extras.runtimeMinutes && extras.runtimeMinutes > 0
               ? extras.runtimeMinutes * 60
               : undefined) ||
-          (savedProgress && savedProgress.duration > 60 ? savedProgress.duration : undefined)
+          (savedProgress && savedProgress.duration > 60 ? savedProgress.duration : undefined),
+        genreIds: item.genreIds,
+        genres: item.genres
       })
       setForceFromStart(false)
     } catch (e) {
@@ -733,7 +1003,7 @@ export function DetailPage(): JSX.Element {
     setCastOpeningKey(key)
     try {
       let imdbId = member.imdbId || null
-      const apiKey = settings?.tmdbApiKey
+      const apiKey = resolveTmdbApiKey(settings?.tmdbApiKey)
       if (!imdbId && member.tmdbPersonId && apiKey) {
         imdbId = await getPersonImdbId(apiKey, member.tmdbPersonId)
       }
@@ -758,7 +1028,7 @@ export function DetailPage(): JSX.Element {
         },
         {
           youtubeId: extras.trailerYoutubeId,
-          tmdbApiKey: settings?.tmdbApiKey
+          tmdbApiKey: resolveTmdbApiKey(settings?.tmdbApiKey)
         }
       )
       if (resolved) {
@@ -829,131 +1099,172 @@ export function DetailPage(): JSX.Element {
 
           <div className="detail-actions">
             <div className="detail-actions-row">
-              <button
-                type="button"
-                className={`detail-watch-btn${
-                  !torrentLoading && isTargetAvailable && bestStream ? ' ready' : ''
-                }`}
-                disabled={
-                  torrentLoading || !isTargetAvailable || !bestStream || Boolean(startingId)
-                }
-                title={
-                  !torrentLoading && !isTargetAvailable
+              {(() => {
+                const busy = streamState !== 'idle'
+                const watchTip = busy
+                  ? 'Press to abort'
+                  : !torrentLoading && !isTargetAvailable
                     ? `No ${selectedRes} torrents found. Highest available: ${highestAvailableRes || '—'}`
                     : bestStream
                       ? `Play ${bestStream.name}`
-                      : undefined
-                }
-                onClick={() => {
-                  if (bestStream) void playTorrent(bestStream)
-                }}
-              >
-                {torrentLoading ? (
-                  <span className="detail-watch-spinner" aria-hidden />
-                ) : (
-                  <Play size={16} className="detail-watch-play-icon" fill="currentColor" />
-                )}
-                <span>
-                  {torrentLoading
-                    ? 'Finding…'
-                    : savedProgress && !forceFromStart
-                      ? `Resume (${formatTime(savedProgress.currentTime)})`
-                      : 'Watch Now'}
-                </span>
-              </button>
+                      : null
+                const canStart =
+                  !torrentLoading && isTargetAvailable && Boolean(bestStream) && !busy
+                return (
+                  <Tooltip content={watchTip ?? ''} disabled={!watchTip} side="bottom">
+                    <button
+                      type="button"
+                      className={`detail-watch-btn${canStart ? ' ready' : ''}${busy ? ' busy' : ''}`}
+                      disabled={!busy && (torrentLoading || !isTargetAvailable || !bestStream)}
+                      aria-busy={busy}
+                      onClick={() => {
+                        if (busy) {
+                          void cancelStreaming()
+                          return
+                        }
+                        if (bestStream) void playTorrent(bestStream)
+                      }}
+                    >
+                      {busy ? (
+                        <>
+                          <span className="detail-watch-spinner" aria-hidden />
+                          <span>
+                            {streamState === 'connecting' ? 'Connecting…' : 'Buffering…'}
+                          </span>
+                          <span className="detail-watch-abort" aria-hidden>
+                            <X size={14} strokeWidth={2.5} />
+                          </span>
+                        </>
+                      ) : torrentLoading ? (
+                        <>
+                          <span className="detail-watch-spinner" aria-hidden />
+                          <span>Finding…</span>
+                        </>
+                      ) : (
+                        <>
+                          <Play size={16} className="detail-watch-play-icon" fill="currentColor" />
+                          <span>
+                            {savedProgress && !forceFromStart
+                              ? `Resume (${formatTime(savedProgress.currentTime)})`
+                              : 'Watch Now'}
+                          </span>
+                        </>
+                      )}
+                    </button>
+                  </Tooltip>
+                )
+              })()}
 
               <div className="detail-res-select-wrap">
-                <select
-                  className="detail-res-select"
-                  value={selectedRes}
+                <SelectMenu
+                  variant="compact"
                   aria-label="Preferred resolution"
-                  onChange={(e) => {
-                    setSelectedRes(e.target.value as TargetRes)
+                  value={selectedRes}
+                  menuMinWidth={120}
+                  onChange={(v) => {
+                    setSelectedRes(v as TargetRes)
                     setResAdjustedNote(null)
                   }}
-                >
-                  <option value="4K">4K</option>
-                  <option value="1080p">1080p</option>
-                  <option value="720p">720p</option>
-                  <option value="Auto">Auto</option>
-                </select>
-                <ChevronDown size={14} className="detail-res-chevron" aria-hidden />
+                  options={[
+                    { value: '4K', label: '4K' },
+                    { value: '1080p', label: '1080p' },
+                    { value: '720p', label: '720p' },
+                    { value: 'Auto', label: 'Auto' }
+                  ]}
+                />
               </div>
 
               {savedProgress && (
-                <button
-                  type="button"
-                  className="detail-restart-btn"
-                  title="Start from beginning"
-                  aria-label="Start from beginning"
-                  disabled={
-                    torrentLoading || !isTargetAvailable || !bestStream || Boolean(startingId)
-                  }
-                  onClick={() => {
-                    setForceFromStart(true)
-                    if (bestStream) void playTorrent(bestStream, { fromStart: true })
-                  }}
-                >
-                  <RotateCcw size={16} strokeWidth={1.75} />
-                </button>
+                <Tooltip content={streamState !== 'idle' ? 'Press to abort' : 'Start from beginning'}>
+                  <button
+                    type="button"
+                    className={`detail-restart-btn${streamState !== 'idle' ? ' busy' : ''}`}
+                    aria-label={
+                      streamState !== 'idle' ? 'Cancel starting playback' : 'Start from beginning'
+                    }
+                    disabled={
+                      streamState === 'idle' &&
+                      (torrentLoading || !isTargetAvailable || !bestStream)
+                    }
+                    onClick={() => {
+                      if (streamState !== 'idle') {
+                        void cancelStreaming()
+                        return
+                      }
+                      setForceFromStart(true)
+                      if (bestStream) void playTorrent(bestStream, { fromStart: true })
+                    }}
+                  >
+                    {streamState !== 'idle' ? (
+                      <X size={16} strokeWidth={2} />
+                    ) : (
+                      <RotateCcw size={16} strokeWidth={1.75} />
+                    )}
+                  </button>
+                </Tooltip>
               )}
 
               <span className="detail-actions-sep" aria-hidden />
 
-              <button
-                className="detail-btn trailer"
-                type="button"
-                disabled={trailerBusy}
-                title={
+              <Tooltip
+                content={
                   extras.trailerYoutubeId
                     ? 'Watch trailer'
-                    : 'Watch trailer (opens in-app or YouTube search)'
+                    : 'Watch trailer (in-app or YouTube search)'
                 }
-                onClick={() => void openTrailer()}
               >
-                <Clapperboard size={18} strokeWidth={1.75} />
-                {trailerBusy ? 'Loading…' : 'Watch Trailer'}
-              </button>
+                <button
+                  className="detail-btn trailer"
+                  type="button"
+                  disabled={trailerBusy}
+                  onClick={() => void openTrailer()}
+                >
+                  <Clapperboard size={18} strokeWidth={1.75} />
+                  {trailerBusy ? 'Loading…' : 'Watch Trailer'}
+                </button>
+              </Tooltip>
 
               <div className="detail-actions-icons">
-                <button
-                  className={`detail-icon-btn detail-watch-later-btn${
-                    item && isWatchLaterSaved(item.id) ? ' on' : ''
-                  }`}
-                  type="button"
-                  title="Watch Later"
-                  aria-label="Watch Later"
-                  aria-pressed={Boolean(item && isWatchLaterSaved(item.id))}
-                  onClick={() => {
-                    if (!item) return
-                    toggleWatchLaterItem(catalogToWatchLaterItem(item))
-                  }}
-                >
-                  <Clock size={18} strokeWidth={1.75} />
-                </button>
+                <Tooltip content="Watch Later">
+                  <button
+                    className={`detail-icon-btn detail-watch-later-btn${
+                      item && isWatchLaterSaved(item.id) ? ' on' : ''
+                    }`}
+                    type="button"
+                    aria-label="Watch Later"
+                    aria-pressed={Boolean(item && isWatchLaterSaved(item.id))}
+                    onClick={() => {
+                      if (!item) return
+                      toggleWatchLaterItem(catalogToWatchLaterItem(item))
+                    }}
+                  >
+                    <Clock size={18} strokeWidth={1.75} />
+                  </button>
+                </Tooltip>
 
-                <button
-                  className={`detail-icon-btn${fav ? ' on' : ''}`}
-                  type="button"
-                  title={fav ? 'Remove from favorites' : 'Favorite'}
-                  aria-label={fav ? 'Remove from favorites' : 'Favorite'}
-                  onClick={() =>
-                    toggleFavorite({
-                      id: item.id,
-                      mediaType: item.mediaType,
-                      externalId: item.externalId,
-                      title: item.title,
-                      posterUrl: item.posterUrl,
-                      releaseDate: item.releaseDate
-                    })
-                  }
-                >
-                  {fav ? (
-                    <Heart size={18} fill="currentColor" strokeWidth={0} />
-                  ) : (
-                    <Heart size={18} strokeWidth={1.75} />
-                  )}
-                </button>
+                <Tooltip content={fav ? 'Remove from favorites' : 'Favorite'}>
+                  <button
+                    className={`detail-icon-btn${fav ? ' on' : ''}`}
+                    type="button"
+                    aria-label={fav ? 'Remove from favorites' : 'Favorite'}
+                    onClick={() =>
+                      toggleFavorite({
+                        id: item.id,
+                        mediaType: item.mediaType,
+                        externalId: item.externalId,
+                        title: item.title,
+                        posterUrl: item.posterUrl,
+                        releaseDate: item.releaseDate
+                      })
+                    }
+                  >
+                    {fav ? (
+                      <Heart size={18} fill="currentColor" strokeWidth={0} />
+                    ) : (
+                      <Heart size={18} strokeWidth={1.75} />
+                    )}
+                  </button>
+                </Tooltip>
               </div>
 
               {!torrentLoading &&
@@ -979,15 +1290,13 @@ export function DetailPage(): JSX.Element {
               )}
 
               {hasUnsupportedAudio && bestStream && (
-                <span
-                  className="detail-audio-warn"
-                  role="status"
-                  title="Desktop app remuxes cinema audio to AAC during playback"
-                >
-                  Best match uses{' '}
-                  {bestStream.audioLabel || bestStream.audioCodec || 'cinema audio'} — remuxed to
-                  AAC in-app
-                </span>
+                <Tooltip content="Desktop app remuxes cinema audio to AAC during playback">
+                  <span className="detail-audio-warn" role="status">
+                    Best match uses{' '}
+                    {bestStream.audioLabel || bestStream.audioCodec || 'cinema audio'} — remuxed to
+                    AAC in-app
+                  </span>
+                </Tooltip>
               )}
             </div>
 
@@ -1012,44 +1321,48 @@ export function DetailPage(): JSX.Element {
             <div className="detail-section-head">
               <h2>Cast & Crew</h2>
             </div>
-            <div className="cast-row">
+            <HScrollRail className="cast-rail" trackClassName="cast-row" aria-label="Cast and crew" role="list">
               {cast.map((c) => {
                 const chipKey = `${c.role}-${c.name}`
                 const busy = castOpeningKey === chipKey
                 return (
-                  <button
-                    key={chipKey}
-                    type="button"
-                    className={`cast-chip${busy ? ' is-opening' : ''}`}
-                    title={`View ${c.name} on IMDb`}
-                    aria-busy={busy}
-                    disabled={busy}
-                    onClick={() => void openCastOnImdb(c)}
-                  >
-                    <div className="cast-avatar-wrap">
-                      {c.photoUrl ? (
-                        <img
-                          src={c.photoUrl}
-                          alt=""
-                          className="cast-avatar"
-                          loading="lazy"
-                        />
-                      ) : (
-                        <span className="cast-avatar-fallback" aria-hidden>
-                          {c.name ? c.name.charAt(0).toUpperCase() : '?'}
+                  <Tooltip key={chipKey} content={`View ${c.name} on IMDb`} side="top">
+                    <button
+                      type="button"
+                      className={`cast-chip${busy ? ' is-opening' : ''}`}
+                      aria-busy={busy}
+                      disabled={busy}
+                      onClick={() => void openCastOnImdb(c)}
+                    >
+                      <div className="cast-avatar-wrap">
+                        {c.photoUrl ? (
+                          <img
+                            src={c.photoUrl}
+                            alt=""
+                            className="cast-avatar"
+                            loading="lazy"
+                          />
+                        ) : (
+                          <span className="cast-avatar-fallback" aria-hidden>
+                            {c.name ? c.name.charAt(0).toUpperCase() : '?'}
+                          </span>
+                        )}
+                      </div>
+                      <div className="cast-copy">
+                        <strong className="cast-name">{c.name}</strong>
+                        <span className="cast-role">
+                          {c.role === 'director'
+                            ? 'Director'
+                            : c.role === 'crew'
+                              ? c.character || 'Crew'
+                              : c.character || 'Cast'}
                         </span>
-                      )}
-                    </div>
-                    <div className="cast-copy">
-                      <strong className="cast-name">{c.name}</strong>
-                      <span className="cast-role">
-                        {c.role === 'director' ? 'Director' : c.character || 'Cast'}
-                      </span>
-                    </div>
-                  </button>
+                      </div>
+                    </button>
+                  </Tooltip>
                 )
               })}
-            </div>
+            </HScrollRail>
           </section>
         )}
 
@@ -1232,35 +1545,30 @@ export function DetailPage(): JSX.Element {
                         if (!label) return null
                         const warn = row.isAudioSupported === false
                         return (
-                          <span
-                            className={`stream-audio${warn ? ' warn' : ''}`}
-                            title={
-                              warn
-                                ? 'May require external player or audio transcoding'
-                                : undefined
-                            }
+                          <Tooltip
+                            content="May require external player or audio transcoding"
+                            disabled={!warn}
                           >
-                            {label}
-                          </span>
+                            <span className={`stream-audio${warn ? ' warn' : ''}`}>{label}</span>
+                          </Tooltip>
                         )
                       })()}
                     </div>
                     <div className="stream-card-copy">
-                      <div className="stream-title" title={row.name}>
-                        {row.name}
-                      </div>
+                      <Tooltip content={row.name} className="mono-tooltip--fill">
+                        <div className="stream-title">{row.name}</div>
+                      </Tooltip>
                       <span className="stream-source">{row.source}</span>
                     </div>
                   </div>
                   <div className="stream-card-meta">
                     <span className="stream-size">{formatFileSize(row.sizeBytes)}</span>
-                    <span
-                      className="stream-health"
-                      title={`${row.seeders} seeders · ${row.leechers} leechers`}
-                    >
-                      <span className="stream-health-dot" />
-                      {row.seeders}
-                    </span>
+                    <Tooltip content={`${row.seeders} seeders · ${row.leechers} leechers`}>
+                      <span className="stream-health">
+                        <span className="stream-health-dot" />
+                        {row.seeders}
+                      </span>
+                    </Tooltip>
                     <button
                       className="stream-play"
                       type="button"
@@ -1292,7 +1600,7 @@ export function DetailPage(): JSX.Element {
             <div className="detail-advanced">
               {localSources.length > 0 && (
                 <div className="play-row">
-                  <ThemedSelect
+                  <SelectMenu
                     variant="default"
                     aria-label="Local or custom source"
                     value={selectedLocal}

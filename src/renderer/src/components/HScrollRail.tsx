@@ -44,16 +44,34 @@ export function HScrollRail({
     const el = ref.current
     if (!el) return
 
+    // Keep an authoritative target so rapid wheel ticks don't fight a mid-flight position.
+    let targetLeft = el.scrollLeft
+
     const onWheel = (e: WheelEvent): void => {
       // Only hijack vertical wheel when the rail actually overflows.
       if (el.scrollWidth <= el.clientWidth + EDGE_EPS) return
+      const dx = Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY
+      if (!dx) return
       e.preventDefault()
-      el.scrollLeft += e.deltaY
+      const max = Math.max(0, el.scrollWidth - el.clientWidth)
+      const before = el.scrollLeft
+      // If user scrubbed via drag/chevrons, resync target to the live position.
+      if (Math.abs(targetLeft - before) > 1) targetLeft = before
+      targetLeft = Math.max(0, Math.min(max, targetLeft + dx))
+      // Force instant apply — CSS smooth makes scrollLeft writes no-ops and stacks animations.
+      el.style.scrollBehavior = 'auto'
+      el.scrollLeft = targetLeft
+      updateEdges()
+    }
+
+    const onScroll = (): void => {
+      // Chevrons use smooth scrollBy — follow the live position when not mid-wheel burst.
+      targetLeft = el.scrollLeft
       updateEdges()
     }
 
     el.addEventListener('wheel', onWheel, { passive: false })
-    el.addEventListener('scroll', updateEdges, { passive: true })
+    el.addEventListener('scroll', onScroll, { passive: true })
 
     const ro = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(updateEdges) : null
     ro?.observe(el)
@@ -65,7 +83,7 @@ export function HScrollRail({
 
     return () => {
       el.removeEventListener('wheel', onWheel)
-      el.removeEventListener('scroll', updateEdges)
+      el.removeEventListener('scroll', onScroll)
       ro?.disconnect()
       window.clearTimeout(t)
       window.clearTimeout(t2)

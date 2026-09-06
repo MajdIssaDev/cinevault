@@ -13,16 +13,25 @@ export interface CatalogItem {
   releaseDate: string | null
   rating: number
   genres: string[]
+  /** TMDB genre ids when known (affinity / discover). */
+  genreIds?: number[]
   imdbId?: string | null
+  /** Cached TMDB title treatment / logo for hero (avoids text→logo flash). */
+  titleLogoUrl?: string | null
   /** MyAnimeList id when known (AniSkip) */
   malId?: number | null
+  /**
+   * Catalog source for detail routing. TMDB-sourced rows (e.g. For You) must not
+   * be loaded as YTS / TVMaze / AniList ids.
+   */
+  provider?: 'yts' | 'tvmaze' | 'anilist' | 'tmdb'
 }
 
 export interface CastMember {
   name: string
   character?: string | null
   photoUrl?: string | null
-  role: 'director' | 'cast'
+  role: 'director' | 'cast' | 'crew'
   /** IMDb person id (nm…) when known */
   imdbId?: string | null
   /** TMDB person id when known */
@@ -101,6 +110,12 @@ export interface PlaybackSession {
   resumeSeconds?: number
   /** Catalog/TMDB runtime in seconds — used when remuxed streams omit duration. */
   runtimeSeconds?: number
+  /** Provider for continue-watching → detail route (TMDB needs `tmdb-` prefix). */
+  provider?: 'yts' | 'tvmaze' | 'anilist' | 'tmdb'
+  /** TMDB genre ids for local affinity recommendations. */
+  genreIds?: number[]
+  /** Genre display names (fallback to resolve ids). */
+  genres?: string[]
 }
 
 export const GENRE_MOVIE: Record<number, string> = {

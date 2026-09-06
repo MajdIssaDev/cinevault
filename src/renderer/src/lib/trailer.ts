@@ -1,6 +1,7 @@
 import {
   buildTrailerInfo,
   fetchTmdbVideos,
+  resolveTmdbApiKey,
   youtubeTrailerSearchUrl,
   type TrailerInfo
 } from '../api/tmdb'
@@ -25,7 +26,7 @@ export async function resolveTrailerForItem(
     return { trailer: buildTrailerInfo(opts.youtubeId, `${item.title} Trailer`), searchUrl }
   }
 
-  const key = opts?.tmdbApiKey?.trim()
+  const key = resolveTmdbApiKey(opts?.tmdbApiKey)
   if (key && item.mediaType !== 'anime') {
     // YTS / TVMaze ids ≠ TMDB ids for movies/series — try enrich path via existing id only when TMDB-native
     // Catalog movies use YTS ids; series use TVMaze. Prefer IMDb enrich when available.

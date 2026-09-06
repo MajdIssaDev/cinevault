@@ -1,6 +1,5 @@
 import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { AnimatePresence, motion } from 'framer-motion'
 import { Play, X } from 'lucide-react'
 import type { MediaType } from '../types'
 import {
@@ -11,6 +10,9 @@ import {
   type PlaybackProgress
 } from '../services/playbackHistoryService'
 import { HScrollRail } from './HScrollRail'
+import { HoverScrollTitle } from './HoverScrollTitle'
+import { Tooltip } from './ui/Tooltip'
+import { detailPathForItem } from '../lib/detailPath'
 
 function ContinueCard({
   entry,
@@ -21,6 +23,7 @@ function ContinueCard({
   onRemove: () => void
   onOpen: () => void
 }): JSX.Element {
+  const [isHovered, setIsHovered] = useState(false)
   const pct = Math.min(100, Math.max(0, entry.percentage))
   const episodeLabel =
     entry.season != null && entry.episode != null
@@ -32,7 +35,11 @@ function ContinueCard({
   const subtitle = [episodeLabel, remaining].filter(Boolean).join(' · ')
 
   return (
-    <article className="continue-card">
+    <article
+      className="continue-card group"
+      onMouseEnter={() => setIsHovered(true)}
+      onMouseLeave={() => setIsHovered(false)}
+    >
       <button type="button" className="continue-card-main" onClick={onOpen}>
         <div className="continue-card-art">
           {entry.backdropPath || entry.posterPath ? (
@@ -49,29 +56,30 @@ function ContinueCard({
           </div>
         </div>
         <div className="continue-card-meta">
-          <div className="continue-card-title" title={entry.title}>
-            {entry.title}
-          </div>
+          <HoverScrollTitle
+            title={entry.title}
+            className="continue-card-title"
+            active={isHovered}
+          />
           {subtitle ? (
-            <div className="continue-card-sub" title={subtitle}>
-              {subtitle}
-            </div>
+            <div className="continue-card-sub">{subtitle}</div>
           ) : null}
         </div>
       </button>
-      <button
-        type="button"
-        className="continue-card-remove"
-        title="Remove from list"
-        aria-label="Remove item"
-        onClick={(e) => {
-          e.preventDefault()
-          e.stopPropagation()
-          onRemove()
-        }}
-      >
-        <X size={14} strokeWidth={2.5} />
-      </button>
+      <Tooltip content="Remove from list" className="continue-card-remove-tip">
+        <button
+          type="button"
+          className="continue-card-remove"
+          aria-label="Remove item"
+          onClick={(e) => {
+            e.preventDefault()
+            e.stopPropagation()
+            onRemove()
+          }}
+        >
+          <X size={14} strokeWidth={2.5} />
+        </button>
+      </Tooltip>
     </article>
   )
 }
@@ -92,81 +100,43 @@ export function ContinueWatchingRow({
 
   const filtered = mediaType ? items.filter((i) => i.mediaType === mediaType) : items
 
-  return (
-    <AnimatePresence initial={false}>
-      {filtered.length > 0 && (
-        <motion.section
-          key="continue-watching-shelf"
-          className="continue-watching catalog-shelf continue-watching-anim"
-          aria-label="Continue watching"
-          initial={{ opacity: 0, height: 0, marginBottom: 0 }}
-          animate={{ opacity: 1, height: 'auto', marginBottom: 0 }}
-          exit={{
-            opacity: 0,
-            height: 0,
-            marginBottom: 0,
-            transition: { duration: 0.3, ease: 'easeInOut' }
-          }}
-          style={{ overflow: 'hidden' }}
-        >
-          <div className="catalog-shelf-head">
-            <h2 className="catalog-shelf-title">Continue Watching</h2>
+  return filtered.length > 0 ? (
+    <section className="continue-watching catalog-shelf" aria-label="Continue watching">
+      <div className="catalog-shelf-head">
+        <h2 className="catalog-shelf-title">Continue Watching</h2>
+      </div>
+      <HScrollRail trackClassName="catalog-shelf-track">
+        {filtered.map((entry) => (
+          <div
+            key={`${entry.mediaId}:${entry.season || 0}:${entry.episode || 0}`}
+            className="continue-card-motion"
+          >
+            <ContinueCard
+              entry={entry}
+              onRemove={() => {
+                clearProgressForMedia(entry.mediaId)
+                void (async () => {
+                  try {
+                    await window.cinevault?.cache.removeByMedia(entry.mediaId)
+                    await window.cinevault?.torrent.deleteByMedia?.(entry.mediaId)
+                  } catch (err) {
+                    console.error('Failed to cleanup torrent storage:', err)
+                  }
+                })()
+              }}
+              onOpen={() => {
+                navigate(
+                  detailPathForItem({
+                    mediaType: entry.mediaType,
+                    externalId: entry.externalId,
+                    provider: entry.provider
+                  })
+                )
+              }}
+            />
           </div>
-          <HScrollRail trackClassName="catalog-shelf-track">
-            <AnimatePresence mode="popLayout" initial={false}>
-              {filtered.map((entry) => (
-                <motion.div
-                  key={`${entry.mediaId}:${entry.season || 0}:${entry.episode || 0}`}
-                  layout
-                  initial={{ opacity: 0, width: 0, scale: 0.9 }}
-                  animate={{
-                    opacity: 1,
-                    width: 'auto',
-                    scale: 1,
-                    transition: {
-                      width: { duration: 0.25, ease: 'easeOut' },
-                      opacity: { duration: 0.2, delay: 0.1 },
-                      scale: { duration: 0.25 }
-                    }
-                  }}
-                  exit={{
-                    opacity: 0,
-                    width: 0,
-                    scale: 0.85,
-                    transition: {
-                      opacity: { duration: 0.15 },
-                      width: { duration: 0.25, delay: 0.1, ease: 'easeInOut' },
-                      scale: { duration: 0.2 }
-                    }
-                  }}
-                  className="continue-card-motion"
-                >
-                  <ContinueCard
-                    entry={entry}
-                    onRemove={() => {
-                      // Optimistic UI + local history
-                      clearProgressForMedia(entry.mediaId)
-                      void (async () => {
-                        try {
-                          // Cache wipe stops matching torrents and removes index rows.
-                          await window.cinevault?.cache.removeByMedia(entry.mediaId)
-                          // Explicit engine + disk purge (idempotent if cache path already ran).
-                          await window.cinevault?.torrent.deleteByMedia?.(entry.mediaId)
-                        } catch (err) {
-                          console.error('Failed to cleanup torrent storage:', err)
-                        }
-                      })()
-                    }}
-                    onOpen={() =>
-                      navigate(`/detail/${entry.mediaType}/${entry.externalId}`)
-                    }
-                  />
-                </motion.div>
-              ))}
-            </AnimatePresence>
-          </HScrollRail>
-        </motion.section>
-      )}
-    </AnimatePresence>
-  )
+        ))}
+      </HScrollRail>
+    </section>
+  ) : null
 }

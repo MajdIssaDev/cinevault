@@ -1,6 +1,7 @@
 import type { CatalogItem, CastMember, MediaExtras } from '../types'
 import { fetchJson } from '../lib/http'
 import { upgradeImageUrl } from '../lib/heroImage'
+import { filterNarrativeCatalogItems } from '../lib/catalogContentFilter'
 
 const YTS_HOSTS = ['https://yts.mx', 'https://yts.lt', 'https://yts.ag']
 
@@ -16,7 +17,7 @@ export const YTS_GENRES = [
   'Fantasy',
   'History',
   'Horror',
-  'Music',
+  // Music chip omitted — concerts/performances; musical films still appear under other genres
   'Mystery',
   'Romance',
   'Sci-Fi',
@@ -156,7 +157,7 @@ async function listMovies(
     return { items: [], movieCount: data.data?.movie_count || 0 }
   }
   return {
-    items: data.data.movies.map(mapMovie),
+    items: filterNarrativeCatalogItems(data.data.movies.map(mapMovie)),
     movieCount: data.data.movie_count || data.data.movies.length
   }
 }
@@ -218,10 +219,35 @@ export async function fetchMovieDetails(id: number): Promise<{
     `/api/v2/movie_details.json?movie_id=${id}&with_images=true&with_cast=true`
   )
   const movie = data.data?.movie
-  if (!movie) throw new Error('Movie not found')
+  if (!movie?.id || !movie.title) throw new Error('Movie not found')
   const item = mapMovie(movie)
   return {
-    item: { ...item, imdbId: item.imdbId || null },
+    item: { ...item, imdbId: item.imdbId || null, provider: 'yts' },
     extras: mapExtras(movie)
+  }
+}
+
+/** Resolve a YTS title from an IMDb id (tt…). */
+export async function findMovieByImdb(imdbId: string): Promise<{
+  item: CatalogItem & { imdbId: string | null }
+  extras: MediaExtras
+} | null> {
+  const q = imdbId.trim()
+  if (!q) return null
+  const norm = q.toLowerCase().startsWith('tt') ? q.toLowerCase() : `tt${q.toLowerCase()}`
+  const { items } = await listMovies({
+    query_term: norm,
+    limit: '10',
+    sort_by: 'download_count'
+  })
+  const hit =
+    items.find((i) => (i.imdbId || '').toLowerCase() === norm) ||
+    items.find((i) => (i.imdbId || '').toLowerCase() === norm.replace(/^tt/, '')) ||
+    null
+  if (!hit) return null
+  try {
+    return await fetchMovieDetails(hit.externalId)
+  } catch {
+    return { item: { ...hit, imdbId: hit.imdbId || null, provider: 'yts' }, extras: {} }
   }
 }

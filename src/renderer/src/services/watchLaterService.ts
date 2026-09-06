@@ -17,6 +17,8 @@ export interface WatchLaterItem {
   /** Primary genre label persisted at bookmark time. */
   genre?: string
   addedAt: number
+  /** When set, detail opens via TMDB id path (`tmdb-…`). */
+  provider?: 'tmdb' | 'yts' | 'tvmaze' | 'anilist'
 }
 
 const STORAGE_KEY = 'cinevault_watch_later'
@@ -113,6 +115,8 @@ export function catalogToWatchLaterItem(item: {
   genres?: string[]
   genre?: string
   genre_ids?: number[]
+  provider?: 'tmdb' | 'yts' | 'tvmaze' | 'anilist'
+  externalId?: number
 }): WatchLaterItem {
   return {
     id: item.id,
@@ -123,6 +127,7 @@ export function catalogToWatchLaterItem(item: {
     voteAverage: item.rating && item.rating > 0 ? item.rating : undefined,
     releaseYear: item.releaseDate?.slice(0, 4) || undefined,
     genre: resolveGenre(item),
-    addedAt: Date.now()
+    addedAt: Date.now(),
+    provider: item.provider
   }
 }

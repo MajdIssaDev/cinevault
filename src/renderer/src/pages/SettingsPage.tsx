@@ -13,6 +13,7 @@ import {
 import { useAppStore } from '../store'
 import type { AppSettings } from '../../../main/settings'
 import { ThemedSelect } from '../components/ThemedSelect'
+import { Tooltip } from '../components/ui/Tooltip'
 import { openExternal } from '../lib/openExternal'
 
 type TabId = 'appearance' | 'subtitles' | 'playback' | 'storage' | 'about'
@@ -484,9 +485,9 @@ export function SettingsPage(): JSX.Element {
                   </p>
 
                   <div className="settings-path-row">
-                    <code className="settings-path" title={cachePath}>
-                      {cachePath}
-                    </code>
+                    <Tooltip content={cachePath} className="mono-tooltip--fill">
+                      <code className="settings-path">{cachePath}</code>
+                    </Tooltip>
                     <button
                       type="button"
                       className="settings-btn-ghost"

@@ -158,6 +158,20 @@ export async function fetchSeriesByGenre(genre: string, page = 1): Promise<Catal
   return out
 }
 
+/** TVMaze show id for an IMDb id, or null when unknown. */
+export async function lookupSeriesByImdb(imdbId: string): Promise<number | null> {
+  const q = imdbId.trim()
+  if (!q) return null
+  try {
+    const show = await fetchJson<TvMazeShow>(
+      `https://api.tvmaze.com/lookup/shows?imdb=${encodeURIComponent(q)}`
+    )
+    return show?.id ?? null
+  } catch {
+    return null
+  }
+}
+
 export async function fetchSeriesDetails(id: number): Promise<{
   item: CatalogItem
   seasons: SeasonInfo[]
