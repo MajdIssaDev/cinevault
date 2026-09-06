@@ -381,10 +381,12 @@ export function SettingsPage(): JSX.Element {
                   <Field label="Subdl API Key (Optional)">
                     <input
                       className="settings-input"
-                      value={draft.subdlApiKey}
-                      onChange={(e) => set('subdlApiKey', e.target.value)}
+                      type="password"
+                      value={draft.subdlApiKey ?? ''}
+                      onChange={(e) => set('subdlApiKey', e.target.value.trim())}
                       autoComplete="off"
-                      placeholder="Paste your Subdl API key"
+                      spellCheck={false}
+                      placeholder="Leave empty unless you have a Subdl key"
                     />
                   </Field>
                   <Field label="Default language">

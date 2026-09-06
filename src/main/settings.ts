@@ -64,6 +64,10 @@ export function loadSettings(): AppSettings {
     return {
       ...DEFAULTS,
       ...raw,
+      // Never invent API keys — missing/null must stay empty until the user fills them.
+      tmdbApiKey: typeof raw.tmdbApiKey === 'string' ? raw.tmdbApiKey : '',
+      subdlApiKey: typeof raw.subdlApiKey === 'string' ? raw.subdlApiKey : '',
+      openSubtitlesApiKey: typeof raw.openSubtitlesApiKey === 'string' ? raw.openSubtitlesApiKey : '',
       cacheDirectory: raw.cacheDirectory || getDefaultCacheDir()
     }
   } catch {
