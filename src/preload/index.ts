@@ -186,8 +186,14 @@ const api = {
       cacheId?: string
       sizeBytes?: number
     }): Promise<{ success: boolean }> => ipcRenderer.invoke('torrent:prepare-stream', opts),
-    deleteByMedia: (mediaId: string): Promise<{ success: boolean }> =>
-      ipcRenderer.invoke('torrent:delete-by-media', mediaId),
+    deleteByMedia: (
+      mediaId: string,
+      infoHash?: string
+    ): Promise<{ success: boolean; error?: string }> =>
+      ipcRenderer.invoke(
+        'torrent:delete-by-media',
+        infoHash ? { mediaId, infoHash } : mediaId
+      ),
     enforceCacheCap: (maxCacheGB?: number): Promise<{ success: boolean; removed: number }> =>
       ipcRenderer.invoke('torrent:enforce-cache-cap', maxCacheGB),
     prioritize: (opts: {

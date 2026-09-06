@@ -171,10 +171,14 @@ export function createRollingPieceStoreConstructor(infoHash: string): new (
 
 export function removeRollingCache(infoHash: string): void {
   const root = cacheRootForHash(infoHash)
-  try {
-    if (existsSync(root)) rmSync(root, { recursive: true, force: true })
-  } catch {
-    /* ignore */
+  for (let i = 0; i < 5; i++) {
+    try {
+      if (!existsSync(root)) return
+      rmSync(root, { recursive: true, force: true, maxRetries: 6, retryDelay: 100 })
+      if (!existsSync(root)) return
+    } catch {
+      /* Windows may still hold handles — caller retries after a delay */
+    }
   }
 }
 

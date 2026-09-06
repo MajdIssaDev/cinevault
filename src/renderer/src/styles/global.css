@@ -1206,20 +1206,35 @@ html.player-open .player-root {
 .hscroll-wrap {
   flex: 1;
   min-width: 0;
-  /* Soft edge fade inside the scroll lane only */
+  /* Edge fades only when .fade-left / .fade-right — never clip when content fits. */
+}
+.hscroll-wrap.fade-left {
+  -webkit-mask-image: linear-gradient(to right, transparent 0, #000 10px, #000 100%);
+  mask-image: linear-gradient(to right, transparent 0, #000 10px, #000 100%);
+}
+.hscroll-wrap.fade-right {
   -webkit-mask-image: linear-gradient(
     to right,
-    transparent,
-    #000 16px,
-    #000 calc(100% - 16px),
-    transparent
+    #000 0,
+    #000 calc(100% - 10px),
+    transparent 100%
+  );
+  mask-image: linear-gradient(to right, #000 0, #000 calc(100% - 10px), transparent 100%);
+}
+.hscroll-wrap.fade-left.fade-right {
+  -webkit-mask-image: linear-gradient(
+    to right,
+    transparent 0,
+    #000 10px,
+    #000 calc(100% - 10px),
+    transparent 100%
   );
   mask-image: linear-gradient(
     to right,
-    transparent,
-    #000 16px,
-    #000 calc(100% - 16px),
-    transparent
+    transparent 0,
+    #000 10px,
+    #000 calc(100% - 10px),
+    transparent 100%
   );
 }
 .hscroll-track {
@@ -4418,11 +4433,11 @@ html.player-open .player-root {
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 8px;
+  font-size: 7.5px;
   font-weight: 700;
   font-variant-numeric: tabular-nums;
   line-height: 1;
-  letter-spacing: -0.02em;
+  letter-spacing: -0.06em;
   pointer-events: none;
   transform: translateY(0.5px);
 }
@@ -5038,6 +5053,7 @@ html.player-open .player-root {
 .continue-card-title {
   font-size: 13px;
   font-weight: 650;
+  max-width: 100%;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -5046,6 +5062,7 @@ html.player-open .player-root {
   margin-top: 2px;
   font-size: 11px;
   color: #a3a3a3;
+  max-width: 100%;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;

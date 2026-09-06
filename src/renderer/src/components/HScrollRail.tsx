@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { ChevronLeft, ChevronRight } from 'lucide-react'
 
 const SCROLL_STEP = 320
-const EDGE_EPS = 10
+const EDGE_EPS = 5
 
 /** Horizontal scroller with edge chevrons, hidden scrollbar, wheel→horizontal. */
 export function HScrollRail({
@@ -30,6 +30,12 @@ export function HScrollRail({
       return
     }
     const { scrollLeft, clientWidth, scrollWidth } = el
+    // No overflow → no edge fades / chevrons (e.g. Continue Watching with ≤2 cards).
+    if (scrollWidth <= clientWidth + EDGE_EPS) {
+      setCanLeft(false)
+      setCanRight(false)
+      return
+    }
     setCanLeft(scrollLeft > EDGE_EPS)
     setCanRight(scrollLeft < scrollWidth - clientWidth - EDGE_EPS)
   }, [])
@@ -39,6 +45,8 @@ export function HScrollRail({
     if (!el) return
 
     const onWheel = (e: WheelEvent): void => {
+      // Only hijack vertical wheel when the rail actually overflows.
+      if (el.scrollWidth <= el.clientWidth + EDGE_EPS) return
       e.preventDefault()
       el.scrollLeft += e.deltaY
       updateEdges()
@@ -52,12 +60,15 @@ export function HScrollRail({
 
     updateEdges()
     const t = window.setTimeout(updateEdges, 50)
+    // Re-check after layout/fonts settle (card widths animate in).
+    const t2 = window.setTimeout(updateEdges, 320)
 
     return () => {
       el.removeEventListener('wheel', onWheel)
       el.removeEventListener('scroll', updateEdges)
       ro?.disconnect()
       window.clearTimeout(t)
+      window.clearTimeout(t2)
     }
   }, [updateEdges, children])
 
@@ -66,6 +77,8 @@ export function HScrollRail({
     if (!el) return
     el.scrollBy({ left: direction * SCROLL_STEP, behavior: 'smooth' })
   }
+
+  const fadeClass = `${canLeft ? ' fade-left' : ''}${canRight ? ' fade-right' : ''}`
 
   return (
     <div
@@ -84,8 +97,13 @@ export function HScrollRail({
         )}
       </div>
 
-      <div className="hscroll-wrap">
-        <div ref={ref} className={`hscroll-track${trackClassName ? ` ${trackClassName}` : ''}`} role={role} aria-label={ariaLabel}>
+      <div className={`hscroll-wrap${fadeClass}`}>
+        <div
+          ref={ref}
+          className={`hscroll-track${trackClassName ? ` ${trackClassName}` : ''}`}
+          role={role}
+          aria-label={ariaLabel}
+        >
           {children}
         </div>
       </div>

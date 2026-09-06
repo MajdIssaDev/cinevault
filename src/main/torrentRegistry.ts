@@ -2,7 +2,12 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync, statSync, r
 import { join } from 'path'
 import { ipcMain } from 'electron'
 import { getDefaultCacheDir, loadSettings } from './settings'
-import { destroyTorrentData, stopMatchingTorrents } from './torrent'
+import {
+  collectActiveTorrents,
+  destroyTorrentData,
+  stopMatchingTorrents
+} from './torrent'
+import { killStreamProxyForSource } from './streamProxy'
 
 export interface TorrentRecord {
   mediaId: string
@@ -34,6 +39,25 @@ function dirSizeBytes(root: string): number {
     /* ignore */
   }
   return total
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+async function rmDirWithRetry(dir: string, attempts = 8): Promise<void> {
+  for (let i = 0; i < attempts; i++) {
+    try {
+      if (!existsSync(dir)) return
+      rmSync(dir, { recursive: true, force: true, maxRetries: 6, retryDelay: 120 })
+      if (!existsSync(dir)) return
+    } catch (err) {
+      if (i === attempts - 1) {
+        console.error(`[torrent-registry] Failed to delete ${dir}:`, err)
+      }
+    }
+    await sleep(150 + i * 100)
+  }
 }
 
 export function loadTorrentRegistry(): void {
@@ -71,27 +95,63 @@ async function deleteTorrentFiles(record: TorrentRecord): Promise<void> {
       destroyStore: true
     })
   }
+  await sleep(150)
   try {
-    if (record.folderPath && existsSync(record.folderPath)) {
-      rmSync(record.folderPath, { recursive: true, force: true, maxRetries: 6, retryDelay: 120 })
+    if (record.folderPath) {
+      await rmDirWithRetry(record.folderPath)
     }
   } catch (err) {
     console.error(`[torrent-registry] Failed to delete cache for ${record.mediaId}:`, err)
   }
 }
 
-export async function deleteTorrentByMediaId(mediaId: string): Promise<boolean> {
-  if (!mediaId) return false
-  const record = registry.get(mediaId)
-  await stopMatchingTorrents(
-    (id) => id === mediaId || id.startsWith(`${mediaId}-`),
-    { destroyStore: true }
-  )
+export async function deleteTorrentByMediaId(
+  mediaId: string,
+  infoHash?: string
+): Promise<boolean> {
+  if (!mediaId && !infoHash) return false
+
+  const match = (id: string): boolean => {
+    if (!mediaId) return false
+    return id === mediaId || id.startsWith(`${mediaId}-`)
+  }
+
+  const record = mediaId ? registry.get(mediaId) : undefined
+  const hashes = new Set<string>()
+  if (infoHash) hashes.add(infoHash.toLowerCase())
+  if (record?.infoHash) hashes.add(record.infoHash.toLowerCase())
+
+  // 1. Kill FFmpeg remux pipes that still read the live HTTP stream (releases locks).
+  const live = mediaId ? collectActiveTorrents(match) : { ids: [], hashes: [], streamUrls: [] }
+  for (const url of live.streamUrls) {
+    killStreamProxyForSource(url)
+  }
+  for (const h of live.hashes) hashes.add(h)
+
+  // 2. Destroy torrent engine instances (closes piece-store file handles).
+  if (mediaId) {
+    await stopMatchingTorrents(match, { destroyStore: true })
+  }
+
+  // 3. Allow Windows to flush locks, then wipe residual dirs + rolling chunk cache.
+  await sleep(200)
+
+  for (const hash of hashes) {
+    await destroyTorrentData({
+      magnetUri: `magnet:?xt=urn:btih:${hash}`,
+      destroyStore: true
+    })
+  }
+
   if (record) {
     await deleteTorrentFiles(record)
     registry.delete(mediaId)
     persistRegistry()
+  } else if (mediaId) {
+    registry.delete(mediaId)
+    persistRegistry()
   }
+
   return true
 }
 
@@ -176,10 +236,27 @@ export function registerTorrentRegistryHandlers(): void {
       })
   )
 
-  ipcMain.handle('torrent:delete-by-media', async (_e, mediaId: string) => {
-    await deleteTorrentByMediaId(mediaId)
-    return { success: true }
-  })
+  ipcMain.handle(
+    'torrent:delete-by-media',
+    async (
+      _e,
+      arg: string | { mediaId: string; infoHash?: string }
+    ): Promise<{ success: boolean; error?: string }> => {
+      try {
+        const mediaId = typeof arg === 'string' ? arg : arg?.mediaId
+        const infoHash = typeof arg === 'string' ? undefined : arg?.infoHash
+        if (!mediaId) return { success: false, error: 'Missing mediaId' }
+        await deleteTorrentByMediaId(mediaId, infoHash)
+        return { success: true }
+      } catch (error) {
+        console.error('[torrent-registry] delete-by-media failed:', error)
+        return {
+          success: false,
+          error: error instanceof Error ? error.message : String(error)
+        }
+      }
+    }
+  )
 
   ipcMain.handle('torrent:enforce-cache-cap', async (_e, maxCacheGB?: number) => {
     const removed = await enforceCacheCap(maxCacheGB)

@@ -3,16 +3,19 @@ import type { RefObject } from 'react'
 
 /**
  * Night Mode: dynamics compressor + optional gain boost.
+ * Audio sync offset: DelayNode for DSP / spatial latency compensation.
  * Once MediaElementSource is created for a <video>, audio must stay on the Web Audio
- * graph — when disabled we passthrough source → destination (no compressor/boost).
+ * graph — when Night Mode is off we passthrough source → (delay) → destination.
  */
 export function useAudioEnhancer(
   videoRef: RefObject<HTMLVideoElement | null>,
   enabled: boolean,
-  gainValue = 1
+  gainValue = 1,
+  audioOffsetMs = 0
 ): void {
   const ctxRef = useRef<AudioContext | null>(null)
   const sourceRef = useRef<MediaElementAudioSourceNode | null>(null)
+  const delayRef = useRef<DelayNode | null>(null)
   const compressorRef = useRef<DynamicsCompressorNode | null>(null)
   const gainRef = useRef<GainNode | null>(null)
   const wiredVideoRef = useRef<HTMLVideoElement | null>(null)
@@ -20,6 +23,8 @@ export function useAudioEnhancer(
   useEffect(() => {
     const video = videoRef.current
     if (!video) return
+
+    const needsGraph = enabled || audioOffsetMs !== 0
 
     // New video element → drop previous graph
     if (wiredVideoRef.current && wiredVideoRef.current !== video) {
@@ -29,6 +34,7 @@ export function useAudioEnhancer(
         /* ignore */
       }
       sourceRef.current = null
+      delayRef.current = null
       compressorRef.current = null
       gainRef.current = null
       if (ctxRef.current && ctxRef.current.state !== 'closed') {
@@ -38,8 +44,8 @@ export function useAudioEnhancer(
       wiredVideoRef.current = null
     }
 
-    // Never touch Web Audio until Night Mode is turned on at least once for this video.
-    if (!enabled && !sourceRef.current) return
+    // Never touch Web Audio until Night Mode or a non-zero sync offset needs it.
+    if (!needsGraph && !sourceRef.current) return
 
     const AC =
       window.AudioContext ||
@@ -72,6 +78,11 @@ export function useAudioEnhancer(
         /* ignore */
       }
       try {
+        delayRef.current?.disconnect()
+      } catch {
+        /* ignore */
+      }
+      try {
         compressorRef.current?.disconnect()
       } catch {
         /* ignore */
@@ -85,8 +96,17 @@ export function useAudioEnhancer(
 
     disconnectAll()
 
+    const delayNode = ctx.createDelay(1.0)
+    // DelayNode can only postpone audio (positive ms). Negative offsets clear delay.
+    const delaySec = Math.max(0, Math.min(1, audioOffsetMs / 1000))
+    delayNode.delayTime.setValueAtTime(delaySec, ctx.currentTime)
+    delayRef.current = delayNode
+
     if (!enabled) {
-      sourceRef.current.connect(ctx.destination)
+      sourceRef.current.connect(delayNode)
+      delayNode.connect(ctx.destination)
+      compressorRef.current = null
+      gainRef.current = null
       return
     }
 
@@ -101,7 +121,9 @@ export function useAudioEnhancer(
     const boost = Math.min(2, Math.max(1, gainValue || 1))
     gainNode.gain.setValueAtTime(boost, ctx.currentTime)
 
-    sourceRef.current.connect(compressor)
+    // source → delay → compressor → gain → destination
+    sourceRef.current.connect(delayNode)
+    delayNode.connect(compressor)
     compressor.connect(gainNode)
     gainNode.connect(ctx.destination)
 
@@ -109,12 +131,14 @@ export function useAudioEnhancer(
     gainRef.current = gainNode
 
     return () => {
-      // Keep graph alive across dependency churn; teardown on unmount handled below.
       if (gainRef.current && enabled) {
         gainRef.current.gain.setValueAtTime(boost, ctx.currentTime)
       }
+      if (delayRef.current) {
+        delayRef.current.delayTime.setValueAtTime(delaySec, ctx.currentTime)
+      }
     }
-  }, [enabled, gainValue, videoRef])
+  }, [enabled, gainValue, audioOffsetMs, videoRef])
 
   useEffect(() => {
     return () => {
@@ -124,6 +148,7 @@ export function useAudioEnhancer(
         /* ignore */
       }
       sourceRef.current = null
+      delayRef.current = null
       compressorRef.current = null
       gainRef.current = null
       if (ctxRef.current && ctxRef.current.state !== 'closed') {

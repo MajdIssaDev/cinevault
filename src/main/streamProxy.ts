@@ -8,6 +8,9 @@ export const STREAM_PROXY_HOST = '127.0.0.1'
 let proxyServer: http.Server | null = null
 let resolvedFfmpeg: string | null = null
 
+/** Track live remux children so a new scrub can force-kill stragglers. */
+const activeProcs = new Map<ChildProcessWithoutNullStreams, string>()
+
 function isAllowedSource(sourceUrl: string): boolean {
   try {
     const u = new URL(sourceUrl)
@@ -20,16 +23,51 @@ function isAllowedSource(sourceUrl: string): boolean {
 }
 
 function killProc(proc: ChildProcessWithoutNullStreams): void {
-  if (proc.killed) return
+  if (proc.exitCode != null || proc.signalCode != null) {
+    activeProcs.delete(proc)
+    return
+  }
+  activeProcs.delete(proc)
   try {
-    if (process.platform === 'win32') {
-      proc.kill()
+    if (process.platform === 'win32' && proc.pid) {
+      // Force-kill the whole tree — SIGKILL is unreliable on Windows.
+      spawn('taskkill', ['/pid', String(proc.pid), '/T', '/F'], {
+        windowsHide: true,
+        stdio: 'ignore'
+      })
     } else {
       proc.kill('SIGKILL')
     }
   } catch {
-    /* ignore */
+    try {
+      proc.kill()
+    } catch {
+      /* ignore */
+    }
   }
+}
+
+/** Kill remux children whose `-i` source matches (full URL, host:port, or substring). */
+export function killStreamProxyForSource(sourceNeedle: string): number {
+  const needle = (sourceNeedle || '').trim().toLowerCase()
+  if (!needle) return 0
+  let killed = 0
+  for (const [proc, url] of [...activeProcs.entries()]) {
+    const src = (url || '').toLowerCase()
+    if (!src) continue
+    if (src === needle || src.includes(needle) || needle.includes(src)) {
+      killProc(proc)
+      killed += 1
+    }
+  }
+  return killed
+}
+
+export function killAllStreamProxyProcs(): number {
+  const n = activeProcs.size
+  for (const proc of [...activeProcs.keys()]) killProc(proc)
+  activeProcs.clear()
+  return n
 }
 
 /**
@@ -127,23 +165,45 @@ export function startStreamProxy(): http.Server {
       '-hide_banner',
       '-loglevel',
       'error',
+
+      // Timestamp & stream normalization (spatial E-AC-3 / Atmos / DDP)
+      '-fflags',
+      '+genpts+discardcorrupt',
+      '-analyzeduration',
+      '10000000',
+      '-probesize',
+      '32000000',
+      '-avoid_negative_ts',
+      'make_zero',
+
+      // Fast input seek
       ...(start > 0 ? ['-ss', String(start)] : []),
       '-i',
       sourceUrl,
+
+      // Prefer first video + first audio (skip secondary commentary / atmos truehd pairs)
       '-map',
       '0:v:0?',
       '-map',
       '0:a:0?',
+
+      // Video: untouched bitstream passthrough
       '-c:v',
       'copy',
+
+      // Audio: continuous sample-clock alignment → stereo AAC
       '-c:a',
       'aac',
       '-b:a',
-      '192k',
+      '256k',
       '-ac',
       '2',
-      '-ar',
-      '48000',
+      // async=1000 stretches/trims up to 1000 samples/sec to fix drift;
+      // first_pts=0 forces audio to begin at t=0 with the container timeline
+      '-af',
+      'aresample=async=1000:first_pts=0',
+
+      // Output container
       '-movflags',
       'frag_keyframe+empty_moov+default_base_moof',
       '-f',
@@ -166,6 +226,7 @@ export function startStreamProxy(): http.Server {
       return
     }
 
+    activeProcs.set(proc, sourceUrl)
     proc.stdout.pipe(res)
 
     let stderrBuf = ''
@@ -176,26 +237,42 @@ export function startStreamProxy(): http.Server {
 
     proc.on('error', (err) => {
       console.error('[stream-proxy] ffmpeg process error:', err)
+      activeProcs.delete(proc)
       if (!res.writableEnded) res.end()
     })
 
     proc.on('close', (code) => {
+      activeProcs.delete(proc)
       if (code && code !== 0 && stderrBuf.trim()) {
         console.error('[stream-proxy] ffmpeg exit', code, stderrBuf.trim())
       }
       if (!res.writableEnded) res.end()
     })
 
+    let tornDown = false
     const teardown = (): void => {
-      killProc(proc)
+      if (tornDown) return
+      tornDown = true
       try {
         proc.stdout.unpipe(res)
+        proc.stdout.destroy()
       } catch {
         /* ignore */
+      }
+      // SIGKILL / taskkill immediately so a scrubbed `&start=` cannot keep
+      // multiplexing stale audio into another response buffer.
+      killProc(proc)
+      if (!res.writableEnded) {
+        try {
+          res.end()
+        } catch {
+          /* ignore */
+        }
       }
     }
 
     req.on('close', teardown)
+    req.on('aborted', teardown)
     res.on('close', teardown)
   })
 
@@ -214,6 +291,7 @@ export function startStreamProxy(): http.Server {
 }
 
 export function stopStreamProxy(): void {
+  killAllStreamProxyProcs()
   if (!proxyServer) return
   const server = proxyServer
   proxyServer = null

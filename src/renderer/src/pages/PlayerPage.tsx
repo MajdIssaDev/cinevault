@@ -48,6 +48,10 @@ import { getBestStream } from '../lib/streamScorer'
 import { searchPublicIndexers } from '../services/publicSearchService'
 import { isBrowserPreferredVideo, parseTorrentVideo } from '../lib/torrentParser'
 import { buildAudioRemuxUrl, needsAudioRemux } from '../lib/audioRemux'
+import {
+  checkIsFinished,
+  releaseVideoElement
+} from '../lib/playbackCompletion'
 
 const ICON = { size: 20, strokeWidth: 1.75 } as const
 
@@ -113,7 +117,7 @@ function SeekGlyph({ dir }: { dir: 'back' | 'forward' }): JSX.Element {
   return (
     <span className="seek-glyph" aria-hidden>
       <Icon {...ICON} />
-      <span className="seek-glyph-num">5</span>
+      <span className="seek-glyph-num">10</span>
     </span>
   )
 }
@@ -268,6 +272,7 @@ export function PlayerPage(): JSX.Element {
   const [showSubs, setShowSubs] = useState(false)
   const [subSize, setSubSize] = useState(28)
   const [subtitleOffsetMs, setSubtitleOffsetMs] = useState(0)
+  const [audioOffsetMs, setAudioOffsetMs] = useState(0)
   const [cues, setCues] = useState<Cue[]>([])
   const [subText, setSubText] = useState('')
   const [scrub, setScrub] = useState<{ x: number; t: number; visible: boolean }>({
@@ -300,6 +305,10 @@ export function PlayerPage(): JSX.Element {
   const [vlcBusy, setVlcBusy] = useState(false)
   const stallNudgedRef = useRef(false)
   const completedMarkedRef = useRef(false)
+  const isFinishedRef = useRef(false)
+  const finishedPurgedRef = useRef(false)
+  const sessionRef = useRef(session)
+  sessionRef.current = session
   const prioritizeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const [seekFlash, setSeekFlash] = useState<{ dir: -1 | 1; seconds: number } | null>(null)
   const [subToast, setSubToast] = useState<string | null>(null)
@@ -341,7 +350,7 @@ export function PlayerPage(): JSX.Element {
 
   const nightMode = Boolean(settings?.nightMode)
   const volumeBoost = settings?.volumeBoost ?? 1.25
-  useAudioEnhancer(videoRef, nightMode, volumeBoost)
+  useAudioEnhancer(videoRef, nightMode, volumeBoost, audioOffsetMs)
 
   const aniSkip = useAniSkip(
     session.mediaType === 'anime' ? session.malId : null,
@@ -352,8 +361,122 @@ export function PlayerPage(): JSX.Element {
   useEffect(() => {
     setSubLang(session.subtitleLang || settings?.defaultSubtitleLanguage || 'en')
     completedMarkedRef.current = false
+    isFinishedRef.current = false
+    finishedPurgedRef.current = false
     // eslint-disable-next-line react-hooks/exhaustive-deps -- reset language only for a new playback session
   }, [session.cacheId])
+
+  /** Mark finished when hitting credits / AniSkip ED / ≤2 min remaining. */
+  useEffect(() => {
+    if (checkIsFinished(currentPlaybackTime, totalDurationSeconds, aniSkip.ed)) {
+      isFinishedRef.current = true
+    }
+  }, [currentPlaybackTime, totalDurationSeconds, aniSkip.ed])
+
+  /**
+   * Wipe torrent cache after finishing. For binge, pass `purgeMedia: false` so only
+   * this episode's cache id is destroyed (next episode shares mediaId).
+   */
+  const purgeTorrentCacheId = async (
+    cacheId: string,
+    opts?: { purgeMedia?: boolean; mediaId?: string }
+  ): Promise<void> => {
+    const snap = sessionRef.current
+    const mediaId = opts?.mediaId || mediaIdFromParts(snap.mediaType, snap.externalId)
+    const purgeMedia = opts?.purgeMedia !== false
+    try {
+      await window.cinevault?.torrent.stop(cacheId, { destroyStore: true })
+      await window.cinevault?.torrent.destroyData({ id: cacheId, destroyStore: true })
+      await window.cinevault?.cache.remove(cacheId)
+      if (purgeMedia) {
+        await window.cinevault?.torrent.deleteByMedia?.(mediaId)
+      }
+      console.log(`[Storage] Auto-purged completed media: ${mediaId} (${cacheId})`)
+    } catch (err) {
+      console.error('[Storage] Failed to auto-purge completed media:', err)
+      throw err
+    }
+  }
+
+  const triggerFinishedCleanup = async (opts?: {
+    purgeMedia?: boolean
+    cacheId?: string
+    skipVideoRelease?: boolean
+  }): Promise<void> => {
+    if (!isFinishedRef.current) return
+    if (finishedPurgedRef.current) return
+    finishedPurgedRef.current = true
+
+    const snap = sessionRef.current
+    const cacheId = opts?.cacheId || snap.cacheId
+    const mediaId = mediaIdFromParts(snap.mediaType, snap.externalId)
+    const purgeMedia = opts?.purgeMedia !== false
+
+    if (!opts?.skipVideoRelease) {
+      releaseVideoElement(videoRef.current)
+      releaseVideoElement(scrubVideoRef.current)
+    }
+
+    markAsCompleted(mediaId, snap.season, snap.episode)
+    completedMarkedRef.current = true
+
+    if (snap.source.kind !== 'torrent') {
+      try {
+        await window.cinevault?.cache.markComplete(cacheId)
+      } catch {
+        /* ignore */
+      }
+      return
+    }
+
+    try {
+      await purgeTorrentCacheId(cacheId, { purgeMedia, mediaId })
+    } catch {
+      finishedPurgedRef.current = false
+    }
+  }
+
+  // Natural end of file — movies purge immediately; series wait for binge / exit.
+  useEffect(() => {
+    const video = videoRef.current
+    if (!video) return
+    const onEnded = (): void => {
+      isFinishedRef.current = true
+      if (sessionRef.current.mediaType === 'movie') {
+        void triggerFinishedCleanup({ purgeMedia: true })
+      }
+    }
+    video.addEventListener('ended', onEnded)
+    return () => video.removeEventListener('ended', onEnded)
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- rebind per stream
+  }, [session.cacheId])
+
+  // Leaving the player after credits → reclaim disk (true unmount only).
+  useEffect(() => {
+    return () => {
+      if (!isFinishedRef.current || finishedPurgedRef.current) return
+      const snap = sessionRef.current
+      const mediaId = mediaIdFromParts(snap.mediaType, snap.externalId)
+      const cacheId = snap.cacheId
+      releaseVideoElement(videoRef.current)
+      markAsCompleted(mediaId, snap.season, snap.episode)
+      if (snap.source.kind === 'torrent') {
+        void (async () => {
+          try {
+            await window.cinevault?.torrent.stop(cacheId, { destroyStore: true })
+            await window.cinevault?.torrent.destroyData({ id: cacheId, destroyStore: true })
+            await window.cinevault?.cache.remove(cacheId)
+            await window.cinevault?.torrent.deleteByMedia?.(mediaId)
+            console.log(`[Storage] Auto-purged completed media on exit: ${mediaId}`)
+          } catch (err) {
+            console.error('[Storage] Failed to auto-purge on exit:', err)
+          }
+        })()
+      } else {
+        void window.cinevault?.cache.markComplete(cacheId)
+      }
+    }
+  }, [])
 
   const bumpChrome = (): void => {
     setChromeVisible(true)
@@ -1065,7 +1188,7 @@ export function PlayerPage(): JSX.Element {
       if (!window.cinevault) return
       const entry = buildEntry()
       const mediaId = mediaIdFromParts(session.mediaType, session.externalId)
-      const done = entry.percentage >= COMPLETE_AT
+      const done = entry.percentage >= COMPLETE_AT || isFinishedRef.current
       void window.cinevault.cache.upsert({
         id: session.cacheId,
         mediaId,
@@ -1079,9 +1202,13 @@ export function PlayerPage(): JSX.Element {
         durationSeconds: entry.duration,
         sourceUrl: session.source.kind !== 'local' ? session.source.url : undefined
       })
-      if (done && !completedMarkedRef.current) {
-        completedMarkedRef.current = true
-        void window.cinevault.cache.markComplete(session.cacheId)
+      if (done) {
+        isFinishedRef.current = true
+        if (!completedMarkedRef.current) {
+          completedMarkedRef.current = true
+          // Schedule backup wipe; primary wipe runs on exit / binge / movie ended.
+          void window.cinevault.cache.markComplete(session.cacheId)
+        }
       }
     }
 
@@ -1169,9 +1296,11 @@ export function PlayerPage(): JSX.Element {
     setSubToast('Loading next episode…')
     const prevCacheId = session.cacheId
     const prevKind = session.source.kind
+    const mediaId = mediaIdFromParts(session.mediaType, session.externalId)
     try {
-      const mediaId = mediaIdFromParts(session.mediaType, session.externalId)
+      isFinishedRef.current = true
       markAsCompleted(mediaId, session.season, session.episode)
+      completedMarkedRef.current = true
 
       const query = buildCatalogSearchQuery({
         title: target.showTitle,
@@ -1229,6 +1358,19 @@ export function PlayerPage(): JSX.Element {
       }
 
       const cacheId = source.id
+
+      // Drop OS locks on the finished episode, then wipe its torrent store (not the whole mediaId).
+      releaseVideoElement(videoRef.current)
+      releaseVideoElement(scrubVideoRef.current)
+      if (prevKind === 'torrent' && prevCacheId && prevCacheId !== cacheId) {
+        try {
+          await purgeTorrentCacheId(prevCacheId, { purgeMedia: false, mediaId })
+        } catch {
+          /* startTorrentPlayback already removeByMedia(keepId) — best-effort extra wipe */
+        }
+      }
+      finishedPurgedRef.current = true
+
       sourceAttachedRef.current = false
       initialStartedRef.current = false
       needsContiguousBufferRef.current = true
@@ -1262,11 +1404,6 @@ export function PlayerPage(): JSX.Element {
           source.quality !== 'unknown' ? source.quality : qualityPref,
         resumeSeconds: 0
       })
-
-      // Stop the previous torrent only after the next one is live.
-      if (prevKind === 'torrent' && prevCacheId && prevCacheId !== cacheId) {
-        void window.cinevault?.torrent.stop(prevCacheId)
-      }
     } catch (e) {
       setUpNextBusy(false)
       setUpNextSeconds(10)
@@ -1544,6 +1681,24 @@ export function PlayerPage(): JSX.Element {
 
   const clampOffsetMs = (ms: number): number => Math.max(-10000, Math.min(10000, Math.round(ms)))
 
+  const clampAudioOffsetMs = (ms: number): number =>
+    Math.max(-500, Math.min(500, Math.round(ms / 50) * 50))
+
+  const toastAudioSync = (ms: number): void => {
+    const label = `Audio Sync: ${ms > 0 ? '+' : ''}${ms}ms`
+    setSubToast(label)
+    if (subToastTimerRef.current) clearTimeout(subToastTimerRef.current)
+    subToastTimerRef.current = setTimeout(() => setSubToast(null), 1400)
+  }
+
+  const nudgeAudioSync = (deltaMs: number): void => {
+    setAudioOffsetMs((prev) => {
+      const next = clampAudioOffsetMs(prev + deltaMs)
+      toastAudioSync(next)
+      return next
+    })
+  }
+
   const setOffsetMs = (ms: number, toast = true): void => {
     const next = clampOffsetMs(ms)
     subOffsetMsRef.current = next
@@ -1607,7 +1762,21 @@ export function PlayerPage(): JSX.Element {
         setShowShortcuts(false)
         return
       }
-      if (e.repeat && key !== 'ArrowLeft' && key !== 'ArrowRight' && key !== 'ArrowUp' && key !== 'ArrowDown' && key !== '[' && key !== ']' && key !== 'z' && key !== 'Z' && key !== 'x' && key !== 'X' && key !== 'j' && key !== 'J' && key !== 'l' && key !== 'L') {
+      if (e.repeat && key !== 'ArrowLeft' && key !== 'ArrowRight' && key !== 'ArrowUp' && key !== 'ArrowDown' && key !== '[' && key !== ']' && key !== '{' && key !== '}' && key !== 'z' && key !== 'Z' && key !== 'x' && key !== 'X' && key !== 'j' && key !== 'J' && key !== 'l' && key !== 'L') {
+        return
+      }
+
+      // Audio sync (hardware DSP latency) — Shift+[ / Shift+]
+      if (e.shiftKey && (e.code === 'BracketLeft' || key === '[' || key === '{')) {
+        e.preventDefault()
+        nudgeAudioSync(-50)
+        bumpChrome()
+        return
+      }
+      if (e.shiftKey && (e.code === 'BracketRight' || key === ']' || key === '}')) {
+        e.preventDefault()
+        nudgeAudioSync(50)
+        bumpChrome()
         return
       }
 
@@ -1648,10 +1817,10 @@ export function PlayerPage(): JSX.Element {
           return next
         })
         bumpChrome()
-      } else if (key === 'z' || key === 'Z' || key === '[') {
+      } else if ((key === 'z' || key === 'Z' || key === '[') && !e.shiftKey) {
         e.preventDefault()
         startHold('sub-earlier', () => nudgeSubs(-250), 70, 320)
-      } else if (key === 'x' || key === 'X' || key === ']') {
+      } else if ((key === 'x' || key === 'X' || key === ']') && !e.shiftKey) {
         e.preventDefault()
         startHold('sub-later', () => nudgeSubs(250), 70, 320)
       } else if (key === 'g' || key === 'G') {
@@ -1776,37 +1945,39 @@ export function PlayerPage(): JSX.Element {
   const stop = async (): Promise<void> => {
     const video = videoRef.current
     const mediaId = mediaIdFromParts(session.mediaType, session.externalId)
+    const wall =
+      video && useAudioRemux
+        ? remuxOriginRef.current + (video.currentTime || 0)
+        : video?.currentTime || 0
+    const dur = totalDurationSeconds || video?.duration || 0
+    if (checkIsFinished(wall, dur, aniSkip.ed)) {
+      isFinishedRef.current = true
+    }
+    if (isFinishedRef.current) {
+      await triggerFinishedCleanup({ purgeMedia: true })
+      setSession(null)
+      return
+    }
     if (video) {
-      const pct = video.duration > 0 ? (video.currentTime / video.duration) * 100 : 0
-      if (pct >= COMPLETE_AT) {
-        markAsCompleted(mediaId, session.season, session.episode)
-      } else {
-        saveProgress(
-          {
-            mediaId,
-            mediaType: session.mediaType,
-            externalId: session.externalId,
-            title: session.showTitle || session.title.split(' · ')[0],
-            posterPath: session.posterUrl || undefined,
-            backdropPath: session.backdropUrl || undefined,
-            season: session.season,
-            episode: session.episode,
-            episodeTitle: session.episodeTitle,
-            currentTime: video.currentTime || 0,
-            duration: video.duration || 0,
-            percentage: pct,
-            updatedAt: Date.now()
-          },
-          { immediate: true }
-        )
-      }
-      if (window.cinevault) {
-        const nearEnd = video.duration > 0 && video.currentTime / video.duration > 0.92
-        if (nearEnd) {
-          completedMarkedRef.current = true
-          await window.cinevault.cache.markComplete(session.cacheId)
-        }
-      }
+      const pct = dur > 0 ? (wall / dur) * 100 : 0
+      saveProgress(
+        {
+          mediaId,
+          mediaType: session.mediaType,
+          externalId: session.externalId,
+          title: session.showTitle || session.title.split(' · ')[0],
+          posterPath: session.posterUrl || undefined,
+          backdropPath: session.backdropUrl || undefined,
+          season: session.season,
+          episode: session.episode,
+          episodeTitle: session.episodeTitle,
+          currentTime: wall,
+          duration: dur,
+          percentage: pct,
+          updatedAt: Date.now()
+        },
+        { immediate: true }
+      )
     }
     if (session.source.kind === 'torrent') {
       await window.cinevault?.torrent.stop(session.cacheId)
@@ -1817,6 +1988,18 @@ export function PlayerPage(): JSX.Element {
   const backToLibrary = (): void => {
     const video = videoRef.current
     const mediaId = mediaIdFromParts(session.mediaType, session.externalId)
+    const wall =
+      video && useAudioRemux
+        ? remuxOriginRef.current + (video.currentTime || 0)
+        : video?.currentTime || 0
+    const dur = totalDurationSeconds || video?.duration || 0
+    if (checkIsFinished(wall, dur, aniSkip.ed)) {
+      isFinishedRef.current = true
+    }
+    if (isFinishedRef.current) {
+      void triggerFinishedCleanup({ purgeMedia: true }).finally(() => setSession(null))
+      return
+    }
     if (video) {
       video.pause()
       saveProgress(
@@ -1830,15 +2013,15 @@ export function PlayerPage(): JSX.Element {
           season: session.season,
           episode: session.episode,
           episodeTitle: session.episodeTitle,
-          currentTime: video.currentTime || 0,
-          duration: video.duration || 0,
-          percentage: 0,
+          currentTime: wall,
+          duration: dur,
+          percentage: dur > 0 ? (wall / dur) * 100 : 0,
           updatedAt: Date.now()
         },
         { immediate: true }
       )
       useAppStore.setState({
-        lastSession: { ...session, resumeSeconds: video.currentTime }
+        lastSession: { ...session, resumeSeconds: wall }
       })
     } else {
       stashLastSession()
@@ -2148,6 +2331,40 @@ export function PlayerPage(): JSX.Element {
             <div>HDR prefer: {session.source.hdr ? 'yes' : 'no'}</div>
             <div>Spatial prefer: {session.source.spatialAudio ? 'yes' : 'no'}</div>
             <div>Subtitle delay: {subtitleOffsetMs} ms</div>
+            <div className="sub-panel-field" style={{ marginTop: 8 }}>
+              <div className="sub-panel-delay-head">
+                <span>Audio sync ({audioOffsetMs > 0 ? '+' : ''}{audioOffsetMs} ms)</span>
+                <button
+                  type="button"
+                  className="sub-panel-reset"
+                  onClick={() => {
+                    setAudioOffsetMs(0)
+                    toastAudioSync(0)
+                  }}
+                  disabled={audioOffsetMs === 0}
+                >
+                  Reset
+                </button>
+              </div>
+              <input
+                type="range"
+                min={-500}
+                max={500}
+                step={50}
+                value={audioOffsetMs}
+                onChange={(e) => {
+                  const next = clampAudioOffsetMs(Number(e.target.value))
+                  setAudioOffsetMs(next)
+                }}
+                onPointerUp={(e) =>
+                  toastAudioSync(clampAudioOffsetMs(Number((e.target as HTMLInputElement).value)))
+                }
+                onKeyUp={(e) =>
+                  toastAudioSync(clampAudioOffsetMs(Number((e.target as HTMLInputElement).value)))
+                }
+              />
+              <div className="sub-panel-status">Shift+[ earlier · Shift+] later · 50 ms</div>
+            </div>
           </div>
         )}
         {showSubs && (
@@ -2567,6 +2784,10 @@ export function PlayerPage(): JSX.Element {
               <li>
                 <kbd>[</kbd> / <kbd>]</kbd>
                 <span>Subtitle ±250ms</span>
+              </li>
+              <li>
+                <kbd>Shift</kbd>+<kbd>[</kbd> / <kbd>]</kbd>
+                <span>Audio sync ±50ms</span>
               </li>
               <li>
                 <kbd>N</kbd>

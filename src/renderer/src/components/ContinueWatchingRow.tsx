@@ -49,8 +49,14 @@ function ContinueCard({
           </div>
         </div>
         <div className="continue-card-meta">
-          <div className="continue-card-title">{entry.title}</div>
-          {subtitle ? <div className="continue-card-sub">{subtitle}</div> : null}
+          <div className="continue-card-title" title={entry.title}>
+            {entry.title}
+          </div>
+          {subtitle ? (
+            <div className="continue-card-sub" title={subtitle}>
+              {subtitle}
+            </div>
+          ) : null}
         </div>
       </button>
       <button
@@ -138,9 +144,18 @@ export function ContinueWatchingRow({
                   <ContinueCard
                     entry={entry}
                     onRemove={() => {
+                      // Optimistic UI + local history
                       clearProgressForMedia(entry.mediaId)
-                      void window.cinevault?.cache.removeByMedia(entry.mediaId)
-                      void window.cinevault?.torrent.deleteByMedia?.(entry.mediaId)
+                      void (async () => {
+                        try {
+                          // Cache wipe stops matching torrents and removes index rows.
+                          await window.cinevault?.cache.removeByMedia(entry.mediaId)
+                          // Explicit engine + disk purge (idempotent if cache path already ran).
+                          await window.cinevault?.torrent.deleteByMedia?.(entry.mediaId)
+                        } catch (err) {
+                          console.error('Failed to cleanup torrent storage:', err)
+                        }
+                      })()
                     }}
                     onOpen={() =>
                       navigate(`/detail/${entry.mediaType}/${entry.externalId}`)

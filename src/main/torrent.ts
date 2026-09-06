@@ -11,6 +11,7 @@ import {
   removeRollingCache,
   type RollingStoreInstance
 } from './rollingPieceStore'
+import { killStreamProxyForSource } from './streamProxy'
 
 const VIDEO_EXT = /\.(mp4|mkv|avi|webm|m4v|mov|wmv|flv|ts|m2ts)$/i
 /** Contiguous bytes ahead of playhead that unlock playback (matches renderer). */
@@ -439,6 +440,61 @@ async function startTorrent(opts: {
   return ensureStream({ id: opts.id, torrent })
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+/** Retry recursive deletes — Windows often returns EBUSY until handles flush. */
+async function rmDirWithRetry(dir: string, attempts = 8): Promise<boolean> {
+  for (let i = 0; i < attempts; i++) {
+    try {
+      if (!existsSync(dir)) return true
+      rmSync(dir, { recursive: true, force: true, maxRetries: 6, retryDelay: 120 })
+      if (!existsSync(dir)) return true
+    } catch (err) {
+      if (i === attempts - 1) {
+        console.error(`[torrent] Failed to delete ${dir}:`, err)
+      }
+    }
+    await sleep(120 + i * 80)
+  }
+  return !existsSync(dir)
+}
+
+async function wipeTorrentDisk(hash: string): Promise<boolean> {
+  const h = hash.toLowerCase()
+  let removed = false
+  for (const p of [join(torrentsDir(), h), join(torrentsDir(), h.toUpperCase())]) {
+    if (await rmDirWithRetry(p)) {
+      if (!existsSync(p)) removed = true
+    }
+  }
+  removeRollingCache(h)
+  // Second pass after rolling-store destroy may still be flushing on Windows
+  await sleep(150)
+  removeRollingCache(h)
+  return removed
+}
+
+/** Snapshot active torrents matching an id predicate (before stop/destroy). */
+export function collectActiveTorrents(match: (id: string) => boolean): {
+  ids: string[]
+  hashes: string[]
+  streamUrls: string[]
+} {
+  const ids: string[] = []
+  const hashes: string[] = []
+  const streamUrls: string[] = []
+  for (const [id, entry] of active) {
+    if (!match(id)) continue
+    ids.push(id)
+    const ih = entry.torrent.infoHash?.toLowerCase()
+    if (ih) hashes.push(ih)
+    if (entry.streamUrl) streamUrls.push(entry.streamUrl)
+  }
+  return { ids, hashes, streamUrls }
+}
+
 async function destroyTorrentInstance(
   torrent: WebTorrent.Torrent,
   destroyStore: boolean
@@ -464,6 +520,17 @@ async function stopTorrent(
   }
   active.delete(id)
 
+  // Release FFmpeg remux pipes that still hold the HTTP stream open (Windows file locks).
+  if (entry.streamUrl) {
+    killStreamProxyForSource(entry.streamUrl)
+    try {
+      const port = String(entry.port || '')
+      if (port) killStreamProxyForSource(`:${port}/`)
+    } catch {
+      /* ignore */
+    }
+  }
+
   await new Promise<void>((resolve) => {
     try {
       entry.server?.close(() => resolve())
@@ -473,10 +540,14 @@ async function stopTorrent(
     setTimeout(resolve, 500)
   })
 
+  // Brief pause so Windows drops TCP/file handles before engine destroy.
+  await sleep(150)
+
+  const hash = entry.torrent.infoHash?.toLowerCase()
   await destroyTorrentInstance(entry.torrent, destroyStore)
-  if (destroyStore) {
-    const hash = entry.torrent.infoHash
-    if (hash) removeRollingCache(hash)
+  if (destroyStore && hash) {
+    await sleep(150)
+    await wipeTorrentDisk(hash)
   }
   return true
 }
@@ -525,19 +596,8 @@ export async function destroyTorrentData(opts: {
     }
 
     if (destroyStore) {
-      const dir = join(torrentsDir(), hash)
-      const dirUpper = join(torrentsDir(), hash.toUpperCase())
-      for (const p of [dir, dirUpper]) {
-        try {
-          if (existsSync(p)) {
-            rmSync(p, { recursive: true, force: true, maxRetries: 6, retryDelay: 120 })
-            removed = true
-          }
-        } catch {
-          /* ignore */
-        }
-      }
-      removeRollingCache(hash)
+      await sleep(150)
+      removed = (await wipeTorrentDisk(hash)) || removed
     }
   }
 
