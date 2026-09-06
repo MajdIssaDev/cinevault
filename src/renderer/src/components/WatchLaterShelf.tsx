@@ -8,6 +8,8 @@ import {
   type WatchLaterItem,
   type WatchLaterMediaType
 } from '../services/watchLaterService'
+import { PosterRatingBadge } from './PosterRatingBadge'
+import { resolveGenre } from '../lib/genres'
 
 const SCROLL_STEP = 160
 const PLACEHOLDER_SLOTS = 4
@@ -21,6 +23,12 @@ function WatchLaterCard({
   onRemove: (id: string | number) => void
   onOpen: () => void
 }): JSX.Element {
+  const year = item.releaseYear || '—'
+  const subLabel = resolveGenre({
+    genre: item.genre,
+    mediaType: item.mediaType
+  })
+
   return (
     <article className="watch-later-card">
       <button type="button" className="watch-later-card-main" onClick={onOpen}>
@@ -30,15 +38,23 @@ function WatchLaterCard({
           ) : (
             <div className="watch-later-card-empty">{item.title}</div>
           )}
+          <PosterRatingBadge rating={item.voteAverage} />
           <div className="watch-later-card-scrim" />
         </div>
         <div className="watch-later-card-meta">
-          <div className="watch-later-card-title">{item.title}</div>
+          <div className="watch-later-card-title" title={item.title}>
+            {item.title}
+          </div>
           <div className="watch-later-card-sub">
-            {item.releaseYear || '—'}
-            {item.voteAverage != null && item.voteAverage > 0
-              ? ` · ★ ${item.voteAverage.toFixed(1)}`
-              : ''}
+            <span>{year}</span>
+            {subLabel ? (
+              <>
+                <span className="poster-card-dot" aria-hidden>
+                  •
+                </span>
+                <span className="poster-card-genre">{subLabel}</span>
+              </>
+            ) : null}
           </div>
         </div>
       </button>

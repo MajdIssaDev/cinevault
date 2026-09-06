@@ -210,7 +210,7 @@ export function CatalogHero({ item }: { item: CatalogItem }): JSX.Element {
         <div className="catalog-hero-actions">
           {localMatch ? (
             <button className="catalog-btn primary" type="button" onClick={() => void playLocal()}>
-              <Play size={18} fill="currentColor" strokeWidth={0} />
+              <Play size={16} fill="currentColor" strokeWidth={0} />
               Play
             </button>
           ) : (
@@ -220,7 +220,7 @@ export function CatalogHero({ item }: { item: CatalogItem }): JSX.Element {
               disabled={checkingLocal}
               onClick={() => navigate(detailPath)}
             >
-              <Search size={18} strokeWidth={2} />
+              <Search size={16} strokeWidth={2} />
               {checkingLocal ? 'Checking…' : 'Find Streams'}
             </button>
           )}
@@ -231,7 +231,7 @@ export function CatalogHero({ item }: { item: CatalogItem }): JSX.Element {
             title="Watch trailer"
             onClick={() => void openTrailer()}
           >
-            <Clapperboard size={18} strokeWidth={1.75} />
+            <Clapperboard size={16} strokeWidth={1.75} />
             {trailerBusy ? 'Loading…' : 'Watch Trailer'}
           </button>
           <button
@@ -241,7 +241,7 @@ export function CatalogHero({ item }: { item: CatalogItem }): JSX.Element {
             aria-pressed={inWatchLater}
             onClick={() => toggleWatchLater(catalogToWatchLaterItem(item))}
           >
-            <Clock size={18} strokeWidth={1.75} />
+            <Clock size={16} strokeWidth={1.75} />
             {inWatchLater ? 'In Watch Later' : 'Watch Later'}
           </button>
           <button
@@ -262,9 +262,9 @@ export function CatalogHero({ item }: { item: CatalogItem }): JSX.Element {
             }
           >
             {fav ? (
-              <Heart size={18} fill="currentColor" strokeWidth={0} />
+              <Heart size={16} fill="currentColor" strokeWidth={0} />
             ) : (
-              <Heart size={18} strokeWidth={1.75} />
+              <Heart size={16} strokeWidth={1.75} />
             )}
           </button>
           <button
@@ -274,7 +274,7 @@ export function CatalogHero({ item }: { item: CatalogItem }): JSX.Element {
             aria-label="More info"
             onClick={() => navigate(detailPath)}
           >
-            <Info size={18} strokeWidth={1.75} />
+            <Info size={16} strokeWidth={1.75} />
           </button>
         </div>
       </div>

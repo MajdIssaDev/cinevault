@@ -11,6 +11,8 @@ import {
 } from '../services/playbackHistoryService'
 import { useWatchLater } from '../hooks/useWatchLater'
 import { catalogToWatchLaterItem } from '../services/watchLaterService'
+import { PosterRatingBadge } from './PosterRatingBadge'
+import { resolveGenre } from '../lib/genres'
 
 function looksLikeLandscapeArt(url: string | null): boolean {
   if (!url) return false
@@ -44,7 +46,7 @@ function PosterCardInner({ item }: { item: CatalogItem }): JSX.Element {
   }, [item.id])
 
   const year = item.releaseDate?.slice(0, 4) || '—'
-  const rating = item.rating > 0 ? item.rating.toFixed(1) : null
+  const subLabel = resolveGenre(item)
   const pct = progress ? Math.min(100, Math.max(0, progress.percentage)) : 0
 
   const goDetail = (): void => {
@@ -73,14 +75,7 @@ function PosterCardInner({ item }: { item: CatalogItem }): JSX.Element {
             <span className="poster-card-empty-title">{item.title}</span>
           </div>
         )}
-        {rating && (
-          <span className="poster-rating-badge">
-            <span className="poster-rating-star" aria-hidden>
-              ★
-            </span>
-            {rating}
-          </span>
-        )}
+        <PosterRatingBadge rating={item.rating} />
         <div className="poster-play" aria-hidden>
           <span className="poster-play-disc">
             <Play size={22} fill="currentColor" strokeWidth={0} />
@@ -160,8 +155,20 @@ function PosterCardInner({ item }: { item: CatalogItem }): JSX.Element {
         </button>
       </div>
       <div className="poster-card-meta">
-        <div className="poster-card-title">{item.title}</div>
-        <div className="poster-card-year">{year}</div>
+        <div className="poster-card-title" title={item.title}>
+          {item.title}
+        </div>
+        <div className="poster-card-sub">
+          <span className="poster-card-year">{year}</span>
+          {subLabel ? (
+            <>
+              <span className="poster-card-dot" aria-hidden>
+                •
+              </span>
+              <span className="poster-card-genre">{subLabel}</span>
+            </>
+          ) : null}
+        </div>
       </div>
     </article>
   )

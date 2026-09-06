@@ -2,6 +2,8 @@
  * Local Watch Later bookmarks — no accounts; persists in localStorage.
  */
 
+import { resolveGenre } from '../lib/genres'
+
 export type WatchLaterMediaType = 'movie' | 'tv' | 'anime'
 
 export interface WatchLaterItem {
@@ -12,6 +14,8 @@ export interface WatchLaterItem {
   backdropPath?: string
   voteAverage?: number
   releaseYear?: string
+  /** Primary genre label persisted at bookmark time. */
+  genre?: string
   addedAt: number
 }
 
@@ -67,6 +71,7 @@ export function toggleWatchLater(item: WatchLaterItem): boolean {
   }
   list.push({
     ...item,
+    genre: item.genre || resolveGenre(item),
     addedAt: item.addedAt || Date.now()
   })
   writeAll(list)
@@ -105,6 +110,9 @@ export function catalogToWatchLaterItem(item: {
   backdropUrl?: string | null
   rating?: number
   releaseDate?: string | null
+  genres?: string[]
+  genre?: string
+  genre_ids?: number[]
 }): WatchLaterItem {
   return {
     id: item.id,
@@ -114,6 +122,7 @@ export function catalogToWatchLaterItem(item: {
     backdropPath: item.backdropUrl || undefined,
     voteAverage: item.rating && item.rating > 0 ? item.rating : undefined,
     releaseYear: item.releaseDate?.slice(0, 4) || undefined,
+    genre: resolveGenre(item),
     addedAt: Date.now()
   }
 }
