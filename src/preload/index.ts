@@ -169,6 +169,8 @@ const api = {
       error?: string
       streamUrl?: string
       fileName?: string
+      contiguousForwardBytes?: number
+      currentPiece?: number
     } | null> => ipcRenderer.invoke('torrent:status', id),
     stop: (id: string, opts?: { destroyStore?: boolean }): Promise<boolean> =>
       ipcRenderer.invoke('torrent:stop', id, opts),
@@ -192,6 +194,7 @@ const api = {
       id: string
       currentTime: number
       duration: number
+      invalidate?: boolean
     }): Promise<boolean> => ipcRenderer.invoke('torrent:prioritize', opts),
     nudge: (id: string): Promise<boolean> => ipcRenderer.invoke('torrent:nudge', id)
   },

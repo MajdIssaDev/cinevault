@@ -137,9 +137,14 @@ function bufferedEnd(video: HTMLVideoElement | null): number {
 /** How far ahead of currentTime the HTML5 buffer extends (target window → %). */
 const unstickAtByVideo = new WeakMap<HTMLVideoElement, number>()
 
+/** Start / resume once we have this much contiguous time ahead of the playhead. */
+const PREBUFFER_SECONDS = 10
+/** Or this many contiguous verified bytes ahead of the playhead. */
+const PREBUFFER_BYTES = 35 * 1024 * 1024
+
 function calculateForwardBuffer(
   video: HTMLVideoElement,
-  targetSeconds = 15
+  targetSeconds = PREBUFFER_SECONDS
 ): { forwardSec: number; pct: number } {
   const current = video.currentTime
   try {
@@ -181,6 +186,27 @@ function calculateForwardBuffer(
   return { forwardSec: 0, pct: 0 }
 }
 
+function isReadyToPlay(
+  video: HTMLVideoElement | null,
+  streamStats: { contiguousForwardBytes?: number; done?: boolean } | null
+): boolean {
+  if (streamStats?.done) return true
+  if (video) {
+    try {
+      for (let i = 0; i < video.buffered.length; i++) {
+        const start = video.buffered.start(i)
+        const end = video.buffered.end(i)
+        if (video.currentTime >= start && video.currentTime <= end) {
+          if (end - video.currentTime >= PREBUFFER_SECONDS) return true
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+  return (streamStats?.contiguousForwardBytes || 0) >= PREBUFFER_BYTES
+}
+
 function isHevcRelease(label: string): boolean {
   return parseTorrentVideo(label).isHevc
 }
@@ -210,7 +236,8 @@ export function PlayerPage(): JSX.Element {
   const idleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const waitingSinceRef = useRef<number | null>(null)
   const sourceAttachedRef = useRef(false)
-  const resumeGateRef = useRef<number | null>(null)
+  /** After seek / underrun: block play until contiguous 10s or 35 MB ahead. */
+  const needsContiguousBufferRef = useRef(true)
   const initialStartedRef = useRef(false)
   /** User/app wants playback; stays true across waiting-induced pauses. */
   const wantPlaybackRef = useRef(true)
@@ -255,6 +282,7 @@ export function PlayerPage(): JSX.Element {
     done: boolean
     peers?: number
     progress?: number
+    contiguousForwardBytes?: number
   } | null>(null)
   const [bufferPct, setBufferPct] = useState(0)
   const [videoWidth, setVideoWidth] = useState(0)
@@ -264,7 +292,6 @@ export function PlayerPage(): JSX.Element {
   const [buffering, setBuffering] = useState(true)
   const [mediaError, setMediaError] = useState<string | null>(null)
   const [mediaAttached, setMediaAttached] = useState(false)
-  const [waitTargetPct, setWaitTargetPct] = useState<number | null>(null)
   const [forwardBufferPct, setForwardBufferPct] = useState(0)
   const [forwardBufferSec, setForwardBufferSec] = useState(0)
   const [stallRecovery, setStallRecovery] = useState<{ speedLabel: string } | null>(null)
@@ -354,10 +381,17 @@ export function PlayerPage(): JSX.Element {
     const video = videoRef.current
     if (!video || !sourceAttachedRef.current) return
     if (!wantPlaybackRef.current) return
+    if (
+      session.source.kind === 'torrent' &&
+      needsContiguousBufferRef.current &&
+      !isReadyToPlay(video, dl)
+    ) {
+      setBuffering(true)
+      return
+    }
     void video.play().then(() => {
       initialStartedRef.current = true
-      resumeGateRef.current = null
-      setWaitTargetPct(null)
+      needsContiguousBufferRef.current = false
       setBuffering(false)
       waitingSinceRef.current = null
       setPlaying(true)
@@ -398,7 +432,6 @@ export function PlayerPage(): JSX.Element {
     // Scrub preview uses the raw stream when possible (byte-range friendly).
     if (scrubVideoRef.current) scrubVideoRef.current.src = src
     setMediaAttached(true)
-    setWaitTargetPct(null)
 
     const onMeta = (): void => {
       if (!remuxing && resumeAt > 0) video.currentTime = resumeAt
@@ -450,7 +483,7 @@ export function PlayerPage(): JSX.Element {
     bumpChrome()
   }
 
-  // Load media — for torrents wait until ~5% downloaded so the start of the file exists
+  // Load media — torrents attach immediately; play waits for contiguous 10s / 35 MB ahead
   useEffect(() => {
     const video = videoRef.current
     if (!video) return
@@ -459,12 +492,11 @@ export function PlayerPage(): JSX.Element {
     setMediaError(null)
     setBuffering(true)
     setMediaAttached(false)
-    setWaitTargetPct(5)
     waitingSinceRef.current = Date.now()
     sourceAttachedRef.current = false
     initialStartedRef.current = false
     wantPlaybackRef.current = true
-    resumeGateRef.current = 0.05
+    needsContiguousBufferRef.current = session.source.kind === 'torrent'
     dlProgressRef.current = 0
 
     remuxOriginRef.current = 0
@@ -474,15 +506,14 @@ export function PlayerPage(): JSX.Element {
     if (session.source.kind === 'hls' && Hls.isSupported()) {
       sourceAttachedRef.current = true
       setMediaAttached(true)
-      setWaitTargetPct(null)
+      needsContiguousBufferRef.current = false
       hls = new Hls({ enableWorker: true })
       hls.loadSource(src)
       hls.attachMedia(video)
       video.addEventListener('canplay', () => tryStartPlayback(), { once: true })
-    } else if (session.source.kind !== 'torrent') {
+    } else {
       attachMediaSource(src, resumeAt)
     }
-    // torrent: attachMediaSource called from progress gate effect
 
     bumpChrome()
 
@@ -505,34 +536,26 @@ export function PlayerPage(): JSX.Element {
     }
   }, [session.cacheId, session.source.url, session.source.kind, session.resumeSeconds, session.source.label, codecHint])
 
-  // 5% start gate + mid-playback resume gate for progressive downloads
+  // Contiguous forward buffer gate (10s HTML5 or 35 MB engine) for torrents
   useEffect(() => {
-    if (session.source.kind === 'local' || session.source.kind === 'hls') return
+    if (session.source.kind !== 'torrent') return
     const progress = dl?.progress ?? (dl && dl.total > 0 ? dl.received / dl.total : 0)
-    const done = Boolean(dl?.done) || progress >= 0.999
     dlProgressRef.current = progress
 
-    const src = session.source.url
-    const resumeAt = session.resumeSeconds || 0
+    if (!sourceAttachedRef.current) return
+    if (!needsContiguousBufferRef.current && !waitingSinceRef.current) return
 
-    // Initial attach after 5% (or complete)
-    if (!sourceAttachedRef.current && (done || progress >= 0.05)) {
-      resumeGateRef.current = null
-      setWaitTargetPct(null)
-      attachMediaSource(src, resumeAt)
-      return
-    }
+    const video = videoRef.current
+    const fwd = video ? calculateForwardBuffer(video) : { forwardSec: 0, pct: 0 }
+    setForwardBufferPct(fwd.pct)
+    setForwardBufferSec(fwd.forwardSec)
 
-    // Resume after underrun once we gained another ~5% (or finished / have buffer)
-    const gate = resumeGateRef.current
-    if (gate != null && sourceAttachedRef.current) {
-      const video = videoRef.current
-      const hasLead = video ? bufferedEnd(video) > video.currentTime + 1.5 : false
-      if (done || progress >= gate || hasLead) {
-        tryStartPlayback()
-      }
+    if (isReadyToPlay(video, dl)) {
+      tryStartPlayback()
+    } else {
+      setBuffering(true)
     }
-  }, [dl, session.source.url, session.source.kind, session.resumeSeconds])
+  }, [dl, session.source.kind])
 
   // Keep cue + offset refs fresh for seeked / rAF-free handlers
   useEffect(() => {
@@ -755,7 +778,8 @@ export function PlayerPage(): JSX.Element {
             total: s.total,
             done: s.done,
             peers: s.peers,
-            progress: s.progress
+            progress: s.progress,
+            contiguousForwardBytes: s.contiguousForwardBytes
           })
         })
       } else {
@@ -782,7 +806,7 @@ export function PlayerPage(): JSX.Element {
     if (!video) return
 
     const refreshBuffer = (): void => {
-      const fwd = calculateForwardBuffer(video, 15)
+      const fwd = calculateForwardBuffer(video)
       setForwardBufferPct(fwd.pct)
       setForwardBufferSec(fwd.forwardSec)
       const dur = video.duration || duration || 0
@@ -869,18 +893,14 @@ export function PlayerPage(): JSX.Element {
       setBuffering(true)
       waitingSinceRef.current = Date.now()
       stallNudgedRef.current = false
-      const fwd = calculateForwardBuffer(video, 15)
+      const fwd = calculateForwardBuffer(video)
       setForwardBufferPct(fwd.pct)
       setForwardBufferSec(fwd.forwardSec)
       // Pause to stop decoder thrash, but keep wantPlayback so canplay can resume.
       if (!video.paused) video.pause()
-      const p = dlProgressRef.current
-      if (p < 0.999) {
-        resumeGateRef.current = Math.min(1, p + 0.05)
-      } else {
-        resumeGateRef.current = null
+      if (session.source.kind === 'torrent') {
+        needsContiguousBufferRef.current = true
       }
-      setWaitTargetPct(null)
       syncTorrentWindow()
     }
     const onPlaying = (): void => {
@@ -889,6 +909,7 @@ export function PlayerPage(): JSX.Element {
       setBuffering(false)
       setStallRecovery(null)
       stallNudgedRef.current = false
+      needsContiguousBufferRef.current = false
       setVideoWidth(video.videoWidth)
       setVideoHeight(video.videoHeight)
       if (waitingSinceRef.current) {
@@ -902,10 +923,12 @@ export function PlayerPage(): JSX.Element {
     const onStalled = (): void => {
       setBuffering(true)
       if (!waitingSinceRef.current) waitingSinceRef.current = Date.now()
-      const fwd = calculateForwardBuffer(video, 15)
+      const fwd = calculateForwardBuffer(video)
       setForwardBufferPct(fwd.pct)
       setForwardBufferSec(fwd.forwardSec)
-      setWaitTargetPct(null)
+      if (session.source.kind === 'torrent') {
+        needsContiguousBufferRef.current = true
+      }
       syncTorrentWindow()
     }
     const onCanPlay = (): void => {
@@ -1208,7 +1231,7 @@ export function PlayerPage(): JSX.Element {
       const cacheId = source.id
       sourceAttachedRef.current = false
       initialStartedRef.current = false
-      resumeGateRef.current = null
+      needsContiguousBufferRef.current = true
       cuesRef.current = []
       setCues([])
       setSubText('')
@@ -1292,7 +1315,7 @@ export function PlayerPage(): JSX.Element {
 
       sourceAttachedRef.current = false
       initialStartedRef.current = false
-      resumeGateRef.current = null
+      needsContiguousBufferRef.current = true
       setMediaError(null)
       setStallRecovery(null)
       setBuffering(true)
@@ -1379,7 +1402,7 @@ export function PlayerPage(): JSX.Element {
 
       sourceAttachedRef.current = false
       initialStartedRef.current = false
-      resumeGateRef.current = null
+      needsContiguousBufferRef.current = true
       setMediaError(null)
       setStallRecovery(null)
       setVideoWidth(0)
@@ -1710,7 +1733,7 @@ export function PlayerPage(): JSX.Element {
   const seekTo = (t: number): void => {
     const video = videoRef.current
     if (!video) return
-    const fwd = calculateForwardBuffer(video, 15)
+    const fwd = calculateForwardBuffer(video)
     const dur = totalDurationSeconds || durationRef.current || duration || 0
     const target = Math.max(0, Math.min(t, dur || t))
 
@@ -1721,15 +1744,26 @@ export function PlayerPage(): JSX.Element {
       return
     }
 
-    if (session.source.kind === 'torrent' && fwd.forwardSec < 1.5 && target > video.currentTime + 1.5) {
+    const outsideBuffer = fwd.forwardSec < 1.5 || target < video.currentTime - 1 || target > video.currentTime + fwd.forwardSec + 0.5
+    if (session.source.kind === 'torrent' && outsideBuffer) {
       setBuffering(true)
       waitingSinceRef.current = Date.now()
+      needsContiguousBufferRef.current = true
+      setForwardBufferPct(0)
+      setForwardBufferSec(0)
+      if (!video.paused) video.pause()
+      void window.cinevault?.torrent.prioritize({
+        id: session.cacheId,
+        currentTime: target,
+        duration: dur,
+        invalidate: true
+      })
     }
     video.currentTime = target
     setCurrent(target)
     const cue = findActiveCue(cuesRef.current, target, subOffsetMsRef.current)
     setSubText(cue?.text || '')
-    if (session.source.kind === 'torrent') {
+    if (session.source.kind === 'torrent' && !outsideBuffer) {
       void window.cinevault?.torrent.prioritize({
         id: session.cacheId,
         currentTime: target,
@@ -2058,20 +2092,18 @@ export function PlayerPage(): JSX.Element {
                   <div className="orbit-core">
                     <div className="orbit-pct">
                       {mediaAttached
-                        ? `${forwardBufferPct}%`
-                        : dl?.progress != null
-                          ? `${Math.min(100, Math.round(dl.progress * 100))}%`
+                        ? `${Math.min(100, Math.round((forwardBufferSec / PREBUFFER_SECONDS) * 100))}%`
+                        : dl?.contiguousForwardBytes != null
+                          ? `${Math.min(100, Math.round((dl.contiguousForwardBytes / PREBUFFER_BYTES) * 100))}%`
                           : '—'}
                     </div>
                     <div className="orbit-speed">{dl ? formatSpeed(dl.speed) : '…'}</div>
                   </div>
                 </div>
                 <p className="orbit-note">
-                  {!mediaAttached
-                    ? '~5% to start playback'
-                    : forwardBufferPct < 100
-                      ? `Buffering ahead · ${forwardBufferSec.toFixed(0)}s / 15s`
-                      : 'Buffering…'}
+                  {mediaAttached && forwardBufferSec > 0
+                    ? `Buffering ${Math.min(PREBUFFER_SECONDS, Math.floor(forwardBufferSec))}s / ${PREBUFFER_SECONDS}s`
+                    : 'Pre-buffering stream...'}
                 </p>
               </>
             )}

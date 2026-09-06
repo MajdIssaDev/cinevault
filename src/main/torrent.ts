@@ -4,8 +4,17 @@ import { join } from 'path'
 import type { Server } from 'http'
 import WebTorrent from 'webtorrent'
 import { getDefaultCacheDir, loadSettings } from './settings'
+import {
+  BUFFER_AHEAD_PIECES,
+  RETAIN_BEHIND_PIECES,
+  createRollingPieceStoreConstructor,
+  removeRollingCache,
+  type RollingStoreInstance
+} from './rollingPieceStore'
 
 const VIDEO_EXT = /\.(mp4|mkv|avi|webm|m4v|mov|wmv|flv|ts|m2ts)$/i
+/** Contiguous bytes ahead of playhead that unlock playback (matches renderer). */
+export const PREBUFFER_BYTES = 35 * 1024 * 1024
 
 export interface TorrentStatus {
   progress: number
@@ -19,6 +28,9 @@ export interface TorrentStatus {
   error?: string
   streamUrl?: string
   fileName?: string
+  /** Contiguous verified bytes from the active playhead forward. */
+  contiguousForwardBytes?: number
+  currentPiece?: number
 }
 
 interface ActiveTorrent {
@@ -33,6 +45,7 @@ interface ActiveTorrent {
   streamUrl?: string
   lastPlayheadSec?: number
   lastDurationSec?: number
+  rollingStore?: RollingStoreInstance | null
 }
 
 let client: WebTorrent.Instance | null = null
@@ -90,6 +103,18 @@ function listenServer(server: Server): Promise<number> {
 
 function toStatus(entry: ActiveTorrent): TorrentStatus {
   const t = entry.torrent
+  const file = t.files?.[entry.fileIndex] as TorrentFilePieces | undefined
+  const duration = entry.lastDurationSec || 0
+  const currentTime = entry.lastPlayheadSec || 0
+  const fileLength = file?.length || entry.total || 0
+  const bytePos =
+    duration > 1 && fileLength > 0
+      ? Math.min(fileLength - 1, Math.floor((currentTime / duration) * fileLength))
+      : 0
+  const contig = file ? contiguousForwardBytes(t, file, bytePos) : 0
+  const pieceLength = Math.max(1, t.pieceLength || 16_384)
+  const startPiece = file?._startPiece ?? 0
+  const currentPiece = startPiece + Math.floor(bytePos / pieceLength)
   return {
     progress: t.progress,
     downloadSpeed: t.downloadSpeed,
@@ -101,8 +126,96 @@ function toStatus(entry: ActiveTorrent): TorrentStatus {
     done: Boolean(t.done),
     error: entry.error,
     streamUrl: entry.streamUrl,
-    fileName: entry.fileName
+    fileName: entry.fileName,
+    contiguousForwardBytes: contig,
+    currentPiece
   }
+}
+
+type TorrentFilePieces = WebTorrent.TorrentFile & {
+  _startPiece?: number
+  _endPiece?: number
+}
+
+type BitfieldLike = { get: (i: number) => boolean; set?: (i: number, v: boolean) => void }
+
+function contiguousForwardBytes(
+  torrent: WebTorrent.Torrent,
+  file: TorrentFilePieces,
+  byteOffset: number
+): number {
+  const startPiece = file._startPiece ?? 0
+  const endPiece = file._endPiece ?? startPiece
+  const pieceLength = Math.max(1, torrent.pieceLength || 16_384)
+  const fileLength = file.length || 0
+  if (fileLength <= 0) return 0
+  const rel = Math.max(0, Math.min(byteOffset, fileLength - 1))
+  let piece = Math.min(endPiece, Math.max(startPiece, startPiece + Math.floor(rel / pieceLength)))
+  const bitfield = (torrent as unknown as { bitfield?: BitfieldLike }).bitfield
+  if (!bitfield?.get) return 0
+
+  let bytes = 0
+  const first = piece
+  while (piece <= endPiece && bitfield.get(piece)) {
+    if (piece === first) {
+      const offsetInPiece = rel % pieceLength
+      bytes += pieceLength - offsetInPiece
+    } else {
+      bytes += pieceLength
+    }
+    piece += 1
+  }
+  return Math.min(bytes, Math.max(0, fileLength - rel))
+}
+
+function resolveRollingStore(torrent: WebTorrent.Torrent): RollingStoreInstance | null {
+  const store = (torrent as unknown as { store?: { store?: RollingStoreInstance } }).store
+  // ImmediateChunkStore wraps CacheChunkStore wraps our store — dig for purgeOutsideWindow
+  const candidates = [
+    store,
+    (store as unknown as { store?: RollingStoreInstance })?.store,
+    (store as unknown as { store?: { store?: RollingStoreInstance } })?.store?.store
+  ]
+  for (const c of candidates) {
+    if (c && typeof (c as RollingStoreInstance).purgeOutsideWindow === 'function') {
+      return c as RollingStoreInstance
+    }
+  }
+  return null
+}
+
+function clearBitfieldPieces(torrent: WebTorrent.Torrent, indices: number[]): void {
+  const bitfield = (torrent as unknown as { bitfield?: BitfieldLike }).bitfield
+  const pieces = (torrent as unknown as { pieces?: unknown[] }).pieces
+  for (const index of indices) {
+    try {
+      bitfield?.set?.(index, false)
+    } catch {
+      /* ignore */
+    }
+    try {
+      if (pieces && index >= 0 && index < pieces.length) {
+        pieces[index] = null
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+function purgeRollingWindow(
+  entry: ActiveTorrent,
+  centerPiece: number
+): void {
+  const store = entry.rollingStore || resolveRollingStore(entry.torrent)
+  if (!store) return
+  entry.rollingStore = store
+  const purged = store.purgeOutsideWindow(
+    centerPiece,
+    RETAIN_BEHIND_PIECES,
+    BUFFER_AHEAD_PIECES
+  )
+  if (purged.length) clearBitfieldPieces(entry.torrent, purged)
 }
 
 function infoHashFromMagnet(magnet: string): string | null {
@@ -170,9 +283,8 @@ async function ensureStream(opts: {
   try {
     const startPiece = (file as { _startPiece?: number })._startPiece ?? 0
     const endPiece = (file as { _endPiece?: number })._endPiece ?? startPiece
-    const span = Math.max(1, endPiece - startPiece + 1)
-    const warmEnd = Math.min(endPiece, startPiece + Math.max(24, Math.ceil(span * 0.05)))
-    opts.torrent.critical(startPiece, warmEnd)
+    const warmEnd = Math.min(endPiece, startPiece + BUFFER_AHEAD_PIECES)
+    opts.torrent.critical(startPiece, Math.min(endPiece, startPiece + 24))
     opts.torrent.select(startPiece, warmEnd, 1)
   } catch {
     /* ignore */
@@ -191,7 +303,8 @@ async function ensureStream(opts: {
     fileName: file.name,
     total: file.length,
     ready: true,
-    streamUrl
+    streamUrl,
+    rollingStore: resolveRollingStore(opts.torrent)
   })
 
   return { streamUrl, fileName: file.name, size: file.length }
@@ -248,7 +361,14 @@ async function startTorrent(opts: {
     let t: WebTorrent.Torrent
     let settled = false
     try {
-      t = wt.add(magnet, { path })
+      const Store = hash ? createRollingPieceStoreConstructor(hash) : undefined
+      t = Store
+        ? (wt.add as (uri: string, opts: Record<string, unknown>) => WebTorrent.Torrent)(magnet, {
+            store: Store,
+            storeOpts: { infoHash: hash },
+            storeCacheSlots: 0
+          })
+        : wt.add(magnet, { path })
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
       if (/duplicate/i.test(msg) && hash) {
@@ -354,6 +474,10 @@ async function stopTorrent(
   })
 
   await destroyTorrentInstance(entry.torrent, destroyStore)
+  if (destroyStore) {
+    const hash = entry.torrent.infoHash
+    if (hash) removeRollingCache(hash)
+  }
   return true
 }
 
@@ -413,22 +537,19 @@ export async function destroyTorrentData(opts: {
           /* ignore */
         }
       }
+      removeRollingCache(hash)
     }
   }
 
   return removed
 }
 
-type TorrentFilePieces = WebTorrent.TorrentFile & {
-  _startPiece?: number
-  _endPiece?: number
-}
-
 /** Jump torrent priority to the HTTP Range byte offset (seek). */
 function prioritizePiecesAtByte(
   torrent: WebTorrent.Torrent,
   file: TorrentFilePieces,
-  byteOffset: number
+  byteOffset: number,
+  opts?: { invalidate?: boolean }
 ): void {
   const startPiece = file._startPiece ?? 0
   const endPiece = file._endPiece ?? startPiece
@@ -438,14 +559,24 @@ function prioritizePiecesAtByte(
     endPiece,
     Math.max(startPiece, startPiece + Math.floor(rel / pieceLength))
   )
-  const critEnd = Math.min(endPiece, pieceIndex + 20)
-  const behindEnd = Math.max(startPiece - 1, pieceIndex - 5 - 1)
+  const critEnd = Math.min(endPiece, pieceIndex + Math.min(24, BUFFER_AHEAD_PIECES))
+  const aheadEnd = Math.min(endPiece, pieceIndex + BUFFER_AHEAD_PIECES)
+  const behindStart = startPiece
+  const behindEnd = Math.max(startPiece - 1, pieceIndex - RETAIN_BEHIND_PIECES - 1)
   try {
-    if (behindEnd >= startPiece) {
-      torrent.deselect(startPiece, behindEnd, 0)
+    if (opts?.invalidate) {
+      // Cancel interest in everything outside the new sliding window.
+      if (pieceIndex - 1 >= startPiece) {
+        torrent.deselect(startPiece, pieceIndex - 1, 0)
+      }
+      if (aheadEnd + 1 <= endPiece) {
+        torrent.deselect(aheadEnd + 1, endPiece, 0)
+      }
+    } else if (behindEnd >= behindStart) {
+      torrent.deselect(behindStart, behindEnd, 0)
     }
     torrent.critical(pieceIndex, critEnd)
-    torrent.select(pieceIndex, critEnd, 2)
+    torrent.select(pieceIndex, aheadEnd, 2)
   } catch {
     /* ignore */
   }
@@ -478,6 +609,7 @@ function prioritizePlaybackWindow(opts: {
   id: string
   currentTime: number
   duration: number
+  invalidate?: boolean
 }): boolean {
   const entry = active.get(opts.id)
   if (!entry?.ready) return false
@@ -497,25 +629,13 @@ function prioritizePlaybackWindow(opts: {
 
   const bytePos =
     duration > 1 ? Math.min(fileLength - 1, Math.floor((currentTime / duration) * fileLength)) : 0
-  prioritizePiecesAtByte(entry.torrent, file, bytePos)
+  prioritizePiecesAtByte(entry.torrent, file, bytePos, { invalidate: opts.invalidate })
 
-  // Also warm the next ~100MB as high priority beyond the critical window
-  try {
-    const pieceAt = Math.min(
-      endPiece,
-      Math.max(startPiece, startPiece + Math.floor(bytePos / pieceLength))
-    )
-    const criticalPieces = 20
-    const highPieces = Math.max(16, Math.ceil((100 * 1024 * 1024) / pieceLength))
-    const critEnd = Math.min(endPiece, pieceAt + criticalPieces)
-    const highStart = Math.min(endPiece, critEnd + 1)
-    const highEnd = Math.min(endPiece, critEnd + highPieces)
-    if (highStart <= highEnd) {
-      entry.torrent.select(highStart, highEnd, 1)
-    }
-  } catch {
-    /* ignore */
-  }
+  const pieceAt = Math.min(
+    endPiece,
+    Math.max(startPiece, startPiece + Math.floor(bytePos / pieceLength))
+  )
+  purgeRollingWindow(entry, pieceAt)
   return true
 }
 
@@ -593,13 +713,14 @@ export function registerTorrentHandlers(): void {
     'torrent:prioritize',
     (
       _e,
-      opts: { id: string; currentTime: number; duration: number }
+      opts: { id: string; currentTime: number; duration: number; invalidate?: boolean }
     ): boolean => {
       if (!opts?.id) return false
       return prioritizePlaybackWindow({
         id: opts.id,
         currentTime: opts.currentTime || 0,
-        duration: opts.duration || 0
+        duration: opts.duration || 0,
+        invalidate: Boolean(opts.invalidate)
       })
     }
   )
